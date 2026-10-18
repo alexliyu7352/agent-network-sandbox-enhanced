@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.superpowers/
+
+# Local credentials and raw host verification output
+.env
+.env.*
+*.backup
+*.bak
+*.pcap
+*.pty
+/docs/evidence/
+/docs/test-results.txt

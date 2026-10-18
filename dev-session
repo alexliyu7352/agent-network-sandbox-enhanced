@@ -1,0 +1,37 @@
+#!/bin/bash -p
+# Save selected workload settings as argv data before scrubbing the manager's
+# environment. They are applied only after dropping privileges and probing.
+[[ $EUID == 0 ]] || { echo 'Use sudo session [-u ACCOUNT]' >&2; exit 125; }
+context_umask=$(umask)
+umask 077
+context_env=()
+for name in LANG LANGUAGE LC_ALL LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE \
+    LC_MONETARY LC_MESSAGES LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE \
+    LC_MEASUREMENT LC_IDENTIFICATION TZ DISPLAY XAUTHORITY WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_CURRENT_DESKTOP; do
+    [[ ! -v $name ]] || context_env+=("$name=${!name}")
+done
+term=${TERM:-dumb}
+[[ $term =~ ^[A-Za-z0-9_.+-]{1,64}$ ]] || term=dumb
+caller_uid=${SUDO_UID:-}
+[[ $caller_uid =~ ^[1-9][0-9]{0,9}$ ]] || caller_uid=''
+exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root TERM="$term" SUDO_UID="$caller_uid" \
+    /bin/bash -p -c '
+set -euo pipefail
+entry=$(readlink -f -- "$1") || exit 125
+shift
+root=${entry%/*}
+[[ $root =~ ^/[A-Za-z0-9_/-]+$ ]] || { echo "Unsupported installation path" >&2; exit 125; }
+for file in "$entry" "$root/lib/main.sh"; do
+    p=$file
+    while :; do
+        [[ -e $p && ! -L $p ]] || exit 125
+        read -r owner mode < <(stat -c "%u %a" -- "$p")
+        [[ $owner == 0 && $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 0022) == 0 )) || exit 125
+        [[ $p == / ]] && break
+        p=${p%/*}; p=${p:-/}
+    done
+done
+[[ $(stat -c "%a" -- "$root") == 700 ]] || { echo "Installation directory must have mode 0700; run the installer" >&2; exit 125; }
+exec /bin/bash -p "$root/lib/main.sh" "$@"
+' dev-session "${BASH_SOURCE[0]}" "$context_umask" "${#context_env[@]}" "${context_env[@]}" "$@"

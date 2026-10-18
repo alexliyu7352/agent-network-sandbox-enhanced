@@ -1,0 +1,28 @@
+#!/bin/bash -p
+# Managed session launcher; format 1.
+manager='@SESSION_MANAGER@'
+# Public bootstrap only. The manager and its configuration remain root-private.
+set -euo pipefail
+if (( EUID == 0 )); then
+    exec "$manager" "$@"
+fi
+
+# Capture before sudo can filter the environment or change the umask/cwd.
+# All values cross that boundary as literal arguments, never as root shell code.
+context_umask=$(umask)
+if context_cwd=$(pwd -P 2>/dev/null && printf '.'); then
+    context_cwd=${context_cwd%$'\n.'}
+else
+    # Administrative commands and an explicit --cwd still work after a
+    # directory is removed. The manager rejects an unresolved default cwd.
+    context_cwd=''
+fi
+context_env=()
+for name in LANG LANGUAGE LC_ALL LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE \
+    LC_MONETARY LC_MESSAGES LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE \
+    LC_MEASUREMENT LC_IDENTIFICATION TZ DISPLAY XAUTHORITY WAYLAND_DISPLAY \
+    XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE XDG_CURRENT_DESKTOP; do
+    [[ ! -v $name ]] || context_env+=("$name=${!name}")
+done
+exec /usr/bin/sudo -- "$manager" --caller-context "$context_umask" "$context_cwd" \
+    "${#context_env[@]}" "${context_env[@]}" -- "$@"

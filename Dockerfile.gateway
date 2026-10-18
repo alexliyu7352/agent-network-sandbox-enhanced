@@ -1,0 +1,23 @@
+FROM ghcr.io/sagernet/sing-box:v1.14.2
+
+# 固定版本；需要不可變供應鏈鎖定時，由管理員補上已驗證的 image digest。
+# 建置階段才裝工具，運行階段不再下載依賴。
+
+# Install gateway tools at build time, before sandbox routing is enabled.
+RUN apk add --no-cache iproute2 iptables iptables-legacy jq \
+    && mv /usr/local/bin/sing-box /usr/local/bin/worker
+
+# Keep the official, unmodified sing-box executable under a neutral local
+# component name. Renaming the actual file also sets the initial Linux comm
+# and /proc/PID/exe basename; a shell alias or exec -a would not do both.
+
+COPY entrypoint-gateway.sh /entrypoint.sh
+
+# 節點設定僅運行時唯讀掛入，不 COPY 進映像層；.dockerignore 預設排除全部。
+
+# The node configuration is mounted read-only by Compose at runtime.
+# Keep its credentials out of image layers and the Docker build context.
+
+HEALTHCHECK NONE
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]
+CMD []
