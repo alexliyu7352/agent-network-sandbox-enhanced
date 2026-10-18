@@ -176,6 +176,7 @@ host_preflight() {
             data = file.read_bytes()
             outside = self.base / "outside"
             outside.write_bytes(data)
+            outside.chmod(0o644)
             if kind == "writable":
                 file.chmod(0o666)
             else:
