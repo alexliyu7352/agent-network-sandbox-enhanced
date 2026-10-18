@@ -34,20 +34,20 @@ class GatewayReviewTests(unittest.TestCase):
     def run_gateway(self, **kwargs):
         return gateway.GatewayTests().run_gateway(**kwargs)
 
-    def test_server_ports_override_is_rejected_before_core_check(self):
-        for ports in (["8443:8444"], ["443"], "8443:8444"):
+    def test_valid_server_ports_override_is_accepted_without_touching_runtime(self):
+        for ports in (["8443:8444"], ["443:443"], "8443:8444"):
             with self.subTest(server_ports=ports):
                 config = configuration()
                 config["outbounds"][0]["server_ports"] = ports
                 result, events, state = self.run_gateway(
                     args=("--check",), config=config, stale_runtime=True)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("server_ports", result.stderr)
-                self.assertFalse(events)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(state["check_config"], config)
+                self.assertEqual([event[:2] for event in events], [["worker", "check"]])
                 self.assertEqual(state["runtime_after"], state["runtime_before"])
 
     def test_invalid_server_ports_types_are_rejected_before_core_check(self):
-        for ports in ("", {}, 0, 443, False, True, [None], [[]]):
+        for ports in ("", {}, 0, 443, False, True, [None], [[]], ["443"]):
             with self.subTest(server_ports=ports):
                 config = configuration()
                 config["outbounds"][0]["server_ports"] = ports
@@ -73,16 +73,21 @@ class GatewayReviewTests(unittest.TestCase):
                 self.assertEqual([event[:2] for event in events], [["worker", "check"]])
                 self.assertEqual(state["runtime_after"], state["runtime_before"])
 
-    def test_port_override_startup_retains_drop_and_removes_stale_readiness(self):
+    def test_port_override_replaces_scalar_allowance_and_retains_forward_drop(self):
         config = configuration()
         config["outbounds"][0]["server_ports"] = ["8443:8444"]
         result, events, state = self.run_gateway(config=config, stale_runtime=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("server_ports", result.stderr)
-        self.assertFalse(any(event[0] == "worker" for event in events))
-        self.assertIsNone(state["marker"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(state["marker"].startswith("{"))
         self.assertEqual(state["policies"], dict.fromkeys(gateway.CHAINS, "DROP"))
-        self.assertFalse(state["routes"])
+        for port, expected in ((443, "DROP"), (8442, "DROP"), (8443, "ACCEPT"),
+                               (8444, "ACCEPT"), (8445, "DROP")):
+            self.assertEqual(gateway.verdict(state, "OUTPUT", **{
+                "-o": "eth0", "-d": "192.0.2.10", "-p": "udp", "--dport": port,
+            }), expected)
+            self.assertEqual(gateway.verdict(state, "FORWARD", **{
+                "-i": "eth0", "-o": "eth0", "-d": "192.0.2.10", "-p": "udp", "--dport": port,
+            }), "DROP")
 
 
 if __name__ == "__main__":

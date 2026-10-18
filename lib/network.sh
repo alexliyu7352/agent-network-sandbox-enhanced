@@ -1,7 +1,6 @@
 #!/bin/bash
 # Sourced by the root entry point. No side effects at source time.
 readonly CLASSID=0x6d730001 MARK=0x6d730001 TABLE=32190 PRIORITY=1190
-readonly CGROOT=/sys/fs/cgroup/net_cls,net_prio/dev-session-v8
 readonly RUNTIME=/run/dev-session-v8
 
 policy_chains() {
@@ -23,13 +22,14 @@ policy_hooks() {
 }
 
 policy_emit() {
-    local family=$1 table=$2 chain prefix
+    local family=$1 table=$2 chain prefix match endpoints address protocol start end port
+    match=$(cgroup_match) || return
     case "$family:$table" in
     4:mangle)
         for chain in D8OUT D8POST; do
             # The only class is shared by all sessions. Historical sockets
             # retain this same restriction; no identities are ever recycled.
-            printf '%s\n' "-A $chain -m cgroup --cgroup $CLASSID -j MARK --set-xmark $MARK/0xffffffff"
+            printf '%s\n' "-A $chain $match -j MARK --set-xmark $MARK/0xffffffff"
             printf '%s\n' "-A $chain -m mark --mark $MARK/0xffffffff -j CONNMARK --set-xmark $MARK/0xffffffff"
             printf '%s\n' "-A $chain -m connmark --mark $MARK/0xffffffff -j MARK --set-xmark $MARK/0xffffffff"
         done
@@ -50,12 +50,16 @@ policy_emit() {
         done
         printf '%s\n' "-A D8POST -m mark --mark $MARK/0xffffffff -o $BRIDGE -j RETURN"
         printf '%s\n' "-A D8POST -m mark --mark $MARK/0xffffffff -j DROP"
-        printf '%s\n' "-A D8GW -i $BRIDGE -s $GATEWAY_IP/32 -d $NODE_IP/32 -p udp -m udp --dport $NODE_PORT -j RETURN"
+        endpoints=$(proxy_endpoint_rows) || return
+        while IFS=$'\t' read -r address protocol start end; do
+            port=$start; [[ $start == "$end" ]] || port=$start:$end
+            printf '%s\n' "-A D8GW -i $BRIDGE -s $GATEWAY_IP/32 -d $address/32 -p $protocol -m $protocol --dport $port -j RETURN"
+        done <<<"$endpoints"
         printf '%s\n' "-A D8GW -i $BRIDGE -j DROP"
         ;;
     6:mangle)
         for chain in D8OUT6 D8POST6; do
-            printf '%s\n' "-A $chain -m cgroup --cgroup $CLASSID -j DROP"
+            printf '%s\n' "-A $chain $match -j DROP"
             printf '%s\n' "-A $chain -m mark --mark $MARK/0xffffffff -j DROP"
             printf '%s\n' "-A $chain -m connmark --mark $MARK/0xffffffff -j DROP"
         done
@@ -89,6 +93,8 @@ canonical_rule() {
       k=$i; v=$(i+1);
       if(k=="-m" && (v=="tcp" || v=="udp")) continue;
       if(k=="--cgroup") v=sprintf("%.0f",decimal(v));
+      if(k=="--path" && v ~ /^"[A-Za-z0-9_.\/-]+"$/) v=substr(v,2,length(v)-2);
+      if(k=="--ctstate" && v=="RELATED,ESTABLISHED") v="ESTABLISHED,RELATED";
       if((k=="--mark" || k=="--set-xmark") && v !~ /\//) v=v "/0xffffffff";
       if((k=="-s" || k=="-d") && v !~ /\//) v=v "/32";
       print k " " v;
@@ -140,6 +146,15 @@ policy_verify() {
 policy_install() {
     local family table chain hook bin current row
     local -a hook_edits
+    local -A rendered
+    # Render every table before touching netfilter. A parser/selector failure
+    # must not be hidden by a later successful printf in the restore pipeline.
+    for family in 6 4; do
+        for table in mangle nat; do
+            [[ $family == 6 && $table == nat ]] && continue
+            rendered[$family:$table]=$(policy_emit "$family" "$table") || return
+        done
+    done
     # Never flush built-in chains. Each owned table update is atomic; the
     # launcher admits no workload until all families and routes are verified.
     for family in 6 4; do
@@ -159,7 +174,7 @@ policy_install() {
                 for chain in $(policy_chains "$family" "$table"); do
                     printf ':%s - [0:0]\n-F %s\n' "$chain" "$chain"
                 done
-                policy_emit "$family" "$table"
+                printf '%s\n' "${rendered[$family:$table]}"
                 printf '%s\n' "${hook_edits[@]}"
                 printf 'COMMIT\n'
             } | "${bin}-restore" --wait 5 --noflush || return
@@ -167,28 +182,58 @@ policy_install() {
     done
 }
 
-read_node() {
-    jq -e '
+read_proxy_policy() {
+    local config=$1 parser source_before source_after policy effective parser_hash
+    unset PROXY_POLICY_JSON SOURCE_SHA256 EFFECTIVE_SHA256 POLICY_PARSER_SHA256
+    parser=$ROOT/gateway-policy.jq
+    [[ -f $config && ! -L $config && -f $parser && ! -L $parser ]] || return 1
+    source_before=$(sha256sum -- "$config") || return
+    parser_hash=$(sha256sum -- "$parser") || return
+    # Only the parser's static, nonsecret failure reasons may reach the user.
+    # JSON syntax diagnostics could otherwise quote source lines with secrets.
+    local error_file
+    error_file=$(mktemp) || return
+    if ! policy=$(jq -ceS --arg mode policy -f "$parser" "$config" 2>"$error_file"); then
+        awk '/^gateway-policy: [A-Za-z0-9][A-Za-z0-9 .,:()_\/-]*$/ {print; found=1; exit}
+             END {if(!found) print "Proxy configuration rejected; check its JSON and supported options."}' "$error_file" >&2
+        rm -f -- "$error_file"
+        return 1
+    fi
+    rm -f -- "$error_file"
+    effective=$(jq -ceS --arg mode effective -f "$parser" "$config" 2>/dev/null) || return
+    source_after=$(sha256sum -- "$config") || return
+    [[ $source_before == "$source_after" && $parser_hash == "$(sha256sum -- "$parser")" ]] || return 1
+    effective=$(printf '%s\n' "$effective" | sha256sum) || return
+    PROXY_POLICY_JSON=$policy
+    SOURCE_SHA256=${source_before%% *}
+    EFFECTIVE_SHA256=${effective%% *}
+    POLICY_PARSER_SHA256=${parser_hash%% *}
+}
+
+proxy_endpoint_rows() {
+    [[ -n ${PROXY_POLICY_JSON:-} ]] || return 1
+    jq -er '
+      def port: type=="number" and .>=1 and .<=65535 and .==floor;
       def ipv4: type=="string" and (split(".") | length==4 and all(.[];
         test("\\A(0|[1-9][0-9]{0,2})\\z") and tonumber<=255));
-      (.outbounds | type=="array" and length==1) and
-      (.outbounds[0] | .type=="hysteria2" and .tag=="proxy" and
-        .bind_interface=="eth0" and (.detour//"")=="" and (.server|ipv4) and
-        (.server_ports==null or .server_ports==[]) and
-        (.server_port|type=="number" and .>=1 and .<=65535 and .==floor)) and
-      .dns.servers==[{"type":"udp","tag":"upstream-dns","server":"1.1.1.1",
-                      "server_port":53,"detour":"proxy"}] and
-      .dns.final=="upstream-dns" and .dns.disable_cache==false and .dns.disable_expire==false
-    ' "$1" >/dev/null || return
-    NODE_IP=$(jq -r '.outbounds[0].server' "$1") || return
-    NODE_PORT=$(jq -r '.outbounds[0].server_port' "$1")
+      if .format==1 and (.outer_endpoints|type=="array" and length>0 and all(.[];
+          .family==4 and (.address|ipv4) and (.protocol=="tcp" or .protocol=="udp") and
+          (.port_start|port) and (.port_end|port) and .port_start<=.port_end))
+      then .outer_endpoints[] | [.address,.protocol,.port_start,.port_end] | @tsv
+      else error("Invalid normalized proxy endpoints") end
+    ' <<<"$PROXY_POLICY_JSON" 2>/dev/null
 }
 
 gateway_open() {
     local info net nid cid pid again netpath expected
     info=$(timeout --signal=KILL 10s docker inspect "$GATEWAY") || return
-    jq -e 'length==1 and (.[0] | .State.Running==true and .State.Pid>0 and
+    jq -e --arg config "$ROOT/network.json" 'length==1 and (.[0] | .State.Running==true and .State.Pid>0 and
       .HostConfig.Privileged==false and .HostConfig.NetworkMode!="host" and
+      .HostConfig.ReadonlyRootfs==true and (.HostConfig.CapDrop==["ALL"]) and
+      (.HostConfig.CapAdd|sort)==["NET_ADMIN","NET_RAW"] and
+      any(.HostConfig.SecurityOpt[]; .=="no-new-privileges:true" or .=="no-new-privileges") and
+      ([.Mounts[]|select(.Destination=="/etc/worker/network.json")]|length==1 and
+        .[0].Source==$config and .[0].RW==false and .[0].Type=="bind") and
       .HostConfig.Sysctls["net.ipv4.ip_forward"]=="0" and
       .HostConfig.Sysctls["net.ipv6.conf.all.disable_ipv6"]=="1" and
       .HostConfig.Sysctls["net.ipv6.conf.default.disable_ipv6"]=="1" and
@@ -200,6 +245,10 @@ gateway_open() {
     GATEWAY_IP=$(jq -r '.[0].NetworkSettings.Networks[].IPAddress' <<<"$info")
     netpath=$(jq -r '.[0].NetworkSettings.SandboxKey' <<<"$info")
     [[ $cid =~ ^[0-9a-f]{64}$ && $nid =~ ^[0-9a-f]{64}$ && $pid =~ ^[1-9][0-9]*$ ]] || return 1
+    # Remapped/rootless Docker needs a separate capability model; do not
+    # silently treat its container root as the required host-owned gateway.
+    awk '/^Uid:/ {found=1; ok=($2==0 && $3==0 && $4==0 && $5==0)} END{exit !(found && ok)}' \
+        "/proc/$pid/status" || return
     [[ $netpath =~ ^/(var/)?run/docker/netns/[A-Za-z0-9_-]+$ ]] || return 1
     [[ $GATEWAY_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     net=$(timeout --signal=KILL 10s docker network inspect "$nid") || return
@@ -215,7 +264,11 @@ gateway_open() {
     again=$(timeout --signal=KILL 10s docker inspect -f '{{.Id}} {{.State.Pid}} {{.State.Running}}' "$GATEWAY") || return
     [[ $again == "$cid $pid true" ]] || return 1
     expected=$(ip -j -4 route get "$GATEWAY_IP") || return
-    jq -e --arg d "$BRIDGE" 'length==1 and .[0].dev==$d and (.[0]|has("gateway")|not)' <<<"$expected" >/dev/null
+    jq -e --arg d "$BRIDGE" 'length==1 and .[0].dev==$d and (.[0]|has("gateway")|not)' <<<"$expected" >/dev/null || return
+    GATEWAY_ID=$cid
+    GATEWAY_PID=$pid
+    GATEWAY_NETWORK_ID=$nid
+    GATEWAY_NS_ID=$(stat -Lc '%d:%i' "/proc/$$/fd/$GWFD")
 }
 
 # Only enter the network namespace: tools still come from the host filesystem.
@@ -223,32 +276,83 @@ gateway_open() {
 # /bin on hosts without merged /usr. Do not assume tools live in /usr/sbin.
 gw() { timeout --signal=KILL 10s nsenter --net="/proc/$$/fd/$GWFD" -- "$@"; }
 
+gateway_ready_text() {
+    jq -cnSe --arg source "$SOURCE_SHA256" --arg effective "$EFFECTIVE_SHA256" \
+        --arg parser "$POLICY_PARSER_SHA256" --argjson policy "$PROXY_POLICY_JSON" \
+        '{format:2,source_sha256:$source,effective_sha256:$effective,
+          policy_parser_sha256:$parser,policy:$policy}'
+}
+
+gateway_rules() {
+    local chain=$1 endpoints address protocol start end port
+    endpoints=$(proxy_endpoint_rows) || return
+    case $chain in
+        OUTPUT)
+            printf '%s\n' '-A OUTPUT -o lo -j ACCEPT' '-A OUTPUT -o tun0 -j ACCEPT'
+            while IFS=$'\t' read -r address protocol start end; do
+                port=$start; [[ $start == "$end" ]] || port=$start:$end
+                printf '%s\n' "-A OUTPUT -o eth0 -d $address/32 -p $protocol -m $protocol --dport $port -j ACCEPT"
+            done <<<"$endpoints"
+            ;;
+        FORWARD)
+            printf '%s\n' '-A FORWARD -i eth0 -o tun0 -j ACCEPT' \
+                '-A FORWARD -i tun0 -o eth0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'
+            ;;
+        INPUT)
+            printf '%s\n' '-A INPUT -i lo -j ACCEPT' '-A INPUT -i tun0 -j ACCEPT'
+            while IFS=$'\t' read -r address protocol start end; do
+                port=$start; [[ $start == "$end" ]] || port=$start:$end
+                printf '%s\n' "-A INPUT -i eth0 -s $address/32 -p $protocol -m $protocol --sport $port -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+            done <<<"$endpoints"
+            printf '%s\n' '-A INPUT -i eth0 -p icmp -m conntrack --ctstate RELATED -j ACCEPT'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+gateway_node_routes_match() {
+    jq -e --argjson policy "$PROXY_POLICY_JSON" '
+      ($policy.outer_endpoints|map(.address)|unique) as $nodes |
+      type=="array" and
+      ([.[]|select(.dst!="default" and (.dst|test("^[0-9]+(\\.[0-9]+){3}(/32)?$")))
+        |.dst|split("/")[0]]|sort)==$nodes and
+      all(.[]; if .dev=="eth0" and has("gateway") and .dst!="default"
+        then (.dst|split("/")[0]) as $dst | ($nodes|index($dst))!=null
+        else true end)
+    ' <<<"$1" >/dev/null
+}
+
 gateway_verify() {
-    local chain count rules default_gateway routes value
-    [[ $(timeout --signal=KILL 10s docker exec "$GATEWAY" cat /run/worker/policy-ready) == worker-policy-v8 ]] || return 1
+    local chain count rules expected actual default_gateway routes value endpoints hashes wanted_hashes
+    actual=$(timeout --signal=KILL 10s docker exec "$GATEWAY" cat /run/worker/policy-ready) || return
+    actual=$(jq -ceS . <<<"$actual" 2>/dev/null) || return
+    expected=$(gateway_ready_text) || return
+    [[ $actual == "$expected" ]] || return 1
+    # Read actual files independently of ready. Password-only changes must be
+    # caught even when the parsed endpoint set has not changed.
+    hashes=$(timeout --signal=KILL 10s docker exec "$GATEWAY" sha256sum \
+        /etc/worker/network.json /run/worker/config.json /usr/local/lib/worker/gateway-policy.jq) || return
+    wanted_hashes=$(printf '%s  %s\n' "$SOURCE_SHA256" /etc/worker/network.json \
+        "$EFFECTIVE_SHA256" /run/worker/config.json \
+        "$POLICY_PARSER_SHA256" /usr/local/lib/worker/gateway-policy.jq)
+    [[ $hashes == "$wanted_hashes" ]] || return 1
     for chain in OUTPUT FORWARD INPUT; do
-        case $chain in OUTPUT) count=3;; FORWARD) count=2;; INPUT) count=4;; esac
+        expected=$(gateway_rules "$chain") || return
+        count=$(awk 'END{print NR}' <<<"$expected")
         rules=$(gw iptables-legacy -w 5 -S "$chain") || return
         awk -v c="$chain" -v n="$count" '
           $1=="-P" && $2==c && $3=="DROP" && NF==3 {p++;next}
           $1=="-A" && $2==c {r++;next} {bad=1}
           END{exit !(p==1 && r==n && !bad)}' <<<"$rules" || return
+        actual=$(awk '$1=="-A"' <<<"$rules") || return
+        rules_equal "$expected" "$actual" || return
     done
-    gw iptables-legacy -w 5 -C OUTPUT -o lo -j ACCEPT || return
-    gw iptables-legacy -w 5 -C OUTPUT -o tun0 -j ACCEPT || return
-    gw iptables-legacy -w 5 -C OUTPUT -o eth0 -d "$NODE_IP/32" -p udp --dport "$NODE_PORT" -j ACCEPT || return
-    gw iptables-legacy -w 5 -C FORWARD -i eth0 -o tun0 -j ACCEPT || return
-    gw iptables-legacy -w 5 -C FORWARD -i tun0 -o eth0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return
-    gw iptables-legacy -w 5 -C INPUT -i lo -j ACCEPT || return
-    gw iptables-legacy -w 5 -C INPUT -i tun0 -j ACCEPT || return
-    gw iptables-legacy -w 5 -C INPUT -i eth0 -s "$NODE_IP/32" -p udp --sport "$NODE_PORT" -m conntrack --ctstate ESTABLISHED -j ACCEPT || return
-    gw iptables-legacy -w 5 -C INPUT -i eth0 -p icmp -m conntrack --ctstate RELATED -j ACCEPT || return
     for value in all default lo; do
         [[ $(gw sysctl -n "net.ipv6.conf.$value.disable_ipv6") == 1 ]] || return 1
     done
     gw ip -d -j link show dev tun0 | jq -e 'length==1 and
       (.[0]|.linkinfo.info_kind=="tun" and .linkinfo.info_data.type=="tun" and
-      .mtu==1500 and (.flags|index("UP")!=null))' >/dev/null || return
+      .linkinfo.info_data.persist==true and .mtu==1500 and (.flags|index("UP")!=null))' >/dev/null || return
     gw ip -j -4 addr show dev tun0 | jq -e 'length==1 and
       any(.[0].addr_info[];.local=="198.18.0.1" and .prefixlen==15)' >/dev/null || return
     default_gateway=$(gw ip -j -4 route show default dev eth0 | jq -er 'if length==1 then .[0].gateway else error("ambiguous gateway") end') || return
@@ -257,10 +361,20 @@ gateway_verify() {
         jq -e --arg d "$value" 'length==1 and (.[0]|.dst==$d and .dev=="tun0" and
           (.type//"unicast")=="unicast" and (has("gateway")|not))' <<<"$routes" >/dev/null || return
     done
-    routes=$(gw ip -j -4 route show table main exact "$NODE_IP/32") || return
-    jq -e --arg ip "$NODE_IP" --arg gw "$default_gateway" 'length==1 and
-      (.[0]|(.dst==$ip or .dst==($ip+"/32")) and .gateway==$gw and .dev=="eth0" and
-      (.type//"unicast")=="unicast")' <<<"$routes" >/dev/null
+    endpoints=$(proxy_endpoint_rows) || return
+    endpoints=$(cut -f1 <<<"$endpoints" | sort -u) || return
+    while IFS= read -r value; do
+        routes=$(gw ip -j -4 route show table main exact "$value/32") || return
+        jq -e --arg ip "$value" --arg gw "$default_gateway" 'length==1 and
+          (.[0]|(.dst==$ip or .dst==($ip+"/32")) and .gateway==$gw and .dev=="eth0" and
+          (.type//"unicast")=="unicast")' <<<"$routes" >/dev/null || return
+    done <<<"$endpoints"
+    routes=$(gw ip -j -4 route show table main) || return
+    gateway_node_routes_match "$routes" || return
+    # A restarted/replaced container must not be admitted using a pinned old
+    # namespace and a new container's ready file.
+    actual=$(timeout --signal=KILL 10s docker inspect -f '{{.Id}} {{.State.Pid}} {{.State.Running}}' "$GATEWAY") || return
+    [[ $actual == "$GATEWAY_ID $GATEWAY_PID true" ]]
 }
 
 route_install() {
@@ -286,7 +400,7 @@ route_verify() {
     local data
     data=$(ip -j -4 route show table "$TABLE") || return
     routes_match "$data" || return
-    data=$(ip -j -4 rule show) || return
+    data=$(ip -N -j -4 rule show) || return
     jq -e --arg tag "$MARK" --argjson tagdec "$((MARK))" --argjson p "$PRIORITY" --argjson t "$TABLE" '
       [.[]|select(.priority==$p)] | length==1 and
       (.[0]|(.fwmark==$tag or .fwmark==$tagdec) and

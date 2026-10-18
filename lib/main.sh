@@ -18,10 +18,11 @@ for file in "$ROOT/dev-session" "$ROOT/lib/host.sh" "$ROOT/lib/main.sh"; do
 done
 [[ $(stat -c '%a' "$ROOT") == 700 ]] || exit 125
 source "$ROOT/lib/host.sh"
-for p in "$ROOT/lib/network.sh" "$ROOT/lib/session.sh" "$ROOT/lib/cli.sh" "$ROOT/lib/context.sh" "$ROOT/policy.json" "$ROOT/network.json"; do
+for p in "$ROOT/lib/network.sh" "$ROOT/lib/cgroup.sh" "$ROOT/lib/session.sh" "$ROOT/lib/cli.sh" "$ROOT/lib/context.sh" "$ROOT/gateway-policy.jq" "$ROOT/policy.json" "$ROOT/network.json"; do
     trusted_path "$p" || die "Untrusted installation path: $p"
 done
 source "$ROOT/lib/network.sh"
+source "$ROOT/lib/cgroup.sh"
 source "$ROOT/lib/session.sh"
 source "$ROOT/lib/cli.sh"
 source "$ROOT/lib/context.sh"
@@ -41,6 +42,7 @@ fi
 case ${1:-} in
     --internal-clean)
         [[ $# == 2 ]] && valid_session_id "$2" || die 'Invalid cleanup request'
+        binding_load && cgroup_verify || die 'Bound cgroup verification failed; restrictions retained'
         cleanup_status=0
         cleanup_group "$2" || cleanup_status=$?
         # v245 may still be about to kill descendants after ExecStopPost.
@@ -50,6 +52,7 @@ case ${1:-} in
         exit ;;
     --internal-child)
         [[ $# == 2 ]] && valid_session_id "$2" || die 'Invalid bootstrap request'
+        binding_load && cgroup_verify || die 'Bound cgroup verification failed; command was not started'
         trusted_path "$RUNTIME/requests/$2" || die 'Untrusted request'
         read_request "$2"
         bootstrap_workload "$2" || die 'Bootstrap failed; command was not started'
@@ -71,6 +74,7 @@ case $command in
     close)
         stop_status=0
         systemctl stop "dev-session-$close_id.service" || stop_status=$?
+        binding_load && cgroup_verify || die 'Bound cgroup verification failed; restrictions retained'
         reclaim_stopped_group "$close_id"
         exit "$stop_status" ;;
     init|check) : ;;
@@ -78,7 +82,7 @@ case $command in
     *) die 'Unknown command; use --help' ;;
 esac
 
-host_preflight || die 'Requires host root, systemd, cgroup v1 net_cls, legacy iptables and required capabilities'
+host_preflight || die 'Requires host root, systemd, legacy iptables and required capabilities'
 jq -e '.version==8 and .gateway_container=="worker" and
     (.probe_url|type=="string" and test("^https://[A-Za-z0-9.-]+(:[0-9]+)?/[^\\r\\n ]*$"))' \
     "$ROOT/policy.json" >/dev/null || die 'Invalid policy configuration'
@@ -92,7 +96,7 @@ exec {LOCKFD}>"$RUNTIME/policy.lock"
 flock -w 30 "$LOCKFD" || die 'Another policy operation is still running'
 prepare_policy "$command" || die 'Policy check/setup failed; no session was started (repair: init)'
 if [[ $command != run ]]; then
-    echo 'Local policy verified. No workload connectivity test was run.'
+    echo "Local policy verified (cgroup $CGROUP_MODE). No workload connectivity test was run."
     exit
 fi
 
@@ -110,7 +114,7 @@ sid=$(tr -d '-' </proc/sys/kernel/random/uuid)
 valid_session_id "$sid" || die 'Cannot allocate session ID'
 write_request "$sid" "$user" "$uid" "$gid" "$home" "$workdir" "$mode" "$outer" \
     "${TERM:-xterm}" "$PROBE" "${workload[@]}"
-unit_arguments "$sid" "$mode"
+unit_arguments "$sid" "$mode" || die 'Cannot construct the bound cgroup service'
 exec {GWFD}<&-
 exec {LOCKFD}>&-
 unit=dev-session-$sid.service
@@ -125,7 +129,7 @@ finish() {
     if [[ -n $client ]]; then kill -TERM "$client" 2>/dev/null || true; wait "$client" 2>/dev/null || true; fi
     timeout --signal=KILL 2s rm -f -- "$RUNTIME/requests/$sid" || true
     # systemd 245 may run ExecStopPost before its final kill of remaining
-    # descendants. Reclaim the empty net_cls group after the stop job completes.
+    # descendants. Check/reclaim the service group after the stop job completes.
     reclaim_stopped_group "$sid" || { (( result != 0 )) || result=125; }
     exit "$result"
 }
@@ -134,6 +138,9 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 echo "Session $sid; exit the shell to close it." >&2
+if ! jq -e '.payload_networks | index("udp") != null' <<<"$PROXY_POLICY_JSON" >/dev/null; then
+    echo 'This proxy guarantees TCP only; DNS uses HTTPS through the proxy. Ordinary UDP is unavailable on TCP-only paths.' >&2
+fi
 # Explicit stdin preserves the terminal for the asynchronous native relay.
 systemd-run "${UNIT_ARGS[@]}" "$ROOT/dev-session" --internal-child "$sid" <&0 >&1 2>&2 &
 client=$!

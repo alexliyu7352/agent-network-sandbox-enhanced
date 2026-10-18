@@ -67,8 +67,9 @@ class LauncherTests(unittest.TestCase):
             self.assertNotEqual(call('trusted_path "$1"',link).returncode,0)
 
     def test_admission_stops_on_each_failed_precondition(self):
-        for failing in ('gateway_verify','policy_verify','route_verify'):
-            p=call('gateway_verify() { echo gateway; [[ $1 != x ]]; }; '
+        for failing in ('cgroup_verify','binding_verify','gateway_verify','policy_verify','route_verify'):
+            p=call('cgroup_verify() { echo cgroup; }; binding_verify() { echo binding; }; '
+                   'gateway_verify() { echo gateway; }; '
                    'policy_verify() { echo firewall; }; route_verify() { echo route; }; '
                    'gw() { echo enabled; }; '
                    'eval "$1() { echo failed; return 17; }"; '
@@ -77,12 +78,18 @@ class LauncherTests(unittest.TestCase):
             self.assertNotIn('enabled',p.stdout)
             self.assertNotIn('RELEASED',p.stdout)
 
-    def test_repair_cannot_change_bound_gateway_identity(self):
-        with tempfile.TemporaryDirectory() as td:
-            p=call('RUNTIME="$1"; BRIDGE=br-original; GATEWAY_IP=172.30.90.2; '
-                   'NODE_IP=203.0.113.8; NODE_PORT=443; binding_write; '
-                   'binding_verify; BRIDGE=br-new; binding_verify',td)
-            self.assertNotEqual(p.returncode,0)
-            self.assertNotIn('command not found',p.stderr)
+    def test_internal_operations_reject_unbound_cgroups_before_bootstrap_or_cleanup(self):
+        internal=(ROOT/'lib/main.sh').read_text().split('case ${1:-} in',1)[1].split('\nesac',1)[0]
+        for operation in ('--internal-child', '--internal-clean'):
+            for failing in ('binding_load', 'cgroup_verify'):
+                p=call('valid_session_id() { :; }; binding_load() { :; }; cgroup_verify() { :; }; '
+                       'trusted_path() { :; }; read_request() { :; }; '
+                       'bootstrap_workload() { echo BOOTSTRAP_RAN; }; '
+                       'cleanup_group() { echo CLEANUP_RAN; }; '
+                       'eval "$3() { return 19; }"; set -- "$1" "$2"; RUNTIME=/unused; '
+                       'case ${1:-} in'+internal+'\nesac',operation,'a'*32,failing)
+                self.assertEqual(p.returncode,125,p.stdout+p.stderr)
+                self.assertNotIn('BOOTSTRAP_RAN',p.stdout)
+                self.assertNotIn('CLEANUP_RAN',p.stdout)
 
 if __name__=='__main__':unittest.main()

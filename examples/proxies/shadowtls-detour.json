@@ -1,0 +1,73 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "upstream-dns",
+        "server": "1.1.1.1",
+        "server_port": 53,
+        "detour": "proxy"
+      }
+    ],
+    "final": "upstream-dns",
+    "strategy": "ipv4_only",
+    "disable_cache": false,
+    "disable_expire": false,
+    "cache_capacity": 4096
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": [
+        "198.18.0.1/15"
+      ],
+      "mtu": 1500,
+      "stack": "mixed",
+      "auto_route": false,
+      "auto_redirect": false,
+      "dns_mode": "disabled"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": [
+          "tun-in"
+        ],
+        "port": 53,
+        "action": "hijack-dns"
+      }
+    ],
+    "final": "proxy"
+  },
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "proxy",
+      "server": "192.0.2.1",
+      "server_port": 443,
+      "method": "chacha20-ietf-poly1305",
+      "password": "EXAMPLE_PASSWORD",
+      "udp_over_tcp": true,
+      "detour": "cover"
+    },
+    {
+      "type": "shadowtls",
+      "tag": "cover",
+      "server": "192.0.2.2",
+      "server_port": 443,
+      "version": 3,
+      "password": "EXAMPLE_SHADOWTLS_PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "proxy.example"
+      }
+    }
+  ]
+}

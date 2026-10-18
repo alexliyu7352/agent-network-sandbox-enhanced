@@ -3,6 +3,7 @@
 No host network changes. These tests are not Linux packet integration tests.
 """
 import ipaddress
+import json
 from pathlib import Path
 import shlex
 import subprocess
@@ -13,14 +14,21 @@ ROOT = Path(__file__).resolve().parents[1]
 TAG = 0x6D730001
 
 
-def emit(family, table):
+def emit(family, table, mode='v1', endpoints=None):
     script = ROOT / 'lib/network.sh'
     if not script.exists():
         raise AssertionError('shared network policy has not been implemented')
+    policy = {'format': 1, 'proxy_tag': 'proxy', 'outer_endpoints': endpoints or [
+        {'family': 4, 'address': '203.0.113.8', 'protocol': 'udp', 'port_start': 443, 'port_end': 443}],
+        'payload_networks': ['tcp', 'udp'], 'dns_transport': 'udp'}
     p = subprocess.run(['bash', '-c', 'source "$1"; BRIDGE=br-test; '
                         'GATEWAY_IP=172.30.90.2; NODE_IP=203.0.113.8; '
-                        'NODE_PORT=443; policy_emit "$2" "$3"',
-                        'test', str(script), str(family), table],
+                        'NODE_PORT=443; CGROUP_MODE=$4; PROXY_POLICY_JSON=$5; '
+                        'cgroup_match() { case $CGROUP_MODE in '
+                        'v1) echo "-m cgroup --cgroup 0x6d730001";; '
+                        'v2) echo "-m cgroup --path devsession.slice";; *) return 1;; esac; }; '
+                        'policy_emit "$2" "$3"',
+                        'test', str(script), str(family), table, mode, json.dumps(policy)],
                        text=True, capture_output=True, check=True)
     return p.stdout
 
@@ -42,6 +50,10 @@ class Rules:
                 if key == '-m': modules.append(val)
                 else: fields[key] = val
             if '--cgroup' in fields and p['classid'] != int(fields['--cgroup'], 0): continue
+            if '--path' in fields:
+                origin = p.get('socket_cgroup', '').strip('/')
+                parent = fields['--path'].strip('/')
+                if origin != parent and not origin.startswith(parent + '/'): continue
             if '--mark' in fields:
                 value, *mask = fields['--mark'].split('/')
                 field = 'connmark' if 'connmark' in modules else 'mark'
@@ -51,7 +63,9 @@ class Rules:
             if '-d' in fields and ipaddress.ip_address(p['dst']) not in ipaddress.ip_network(fields['-d'], strict=False): continue
             if '-s' in fields and ipaddress.ip_address(p['src']) not in ipaddress.ip_network(fields['-s'], strict=False): continue
             if '-p' in fields and p['proto'] != fields['-p']: continue
-            if '--dport' in fields and p['port'] != int(fields['--dport']): continue
+            if '--dport' in fields:
+                interval = list(map(int, fields['--dport'].split(':')))
+                if not interval[0] <= p['port'] <= interval[-1]: continue
             target = fields['-j']
             if target in ('DROP', 'RETURN', 'ACCEPT'): return target
             if target in ('MARK', 'CONNMARK'):
@@ -77,6 +91,43 @@ def packet(**kw):
 
 
 class SharedPolicyTests(unittest.TestCase):
+    def test_v2_subtree_matches_socket_origin_and_retains_marked_old_flows(self):
+        rules = Rules(emit(4, 'mangle', mode='v2'))
+        self.assertEqual(rules.visit('D8POST', packet(classid=0, out='eth0',
+            socket_cgroup='/devsession.slice/dev-session-one.service', process_cgroup='/other.slice')), 'DROP')
+        self.assertEqual(rules.visit('D8POST', packet(classid=0, out='eth0',
+            socket_cgroup='/other.slice', process_cgroup='/devsession.slice/dev-session-one.service')), 'RETURN')
+        self.assertEqual(rules.visit('D8POST', packet(classid=0, out='eth0',
+            socket_cgroup='/devsession.slice-other/service')), 'RETURN')
+        self.assertEqual(rules.visit('D8POST', packet(classid=0, out='eth0',
+            socket_cgroup='/removed-parent/old-service', connmark=TAG)), 'DROP')
+
+    def test_v2_dns_and_ipv6_use_the_same_socket_subtree(self):
+        for proto in ('tcp', 'udp'):
+            p = packet(classid=0, proto=proto, dst='127.0.0.53', port=53, out='lo',
+                       socket_cgroup='/devsession.slice/dev-session-one.service')
+            Rules(emit(4, 'mangle', mode='v2')).visit('D8OUT', p)
+            self.assertEqual(Rules(emit(4, 'nat', mode='v2')).visit('D8DNS', p), 'DNAT')
+        for hook in ('D8OUT6', 'D8POST6'):
+            for dst in ('::1', '2606:4700:4700::1111'):
+                self.assertEqual(Rules(emit(6, 'mangle', mode='v2')).visit(hook,
+                    packet(classid=0, out='eth0', dst=dst,
+                           socket_cgroup='/devsession.slice/dev-session-one.service')), 'DROP')
+
+    def test_multi_endpoint_guard_opens_only_explicit_outer_transport_ranges(self):
+        endpoints = [
+            {'family': 4, 'address': '203.0.113.8', 'protocol': 'udp', 'port_start': 8443, 'port_end': 8445},
+            {'family': 4, 'address': '192.0.2.10', 'protocol': 'tcp', 'port_start': 443, 'port_end': 443}]
+        rules = Rules(emit(4, 'mangle', endpoints=endpoints))
+        for ip, proto, port, expected in [
+            ('203.0.113.8', 'udp', 8443, 'RETURN'), ('203.0.113.8', 'udp', 8445, 'RETURN'),
+            ('203.0.113.8', 'udp', 8442, 'DROP'), ('203.0.113.8', 'tcp', 8443, 'DROP'),
+            ('192.0.2.10', 'tcp', 443, 'RETURN'), ('192.0.2.10', 'udp', 443, 'DROP'),
+            ('8.8.8.8', 'tcp', 443, 'DROP')]:
+            p = packet(classid=0, src='172.30.90.2', dst=ip, proto=proto, port=port)
+            p['in'] = 'br-test'
+            self.assertEqual(rules.visit('D8GW', p), expected, (ip, proto, port))
+
     def test_every_managed_selector_denies_physical_egress(self):
         r = Rules(emit(4, 'mangle'))
         for field in ('classid', 'mark', 'connmark'):
@@ -154,13 +205,33 @@ class SharedPolicyTests(unittest.TestCase):
                 'firewall_tool() { echo "$2"; }; '
                 # $2 inside a function is not the script positional parameter.
                 'firewall_tool() { echo "$FW_TEST"; }; '
-                'BRIDGE=br-test; GATEWAY_IP=172.30.90.2; NODE_IP=203.0.113.8; NODE_PORT=443; policy_install',
+                'cgroup_match() { echo "-m cgroup --cgroup 0x6d730001"; }; '
+                'BRIDGE=br-test; GATEWAY_IP=172.30.90.2; policy_install',
                 'test', str(ROOT / 'lib/network.sh')], text=True, capture_output=True,
-                env={'PATH': '/usr/bin:/bin', 'FW_TEST': str(binpath), 'TRANSACTIONS': tmp+'/transactions'})
+                env={'PATH': '/usr/bin:/bin', 'FW_TEST': str(binpath), 'TRANSACTIONS': tmp+'/transactions',
+                     'PROXY_POLICY_JSON': json.dumps({'format': 1, 'outer_endpoints': [
+                         {'family': 4, 'address': '203.0.113.8', 'protocol': 'udp', 'port_start': 443, 'port_end': 443}]})})
             self.assertEqual(p.returncode, 0, p.stderr)
             transactions = (Path(tmp)/'transactions').read_text()
             self.assertIn('-I OUTPUT 1 -j D8OUT', transactions)
             self.assertNotIn('-F OUTPUT', transactions)
+
+    def test_invalid_endpoint_cannot_install_a_partial_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            restore = Path(tmp) / 'fw-restore'
+            restore.write_text('#!/bin/bash\ncat >>"$TRANSACTIONS"\n')
+            restore.chmod(0o700)
+            p = subprocess.run(['bash', '-c', 'set -euo pipefail; source "$1"; '
+                'cgroup_match() { echo "-m cgroup --cgroup 0x6d730001"; }; '
+                'firewall_tool() { echo "$FW_TEST"; }; '
+                'BRIDGE=br-test; GATEWAY_IP=172.30.90.2; '
+                'if policy_install; then exit 9; fi', 'test', str(ROOT / 'lib/network.sh')],
+                text=True, capture_output=True, env={'PATH': '/usr/bin:/bin',
+                'FW_TEST': str(Path(tmp) / 'fw'), 'TRANSACTIONS': tmp + '/transactions',
+                'PROXY_POLICY_JSON': '{"format":1,"outer_endpoints":[{"protocol":"all"}]}'})
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertFalse((Path(tmp) / 'transactions').exists())
+            self.assertNotIn('No such file', p.stderr, 'Validation must precede firewall access')
 
 
 if __name__ == '__main__': unittest.main()

@@ -5,6 +5,7 @@ All ip, iptables, sysctl, proxy, and probe commands are intercepted. Synthetic
 endpoints are used; the runner's firewall and network are never modified.
 """
 import copy
+import hashlib
 import ipaddress
 import json
 import os
@@ -20,7 +21,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = Path(os.environ.get("GATEWAY_SCRIPT", ROOT / "entrypoint-gateway.sh"))
 ENDPOINT = "203.0.113.45"
-READY_TEXT = "worker-policy-v8\n"
+POLICY_FILE = Path(os.environ.get("GATEWAY_POLICY_FILE", ROOT / "gateway-policy.jq"))
 PROBES = {"getent", "dig", "nslookup", "host", "curl", "wget", "ping", "ping6",
           "nc", "socat", "traceroute", "tun2socks", "sing-box"}
 CHAINS = ("INPUT", "OUTPUT", "FORWARD")
@@ -31,7 +32,11 @@ def native_config():
         "log": {"level": "info", "timestamp": True},
         "dns": {"servers": [{"type": "udp", "tag": "upstream-dns", "server": "1.1.1.1",
                               "server_port": 53, "detour": "proxy"}],
-                "final": "upstream-dns", "disable_cache": False, "disable_expire": False},
+                "final": "upstream-dns", "strategy": "ipv4_only",
+                "disable_cache": False, "disable_expire": False},
+        "inbounds": [{"type": "tun", "tag": "tun-in", "interface_name": "tun0",
+                      "address": ["198.18.0.1/15"], "mtu": 1500, "stack": "mixed",
+                      "auto_route": False, "auto_redirect": False, "dns_mode": "disabled"}],
         "outbounds": [{
             "type": "hysteria2", "tag": "proxy", "server": ENDPOINT,
             "server_port": 443, "bind_interface": "eth0",
@@ -39,8 +44,35 @@ def native_config():
             "disable_path_mtu_discovery": True,
             "tls": {"enabled": True, "insecure": True, "alpn": ["h3"]},
         }],
-        "route": {"final": "proxy"},
+        "route": {"rules": [{"inbound": ["tun-in"], "port": 53,
+                              "action": "hijack-dns"}], "final": "proxy"},
     }
+
+
+def http_config():
+    config = native_config()
+    config["outbounds"] = [{
+        "type": "http", "tag": "proxy", "server": "192.0.2.20", "server_port": 3128,
+        "username": "offline-user", "password": "fake-http-password",
+    }]
+    return config
+
+
+def mixed_config():
+    config = native_config()
+    hy2 = config["outbounds"][0]
+    hy2.update(tag="quic-node", server="192.0.2.10", server_ports=["8443:8445", "443:443"])
+    http = http_config()["outbounds"][0]
+    http["tag"] = "tcp-node"
+    config["outbounds"] = [
+        {"type": "selector", "tag": "proxy", "outbounds": ["quic-node", "tcp-node"]},
+        hy2, http,
+    ]
+    return config
+
+
+def canonical_json(value):
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
 
 
 SHIM = r'''#!/usr/bin/env python3
@@ -91,7 +123,22 @@ def invoke():
                 if os.environ.get("VERIFY_BAD_POLICY") == chain:
                     policy = "ACCEPT"
                 print("-P " + chain + " " + policy)
-            for rule in rules:
+            visible_rules = list(rules)
+            if os.environ.get("VERIFY_REORDER_RULES") == chain:
+                visible_rules.reverse()
+            if os.environ.get("VERIFY_MISSING_RULE") == chain and visible_rules:
+                visible_rules.pop()
+            for rule in visible_rules:
+                if os.environ.get("KERNEL_CANONICAL_RULES") == "1":
+                    pairs = [rule[index:index + 2] for index in range(0, len(rule), 2)]
+                    for pair in pairs:
+                        if pair == ["--ctstate", "ESTABLISHED,RELATED"]:
+                            pair[1] = "RELATED,ESTABLISHED"
+                    if ["-p", "tcp"] in pairs and ["-m", "tcp"] not in pairs:
+                        pairs.append(["-m", "tcp"])
+                    if ["-p", "udp"] in pairs and ["-m", "udp"] not in pairs:
+                        pairs.append(["-m", "udp"])
+                    rule = [word for pair in reversed(pairs) for word in pair]
                 print("-A " + chain + " " + " ".join(rule))
             if os.environ.get("VERIFY_EXTRA_RULE") == chain:
                 print("-A " + chain + " -j ACCEPT")
@@ -117,7 +164,19 @@ def invoke():
                     routes = []
                 print(json.dumps(routes))
             else:
-                raise AssertionError("Unsupported route read: " + repr(args))
+                routes = [dict(route) for route in state["routes"].values()]
+                routes.extend([
+                    {"dst": "default", "dev": "eth0", "gateway": "172.19.0.1", "flags": []},
+                    {"dst": "172.19.0.0/16", "dev": "eth0", "scope": "link", "flags": []},
+                    {"dst": "198.18.0.0/15", "dev": "tun0", "scope": "link", "flags": []},
+                ])
+                if os.environ.get("EXTRA_NODE_ROUTE"):
+                    routes.append({"dst": "192.0.2.99", "dev": os.environ["EXTRA_NODE_ROUTE"],
+                                   "gateway": "172.19.0.1", "flags": []})
+                if os.environ.get("EXTRA_ETH0_ROUTE"):
+                    routes.append({"dst": "192.0.2.0/24", "dev": "eth0",
+                                   "gateway": "172.19.0.1", "flags": []})
+                print(json.dumps(routes))
         elif "route" in args and "replace" in args:
             prefix = args[args.index("replace") + 1]
             destination = prefix[:-3] if prefix.endswith("/32") else prefix
@@ -165,6 +224,17 @@ def invoke():
         state[mode + "_marker"] = marker.read_text() if marker.exists() else None
         if mode == "check" and os.environ.get("BAD_CONFIG") == "1":
             return 1
+        if mode == "check" and os.environ.get("CHANGE_SOURCE_DURING_CHECK") == "1":
+            source = Path(os.environ["CONFIG_TEMPLATE"])
+            source.write_text(source.read_text() + "\n")
+        if mode == "check" and os.environ.get("CHANGE_EFFECTIVE_DURING_CHECK") == "1":
+            effective = Path(args[args.index("-c") + 1])
+            changed = json.loads(effective.read_text())
+            changed["outbounds"][-1]["password"] = "changed-fake-authentication"
+            effective.write_text(json.dumps(changed))
+        if mode == "check" and os.environ.get("CHANGE_PARSER_DURING_CHECK") == "1":
+            parser = Path(os.environ["GATEWAY_POLICY_FILE"])
+            parser.write_text(parser.read_text() + "\n# altered parser identity\n")
         if mode == "run":
             return int(os.environ.get("CORE_EXIT", "0"))
     else:
@@ -200,8 +270,11 @@ def verdict(firewall, chain, **packet):
                 continue
             if flag == "-j":
                 target = value
-            elif flag in ("-i", "-o", "-p", "--dport", "--sport"):
+            elif flag in ("-i", "-o", "-p"):
                 matches &= str(packet.get(flag, "")) == value
+            elif flag in ("--dport", "--sport"):
+                lower, _, upper = value.partition(":")
+                matches &= int(lower) <= int(packet.get(flag, 0)) <= int(upper or lower)
             elif flag == "--ctstate":
                 matches &= packet.get("state", "NEW") in value.split(",")
             elif flag in ("-s", "-d"):
@@ -234,6 +307,8 @@ class GatewayTests(unittest.TestCase):
             template = base / "template.json"
             template.write_text(json.dumps(native_config() if config is None else config)
                                 if template_text is None else template_text)
+            parser_file = base / "policy.jq"
+            parser_file.write_bytes(POLICY_FILE.read_bytes())
             calls, kernel, runtime = base / "calls.jsonl", base / "kernel.json", base / "run"
             kernel.write_text(json.dumps({"policies": dict.fromkeys(CHAINS, "ACCEPT"),
                                          "rules": initial_rules or {}, "routes": {}, "tun": initial_tun}))
@@ -247,7 +322,8 @@ class GatewayTests(unittest.TestCase):
                 env.pop(name, None)
             env.update(PATH=f"{bindir}:{os.environ['PATH']}", CALL_LOG=str(calls),
                        KERNEL_STATE=str(kernel), CONFIG_TEMPLATE=str(template),
-                       GATEWAY_RUNTIME_DIR=str(runtime), TMPDIR=str(base))
+                       GATEWAY_RUNTIME_DIR=str(runtime), TMPDIR=str(base),
+                       GATEWAY_POLICY_FILE=str(parser_file))
             env.update(extra_env or {})
             result = subprocess.run(["/bin/sh", str(SCRIPT), *args], env=env,
                                     capture_output=True, text=True, timeout=10)
@@ -256,6 +332,7 @@ class GatewayTests(unittest.TestCase):
             after = {p.name: p.read_bytes() for p in runtime.iterdir()} if runtime.exists() else {}
             marker = runtime / "policy-ready"
             state.update(runtime_before=before, runtime_after=after,
+                         source_bytes=template.read_bytes(),
                          marker=marker.read_text() if marker.exists() else None,
                          marker_mode=marker.stat().st_mode & 0o777 if marker.exists() else None)
             return result, events, state
@@ -272,6 +349,20 @@ class GatewayTests(unittest.TestCase):
         self.assert_offline_failure(result, events, state)
         self.assertFalse([e for e in events if is_network_mutation(e)])
 
+    def assert_ready_identity(self, state):
+        self.assertTrue(state["marker"].startswith("{"), "readiness must be versioned JSON")
+        ready = json.loads(state["marker"])
+        self.assertEqual(set(ready), {"format", "source_sha256", "effective_sha256",
+                                     "policy_parser_sha256", "policy"})
+        self.assertEqual(ready["format"], 2)
+        self.assertEqual(ready["source_sha256"], hashlib.sha256(state["source_bytes"]).hexdigest())
+        self.assertEqual(ready["effective_sha256"],
+                         hashlib.sha256(state["runtime_after"]["config.json"]).hexdigest())
+        self.assertEqual(ready["policy_parser_sha256"], hashlib.sha256(POLICY_FILE.read_bytes()).hexdigest())
+        self.assertEqual(state["runtime_after"]["config.json"], canonical_json(state["run_config"]))
+        self.assertEqual(state["marker"].encode(), canonical_json(ready))
+        return ready
+
     def test_native_config_is_preserved_without_any_outbound_probe(self):
         result, events, state = self.run_gateway()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -286,9 +377,9 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual([event[1] for event in commands], ["check", "run"])
         self.assertFalse(any(event[0] == "sing-box" for event in events))
         self.assertEqual(set(state["runtime_after"]), {"config.json", "policy-ready"})
-        self.assertEqual(state["marker"], READY_TEXT)
+        self.assert_ready_identity(state)
 
-    def test_only_log_level_changes_and_legacy_env_cannot_redirect_node(self):
+    def test_source_log_authentication_and_node_are_preserved_despite_legacy_env(self):
         original = native_config()
         original["outbounds"][0].update(server="198.51.100.17", server_port=2443)
         result, _, state = self.run_gateway({
@@ -296,9 +387,7 @@ class GatewayTests(unittest.TestCase):
             "PROXY_PROTOCOL": "obsolete-protocol",
         }, config=original)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        expected = copy.deepcopy(original)
-        expected["log"]["level"] = "debug"
-        self.assertEqual(state["run_config"], expected)
+        self.assertEqual(state["run_config"], original)
         self.assertIn("198.51.100.17/32", state["routes"])
         self.assertNotIn("192.0.2.99/32", state["routes"])
         for port, allowed in ((2443, "ACCEPT"), (443, "DROP")):
@@ -394,7 +483,8 @@ class GatewayTests(unittest.TestCase):
                 self.assertFalse(state["routes"])
 
     def test_readiness_requires_verified_policies_rules_and_no_extra_allowances(self):
-        for failure in ("VERIFY_BAD_POLICY", "VERIFY_MISSING_RULE", "VERIFY_EXTRA_RULE"):
+        for failure in ("VERIFY_BAD_POLICY", "VERIFY_MISSING_RULE", "VERIFY_EXTRA_RULE",
+                        "VERIFY_REORDER_RULES"):
             for chain in CHAINS:
                 with self.subTest(failure=failure, chain=chain):
                     self.assert_offline_failure(*self.run_gateway({failure: chain}, stale_runtime=True))
@@ -438,8 +528,13 @@ class GatewayTests(unittest.TestCase):
         result, events, state = self.run_gateway(stale_runtime=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsNone(state["check_marker"])
-        self.assertEqual(state["run_marker"], READY_TEXT)
-        self.assertEqual(state["marker"], READY_TEXT)
+        self.assertEqual(state["run_marker"], state["marker"])
+        ready = self.assert_ready_identity(state)
+        self.assertEqual(ready["policy"], {
+            "format": 1, "proxy_tag": "proxy", "outer_endpoints": [{"family": 4,
+                "address": ENDPOINT, "protocol": "udp", "port_start": 443, "port_end": 443}],
+            "payload_networks": ["tcp", "udp"], "dns_transport": "udp",
+        })
         self.assertEqual(state["marker_mode"], 0o600)
         self.assertFalse([name for name in state["runtime_after"] if name.startswith(".policy-ready")])
         self.assertFalse([e for e in events if e[0] in PROBES])
@@ -510,7 +605,7 @@ class GatewayTests(unittest.TestCase):
             config = native_config()
             config["outbounds"][0][field] = value
             variants.append(config)
-        for field in ("type", "tag", "server", "server_port", "bind_interface"):
+        for field in ("type", "tag", "server", "server_port"):
             config = native_config()
             del config["outbounds"][0][field]
             variants.append(config)
@@ -528,6 +623,107 @@ class GatewayTests(unittest.TestCase):
         for index, config in enumerate(variants):
             with self.subTest(variant=index):
                 self.assert_check_rejected(config=config)
+
+    def test_tcp_only_proxy_gets_https_dns_and_only_tcp_outer_permissions(self):
+        config = http_config()
+        result, events, state = self.run_gateway(config=config)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        effective = state["run_config"]
+        expected_outbound = {**config["outbounds"][0], "bind_interface": "eth0"}
+        self.assertEqual(effective["outbounds"], [expected_outbound])
+        self.assertEqual(effective["log"], config["log"])
+        self.assertEqual(effective["dns"]["servers"], [{
+            "type": "https", "tag": "upstream-dns", "server": "1.1.1.1", "server_port": 443,
+            "path": "/dns-query", "detour": "proxy",
+            "tls": {"enabled": True, "server_name": "cloudflare-dns.com"},
+        }])
+        self.assertEqual(state["source_bytes"], json.dumps(config).encode())
+        self.assertIn("does not support UDP", result.stdout)
+        for transport, expected in (("tcp", "ACCEPT"), ("udp", "DROP")):
+            self.assertEqual(verdict(state, "OUTPUT", **{
+                "-o": "eth0", "-d": "192.0.2.20", "-p": transport, "--dport": 3128,
+            }), expected)
+        ready = self.assert_ready_identity(state)
+        self.assertEqual(ready["policy"]["payload_networks"], ["tcp"])
+        self.assertEqual(ready["policy"]["dns_transport"], "https")
+        self.assertNotIn("fake-http-password", state["marker"] + result.stdout + result.stderr)
+        self.assertFalse([event for event in events if event[0] in PROBES])
+
+    def test_selector_installs_exact_mixed_transports_port_ranges_and_node_routes(self):
+        result, _, state = self.run_gateway(config=mixed_config())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(set(state["routes"]), {
+            "192.0.2.10/32", "192.0.2.20/32", "0.0.0.0/1", "128.0.0.0/1",
+        })
+        endpoints = [("192.0.2.10", "udp", 443), ("192.0.2.10", "udp", 8443),
+                     ("192.0.2.10", "udp", 8444), ("192.0.2.10", "udp", 8445),
+                     ("192.0.2.20", "tcp", 3128)]
+        for address, protocol, port in endpoints:
+            self.assertEqual(verdict(state, "OUTPUT", **{
+                "-o": "eth0", "-d": address, "-p": protocol, "--dport": port,
+            }), "ACCEPT")
+            self.assertEqual(verdict(state, "INPUT", **{
+                "-i": "eth0", "-s": address, "-p": protocol, "--sport": port,
+                "state": "ESTABLISHED",
+            }), "ACCEPT")
+            for connection in ("NEW", "ESTABLISHED", "RELATED"):
+                self.assertEqual(verdict(state, "FORWARD", **{
+                    "-i": "eth0", "-o": "eth0", "-d": address, "-p": protocol,
+                    "--dport": port, "state": connection,
+                }), "DROP")
+        for address, protocol, port in (("192.0.2.10", "udp", 8442),
+                                        ("192.0.2.10", "udp", 8446),
+                                        ("192.0.2.10", "tcp", 8443),
+                                        ("192.0.2.20", "udp", 3128),
+                                        ("192.0.2.99", "tcp", 3128)):
+            self.assertEqual(verdict(state, "OUTPUT", **{
+                "-o": "eth0", "-d": address, "-p": protocol, "--dport": port,
+            }), "DROP")
+        ready = self.assert_ready_identity(state)
+        self.assertEqual(ready["policy"]["outer_endpoints"], [
+            {"family": 4, "address": "192.0.2.10", "protocol": "udp", "port_start": 443, "port_end": 443},
+            {"family": 4, "address": "192.0.2.10", "protocol": "udp", "port_start": 8443, "port_end": 8445},
+            {"family": 4, "address": "192.0.2.20", "protocol": "tcp", "port_start": 3128, "port_end": 3128},
+        ])
+
+    def test_kernel_option_order_and_implicit_transport_module_are_accepted(self):
+        result, _, _ = self.run_gateway({"KERNEL_CANONICAL_RULES": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_readiness_rejects_extra_node_host_routes_and_extra_eth0_gateway_routes(self):
+        for environment in ({"EXTRA_NODE_ROUTE": "eth0"}, {"EXTRA_NODE_ROUTE": "tun0"},
+                            {"EXTRA_ETH0_ROUTE": "1"}):
+            with self.subTest(environment=environment):
+                self.assert_offline_failure(*self.run_gateway(environment, stale_runtime=True))
+
+    def test_readiness_rejects_source_effective_authentication_or_parser_drift(self):
+        for key in ("CHANGE_SOURCE_DURING_CHECK", "CHANGE_EFFECTIVE_DURING_CHECK",
+                    "CHANGE_PARSER_DURING_CHECK"):
+            with self.subTest(key=key):
+                self.assert_offline_failure(*self.run_gateway({key: "1"}, stale_runtime=True))
+
+    def test_nonpersistent_existing_tun_never_receives_traffic_allowances(self):
+        result, events, state = self.run_gateway(initial_tun={
+            "ifname": "tun0", "flags": ["UP"], "mtu": 1500, "addr_info": [],
+            "linkinfo": {"info_kind": "tun", "info_data": {"type": "tun", "persist": False}},
+        })
+        self.assert_offline_failure(result, events, state)
+        self.assertFalse(state["routes"])
+
+    def test_malformed_configuration_never_exposes_source_text_in_errors(self):
+        result, events, state = self.run_gateway(
+            template_text='{"password":"SENSITIVE_FAKE_CANARY", "broken": SENSITIVE_FAKE_CANARY}',
+            stale_runtime=True)
+        self.assert_offline_failure(result, events, state)
+        self.assertNotIn("SENSITIVE_FAKE_CANARY", result.stdout + result.stderr)
+
+    def test_multiple_configuration_documents_are_rejected_before_core_check(self):
+        source = json.dumps(native_config()) + "\n" + json.dumps(native_config()) + "\n"
+        result, events, state = self.run_gateway(args=("--check",), template_text=source,
+                                                  stale_runtime=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(events, "the compiler must reject multiple documents before invoking the core")
+        self.assertEqual(state["runtime_before"], state["runtime_after"])
 
 
 class EngineNameTests(unittest.TestCase):
