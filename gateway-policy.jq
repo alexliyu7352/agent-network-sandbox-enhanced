@@ -299,44 +299,79 @@ def channels($wanted):
     elif .type == "naive" and .quic == true then ["udp"]
     elif .transport.type == "quic" then ["udp"]
     else ["tcp"] end;
-def lookup($map; $name; $path):
-  ensure(($path | index($name)) == null; "outbound reference cycle is forbidden")
-  | ensure(($path | length) < 32; "outbound reference depth exceeds 32 hops")
-  | ensure($map | has($name); "outbound reference is missing") | $map[$name];
-def capabilities($map; $name; $path; $carrier):
-  lookup($map;$name;$path) as $node
-  | if ($node | group) then
-      [$node.outbounds[] | capabilities($map;.;$path + [$name];$carrier)] as $branches
-      | reduce $branches[] as $branch (["tcp","udp"]; . - (. - $branch))
-    else
-      $node | ensure($carrier or .type != "shadowtls";
-                      "ShadowTLS is a transport wrapper and cannot be a final proxy candidate")
-      | intrinsic as $payload
-      | if .detour != null and .detour != "" then
-          capabilities($map;.detour;$path + [$name];true) as $carrier_networks
-          | ensure(subset(channels($payload);$carrier_networks);
-                   "detour cannot carry the configured protocol transport; use a compatible carrier or restrict payload network")
-          | $payload
-        else $payload end
-    end;
 def references:
   if group then .outbounds else if .detour != null and .detour != "" then [.detour] else [] end end;
-def reachable($map; $name; $path):
-  lookup($map;$name;$path) as $node
-  | [$name] + ([$node | references[] | reachable($map;.;$path + [$name])] | add // []);
-def endpoints($map; $name; $wanted; $path):
-  lookup($map;$name;$path) as $node
-  | if ($node | group) then
-      [$node.outbounds[] | endpoints($map;.;$wanted;$path + [$name])]
-      + (if $node.type == "urltest" then
-           [$node.outbounds[] | endpoints($map;.;["tcp"];$path + [$name])] else [] end)
-      | add // []
-    else $node | channels($wanted) as $channels
-      | if .detour != null and .detour != "" then endpoints($map;.detour;$channels;$path + [$name])
-        else .server as $server | port_ranges as $ports
-          | [$channels[] as $protocol | $ports[] |
-              {family:4,address:$server,protocol:$protocol,port_start:.[0],port_end:.[1]}] end
-    end;
+
+# Validate the graph and compute a leaves-first order before evaluating it.
+# Shared DAG branches must not expand into every possible path: all subsequent
+# passes use one cached capability and one combined demand per node.
+def graph_order($map):
+  ensure($map | has("proxy"); "outbound reference is missing")
+  | ensure(all($map[]; all(references[]; . as $name | $map | has($name)));
+           "outbound reference is missing")
+  | reduce range(0; $map | length) as $iteration
+      ({pending:$map,order:[],depth:{}};
+       if (.pending | length) == 0 then . else
+         . as $state
+         | [.pending | keys[] | . as $name
+            | select(all($map[$name] | references[]; $state.depth[.] != null))] as $ready
+         | ensure(($ready | length) > 0; "outbound reference cycle is forbidden")
+         | reduce $ready[] as $name (.;
+             ($map[$name] | references | map($state.depth[.]) | (max // 0) + 1) as $depth
+             | ensure($depth <= 32; "outbound reference depth exceeds 32 hops")
+             | .depth[$name] = $depth | .order += [$name] | del(.pending[$name]))
+       end)
+  | .order;
+
+def graph_roles($map; $order):
+  reduce ($order | reverse[]) as $name
+    ({reachable:{proxy:true},final:{proxy:true}};
+     if .reachable[$name] then
+       reduce ($map[$name] | references[]) as $reference (.; .reachable[$reference] = true)
+     else . end
+     # URLTest probes need a forwarding protocol too, even when the group is
+     # used only as a detour. A forwarding leaf may itself detour via ShadowTLS.
+     | if (.final[$name] and ($map[$name] | group)) or
+          (.reachable[$name] and $map[$name].type == "urltest") then
+         reduce $map[$name].outbounds[] as $reference (.; .final[$reference] = true)
+       else . end);
+
+def capabilities($map; $order; $roles):
+  reduce $order[] as $name ({};
+    . as $known | $map[$name] as $node
+    | ensure(($roles.final[$name] | not) or $node.type != "shadowtls";
+             "ShadowTLS is a transport wrapper and cannot be a final or URLTest proxy candidate")
+    | (if ($node | group) then
+         reduce $node.outbounds[] as $reference (["tcp","udp"]; . - (. - $known[$reference]))
+       else $node | intrinsic end) as $payload
+    | if $node.detour != null and $node.detour != "" then
+        ensure(subset(($node | channels($payload)); $known[$node.detour]);
+               "detour cannot carry the configured protocol transport; use a compatible carrier or restrict payload network")
+      else . end
+    | if $node.type == "urltest" then
+        ensure(all($node.outbounds[]; ($known[.] | index("tcp")) != null);
+               "urltest TCP health probes require TCP-capable candidate paths; use compatible carriers")
+      else . end
+    | .[$name] = $payload);
+
+def add_demand($name; $wanted):
+  .wanted[$name] = ((.wanted[$name] // []) + $wanted | unique);
+def endpoints($map; $order):
+  reduce ($order | reverse[]) as $name
+    ({wanted:{proxy:["tcp","udp"]},outer:[]};
+     .wanted[$name] as $wanted | $map[$name] as $node
+     | if $wanted == null then .
+       elif ($node | group) then
+         ($wanted + (if $node.type == "urltest" then ["tcp"] else [] end) | unique) as $branch_wanted
+         | reduce $node.outbounds[] as $reference (.; add_demand($reference;$branch_wanted))
+       else ($node | channels($wanted)) as $channels
+         | if $node.detour != null and $node.detour != "" then add_demand($node.detour;$channels)
+           else ($node | port_ranges) as $ports
+             | .outer += [$channels[] as $protocol | $ports[] |
+                 {family:4,address:$node.server,protocol:$protocol,port_start:.[0],port_end:.[1]}]
+           end
+       end)
+  | .outer;
 def normalize_endpoints:
   sort_by(.family, (.address | split(".") | map(tonumber)), .protocol, .port_start, .port_end)
   | reduce .[] as $endpoint ([];
@@ -350,13 +385,15 @@ try (
   | ensure(($remaining | length) == 0; "exactly one JSON configuration document is required")
   | $first | check_source as $source
   | ($source.outbounds | map({key:.tag,value:.}) | from_entries) as $map
-  | capabilities($map;"proxy";[];false) as $payload
+  | graph_order($map) as $order
+  | graph_roles($map;$order) as $roles
+  | ensure(($roles.reachable | length) == ($map | length);
+           "unreferenced outbounds are unsupported; all configured nodes must belong to the proxy graph")
+  | (capabilities($map;$order;$roles) | .proxy) as $payload
   | ensure(($payload | length) > 0; "proxy candidates have no common usable payload network")
   | ensure(($payload | index("tcp")) != null;
            "final proxy must guarantee TCP for session readiness; UDP-only detour carriers are allowed")
-  | ensure((reachable($map;"proxy";[]) | unique | length) == ($map | length);
-           "unreferenced outbounds are unsupported; all configured nodes must belong to the proxy graph")
-  | (endpoints($map;"proxy";["tcp","udp"];[]) | normalize_endpoints) as $outer
+  | (endpoints($map;$order) | normalize_endpoints) as $outer
   | ensure(($outer | length) > 0; "proxy graph has no controlled outer endpoint")
   | (if ($payload | index("udp")) != null then "udp" else "https" end) as $dns
   | if $mode == "policy" then

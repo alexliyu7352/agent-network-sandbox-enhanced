@@ -15,7 +15,7 @@ import subprocess
 import termios
 import threading
 import time
-from host_acceptance import DEV, CGROOT, RUNTIME, Suite, Session, command
+from host_acceptance import DEV, RUNTIME, Suite, Session, command, udp_target
 
 
 class Terminal:
@@ -237,26 +237,18 @@ result=[pid,q.pid]
                 old_attempts=old_work.result(timeout=20);new_attempts=new_work.result(timeout=20)
                 forced_attempts=forced_work.result(timeout=20)
             assert all(attempts[0]['started']<elapsed for attempts in (old_attempts,new_attempts,forced_attempts))
-            check=command(DEV,'check',check=False)
-            rejection=None
-            if check.returncode:
-                # Docker may insert its NAT hook before ours. Strict admission
-                # intentionally rejects this; do not weaken it or repair live.
-                rejection=self.rejected_start('docker-restart-policy-drift')
-                assert not self.https(c)['ok']
-            else:assert self.https(c)['ok']
+            recovery=self.after_namespace_fault('docker-restart')
+            if not recovery['offline_maintenance_required']:assert self.https(c)['ok']
             self.credentials(a);self.assert_rules();a.close();b.close();c.close()
             self.stop_captures();physical=self.verify_physical_capture(capture)
-            if check.returncode:command(DEV,'init')
-            self.gateway_ready()
-            recovered=Session(self,'docker-recovered');assert self.https(recovered)['ok'];recovered.close()
+            if not recovery['offline_maintenance_required']:
+                self.gateway_ready()
+                recovered=Session(self,'docker-recovered');assert self.https(recovered)['ok'];recovered.close()
             self.assert_rules()
-            return dict(physical,session_survived=True,gateway_recovered=True,capabilities_unchanged=True,
-                        post_restart_check_exit=check.returncode,rejected_start=rejection,
-                        recovery='all sessions closed, explicit init' if check.returncode else 'check',
+            return dict(physical,session_survived=True,capabilities_unchanged=True,
+                        recovery=recovery,all_test_sessions_closed=True,
                         restart_seconds=round(elapsed,3),existing_attempts=old_attempts,
                         new_attempts=new_attempts,forced_attempts=forced_attempts)
-        self.record('Docker_daemon_restart',docker_restart)
         def concurrent_sessions():
             sessions=[Session(self,'parallel-'+name) for name in 'ABC']
             assert len({session.sid for session in sessions})==3
@@ -281,12 +273,14 @@ result=[pid,q.pid]
                 for done in pool.map(one,range(self.repetitions)):
                     completed+=1
                     if completed%10==0:print('SHORT_SESSIONS_COMPLETED='+str(completed),flush=True)
-            assert not [path for path in CGROOT.iterdir() if path.is_dir()]
+            assert not [path for path in self.binding.cgroup_root.iterdir() if path.is_dir()]
             assert list((RUNTIME/'requests').iterdir())==[]
             self.assert_rules()
             return {'sessions':completed,'concurrency':3,'seconds':round(time.monotonic()-started,3),'residual_sessions':0,'constant_rule_count':len(self.baseline)}
         self.record('repeated_parallel_sessions',repetitions)
         self.record('lifecycle_policy_unchanged',self.assert_rules)
+        if self.namespace_fault=='docker-restart':
+            self.record('Docker_daemon_restart',docker_restart)
 
     def cleanup(self):
         for terminal in self.terminals:terminal.dispose()
@@ -298,6 +292,9 @@ def main():
     parser.add_argument('--user',default='ubuntu')
     parser.add_argument('--output',default='/root/dev-session-acceptance-20261009/lifecycle')
     parser.add_argument('--repetitions',type=int,default=100)
+    parser.add_argument('--udp-echo',type=udp_target)
+    parser.add_argument('--namespace-fault',choices=('none','docker-restart'),default='none',
+                        help='last scenario; namespace changes require offline rebind after sessions close')
     args=parser.parse_args();assert os.geteuid()==0
     os.umask(0o077);suite=Lifecycle(args)
     try:suite.run_lifecycle()

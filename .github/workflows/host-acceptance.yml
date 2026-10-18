@@ -1,0 +1,86 @@
+name: Native cgroup v2 host acceptance
+
+on:
+  push:
+    branches: ['work/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ubuntu-v2:
+    # Public standard runners are free; never send this privileged harness to
+    # self-hosted machines, production hosts, or a container-only runner.
+    if: ${{ github.event.repository.private == false }}
+    name: Ubuntu 26.04 / ${{ matrix.protocol }} / ${{ matrix.scenario }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        protocol: [hysteria2, http]
+        scenario: [healthy, gateway-stop, gateway-kill, docker-restart]
+    steps:
+      - name: Fetch this public commit into a fresh root-private checkout
+        env:
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SERVER_URL" == https://github.com ]]
+          [[ "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$CI_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          sudo env CI_REPOSITORY="$CI_REPOSITORY" CI_COMMIT="$CI_COMMIT" bash <<'ROOT'
+          set -euo pipefail
+          umask 077
+          test ! -e /root/dev-session-ci
+          mkdir -m 700 /root/dev-session-ci
+          git init -q /root/dev-session-ci/repo
+          git -C /root/dev-session-ci/repo fetch --no-tags --depth=1 \
+            "https://github.com/$CI_REPOSITORY.git" "$CI_COMMIT"
+          git -C /root/dev-session-ci/repo checkout -q --detach FETCH_HEAD
+          test "$(git -C /root/dev-session-ci/repo rev-parse HEAD)" = "$CI_COMMIT"
+          ROOT
+
+      - name: Run offline and real host acceptance with fake fixtures
+        env:
+          CI_PROTOCOL: ${{ matrix.protocol }}
+          CI_SCENARIO: ${{ matrix.scenario }}
+          CI_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          sudo env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            CI_DISPOSABLE_HOST=github-actions CI_GITHUB_SHA="$CI_COMMIT" \
+            bash /root/dev-session-ci/repo/tests/ci-host.sh \
+            --protocol "$CI_PROTOCOL" --scenario "$CI_SCENARIO" --repetitions 100
+
+      - name: Export only test evidence, including failure results
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          destination="$RUNNER_TEMP/dev-session-evidence"
+          mkdir -m 700 "$destination"
+          if sudo test -d /root/dev-session-ci/evidence; then
+            sudo cp -a /root/dev-session-ci/evidence/. "$destination/"
+            sudo chown -R "$(id -u):$(id -g)" "$destination"
+          fi
+          if [[ ! -f "$destination/manifest.json" ]]; then
+            printf '%s\n' '{"format":1,"status":"failed","reason":"bootstrap did not produce a completed manifest","suites":{"core":{"status":"not_run"},"lifecycle":{"status":"not_run"}}}' \
+              >"$destination/manifest.json"
+          fi
+          cat "$destination/manifest.json" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: ${{ always() }}
+        # Official actions/upload-artifact v7.0.2, Node 24; pinned to its commit.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ubuntu-26.04-${{ matrix.protocol }}-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/dev-session-evidence
+          if-no-files-found: error
+          retention-days: 14

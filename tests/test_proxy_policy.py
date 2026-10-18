@@ -90,6 +90,39 @@ class ProxyPolicyTests(unittest.TestCase):
         self.assertEqual(result["payload_networks"], ["tcp", "udp"])
         self.assertEqual(result["outer_endpoints"], [endpoint("192.0.2.2", "udp", 8388)])
 
+    def test_urltest_requires_tcp_health_probes_on_every_candidate(self):
+        value = config(node("hysteria2", detour="carrier-test"),
+                       {"type": "urltest", "tag": "carrier-test", "outbounds": ["carrier"]},
+                       node("shadowsocks", "carrier", "192.0.2.2", 8388, network="udp"))
+        self.rejected(value, "urltest TCP health probes")
+
+    def test_urltest_requires_forwarding_candidates_not_raw_shadowtls_wrappers(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                value = config(node("shadowsocks", detour="cover-test", udp_over_tcp=True),
+                               {"type": "urltest", "tag": "cover-test", "outbounds": ["group" if nested else "cover"]},
+                               node("shadowtls", "cover", "192.0.2.2"))
+                if nested:
+                    value["outbounds"].append({"type": "selector", "tag": "group", "outbounds": ["cover"]})
+                self.rejected(value, "ShadowTLS")
+        valid = config({"type": "urltest", "tag": "proxy", "outbounds": ["leaf"]},
+                       node("shadowsocks", "leaf", detour="cover", udp_over_tcp=True),
+                       node("shadowtls", "cover", "192.0.2.2"))
+        self.assertEqual(self.parse(valid)["outer_endpoints"], [endpoint("192.0.2.2")])
+
+    def test_shared_selector_graph_is_evaluated_without_expanding_every_path(self):
+        nodes = [{"type": "selector", "tag": "proxy", "outbounds": ["a0", "b0"]}]
+        depth = 24
+        for level in range(depth):
+            children = ["a" + str(level + 1), "b" + str(level + 1)] if level + 1 < depth else ["leaf"]
+            nodes.extend({"type": "selector", "tag": prefix + str(level), "outbounds": children}
+                         for prefix in ("a", "b"))
+        nodes.append(node("http", "leaf"))
+        result = subprocess.run(["jq", "-ceS", "--arg", "mode", "policy", "-f", str(PROGRAM)],
+                                input=json.dumps(config(*nodes)), text=True, capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["outer_endpoints"], [endpoint()])
+
     def test_shipped_hysteria_config_is_accepted(self):
         result = self.parse(PUBLIC)
         self.assertEqual(result["outer_endpoints"], [endpoint(protocol="udp")])

@@ -70,9 +70,9 @@ Hysteria 1／2 的 `server_ports` 支援明確的 `"起點:終點"` 字串或字
 - Hysteria2 → HTTP：HTTP CONNECT 不承載該 UDP 通道，配置被拒絕。
 - urltest 作 Hysteria2 的 detour：除了承載 QUIC 所需的 UDP，還要推導 urltest 各候選的 TCP 健康探測，不能漏掉它自己的活動。
 
-selector 的所有候選都必須接受相同的必要通道。urltest 核心會分別選擇支援 TCP／UDP 的出口，本專案仍使用所有候選能力交集來選 DNS，讓改選候選不會令既定 DNS 通道失效。UDP 能力表示靜態配置允許，不代表遠端已開啟 UDP 轉發。
+selector 的所有候選都必須接受相同的必要通道。urltest 核心會分別選擇支援 TCP／UDP 的出口，本專案仍使用所有候選能力交集來選 DNS，讓改選候選不會令既定 DNS 通道失效。每條 urltest 候選路徑還必須保證 TCP，因為健康探測會建立 TCP 連線；目前明確拒絕只宣告 UDP 的候選路徑，不能接受配置後漏掉探測所需的外層端點。候選必須是可轉發目的地的代理，不能直接以 ShadowTLS 包裝回應健康探測；正常代理再經 ShadowTLS detour 的形式不受影響。UDP 能力表示靜態配置允許，不代表遠端已開啟 UDP 轉發。
 
-重複 tag、遺失引用、引用循環、無共同能力、detour 不相容、無關且未引用的出口，都會拒絕啟動。限制為最多 128 個節點、32 層引用；這些是專案的可審查範圍限制。撥號行為依據 [dialer](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/common/dialer/dialer.go) 與 [detour dialer](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/common/dialer/detour.go)。
+重複 tag、遺失引用、引用循環、無共同能力、detour 不相容、無關且未引用的出口，都會拒絕啟動。限制為最多 128 個節點、32 層引用；這些是專案的可審查範圍限制。解析器先建立拓撲順序，每個節點只計算一次能力，再合併傳入的 TCP／UDP 需求；多個群組共用下層節點不會重複列舉所有路徑。撥號行為依據 [dialer](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/common/dialer/dialer.go) 與 [detour dialer](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/common/dialer/detour.go)。
 
 ### SOCKS 原生 UDP 的邊界
 
@@ -160,6 +160,6 @@ jq -ceS --arg mode effective -f gateway-policy.jq network.json
 
 [`examples/proxies/`](../examples/proxies/) 包含 24 份完整配置：Hysteria 1／2 與跳埠、TUIC、Shadowsocks 原生／UoT／multiplex、Trojan、VMess QUIC、VLESS WebSocket、AnyTLS、Snell 4／6、HTTP／HTTPS、SOCKS TCP／UoT、SSH、Naive TCP／QUIC、selector、urltest、detour 及 ShadowTLS detour。它們只使用文件保留地址、範例名稱與假認證；不代表可用節點。依服務端要求修改原始配置，再交給程式生成有效配置。
 
-靜態驗證由 [`tests/test_proxy_policy.py`](../tests/test_proxy_policy.py) 覆蓋：內層／外層分離、傳輸封裝、精確跳埠、圖引用、detour 通道相容、urltest 健康探測、DNS 自動選擇、未知出口通道拒絕、身份相關冪等性、多文件拒絕及錯誤不回顯憑證。24 份範例已通過兩種 jq 模式；核心配置檢查及實際轉發結果應另外記錄在實機驗收文件，不以解析器測試替代。
+靜態驗證由 [`tests/test_proxy_policy.py`](../tests/test_proxy_policy.py) 覆蓋：內層／外層分離、傳輸封裝、精確跳埠、圖引用、detour 通道相容、urltest 健康探測、DNS 自動選擇、未知出口通道拒絕、身份相關冪等性、多文件拒絕及錯誤不回顯憑證。24 份範例已通過兩種 jq 模式，也全部通過測試 VPS 的固定 `worker 1.14.2 check`。真實 DNS 及主機轉發結果分開記錄於 [2026-10-18 驗證紀錄](validation-20261018.md)，不以解析器或核心配置檢查替代完整轉發驗收。
 
 任何新增「已實測支援」宣稱都應列出協議、transport、認證方式、實際 TCP／UDP、DNS、代理出口 IP，以及停止／中斷代理後無直連的證據；有 port hopping、selector 或 detour 時還需要實體介面端點觀測。歷史只驗證 Hysteria2 的結果不能外推到其他協議。

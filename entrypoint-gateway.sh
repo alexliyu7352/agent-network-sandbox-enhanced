@@ -116,7 +116,9 @@ fi
 ENDPOINT_ROWS="$(printf '%s\n' "$PROXY_POLICY_JSON" | jq -er '
     .outer_endpoints[] | [.address, .protocol, .port_start, .port_end] | @tsv')"
 NODE_ADDRESSES="$(printf '%s\n' "$PROXY_POLICY_JSON" | jq -er '[.outer_endpoints[].address] | unique | .[]')"
-DEFAULT_ROUTES="$(ip -j -4 route show default dev eth0)"
+# iproute2 may omit .dev when the query already filters on that device. Read
+# the complete default set, then verify the unique route's device explicitly.
+DEFAULT_ROUTES="$(ip -j -4 route show default)"
 ORIG_GATEWAY="$(printf '%s\n' "$DEFAULT_ROUTES" | jq -er '
     def ipv4: type == "string" and (split(".") | length == 4 and all(.[];
       test("\\A(0|[1-9][0-9]{0,2})\\z") and tonumber <= 255));

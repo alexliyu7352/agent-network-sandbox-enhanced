@@ -26,11 +26,14 @@ import subprocess
 import termios
 import threading
 import time
+import tempfile
+from types import SimpleNamespace
 import uuid
+import unittest
+from unittest import mock
 
 INSTALL_ROOT = Path(__file__).resolve().parents[1]
 DEV = str(INSTALL_ROOT / 'dev-session')
-CGROOT = Path('/sys/fs/cgroup/net_cls,net_prio/dev-session-v8')
 RUNTIME = Path('/run/dev-session-v8')
 WORKER = r'''
 import json, os, sys
@@ -50,10 +53,19 @@ for line in sys.stdin:
     print('RESULT ' + json.dumps(response), flush=True)
 '''
 INFO = '''
-import os
+import os, socket
+before=open('/proc/self/cgroup').read()
+probes=[]
+for kind in (socket.SOCK_STREAM,socket.SOCK_DGRAM):
+    sock=socket.socket(socket.AF_INET,kind);probes.append(sock)
+    sock.bind(('127.0.0.1',0))
+    if kind==socket.SOCK_STREAM:sock.listen(1)
+state['membership_sockets']=probes
 result={'uid':os.getuid(),'gid':os.getgid(),'groups':os.getgroups(),
         'status':open('/proc/self/status').read(),
         'cgroup':open('/proc/self/cgroup').read(),
+        'cgroup_before_sockets':before,'pid':os.getpid(),
+        'socket_inodes':[int(os.readlink('/proc/self/fd/'+str(s.fileno()))[8:-1]) for s in probes],
         'proxy_env':[k for k in os.environ if k.lower().endswith('_proxy')]}
 '''
 
@@ -64,6 +76,137 @@ def command(*args, check=True, timeout=40):
     if check and p.returncode:
         raise AssertionError('command failed {}: {}'.format(args, (p.stdout+p.stderr)[-2000:]))
     return p
+
+
+class Binding:
+    """Independent strict reader for the installed format-2 runtime contract."""
+
+    @classmethod
+    def from_text(cls, text):
+        def unique(pairs):
+            result={}
+            for key,value in pairs:
+                if key in result:raise ValueError('duplicate JSON binding key')
+                result[key]=value
+            return result
+        value=json.loads(text,object_pairs_hook=unique)
+        def keys(obj,expected):
+            assert isinstance(obj,dict) and set(obj)==set(expected.split()),'unexpected binding schema'
+        def match(value,pattern):
+            return isinstance(value,str) and re.fullmatch(pattern,value) is not None
+        def version(obj,number):
+            assert type(obj['format']) is int and obj['format']==number,'unexpected binding version'
+        def ipv4(value):
+            assert isinstance(value,str) and str(ipaddress.IPv4Address(value))==value,'noncanonical IPv4 address'
+        keys(value,'format cgroup gateway proxy_policy source_sha256 effective_sha256 policy_parser_sha256')
+        version(value,2)
+        for key in ('source_sha256','effective_sha256','policy_parser_sha256'):
+            assert match(value[key],r'[0-9a-f]{64}'),'invalid binding hash'
+        group=value['cgroup']
+        keys(group,'format mode mount mount_identity manager_hierarchy path identity boot_id');version(group,1)
+        assert group['mode'] in ('v1','v2'),'unsupported cgroup mode'
+        assert match(group['mount'],r'(?:/[A-Za-z0-9_.,-]+)+'),'unsafe cgroup mount'
+        assert all(part not in ('.','..') for part in group['mount'].split('/')),'unsafe cgroup mount'
+        for key in ('mount_identity','identity'):
+            assert match(group[key],r'[0-9]+:[1-9][0-9]*'),'invalid cgroup identity'
+        assert match(group['boot_id'],r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'),'invalid boot identity'
+        assert ((group['mode']=='v1' and group['path']=='dev-session-v8' and group['manager_hierarchy'] in ('0','name=systemd'))
+                or (group['mode']=='v2' and group['path']=='devsession.slice' and group['manager_hierarchy']=='0')),'invalid cgroup parent'
+        gateway=value['gateway']
+        keys(gateway,'bridge address container_id network_id namespace_identity')
+        assert match(gateway['bridge'],r'[A-Za-z0-9_-]{1,15}'),'invalid bridge'
+        ipv4(gateway['address'])
+        for key in ('container_id','network_id'):
+            assert match(gateway[key],r'[0-9a-f]{64}'),'invalid Docker identity'
+        assert match(gateway['namespace_identity'],r'[0-9]+:[1-9][0-9]*'),'invalid namespace identity'
+        policy=value['proxy_policy']
+        keys(policy,'format proxy_tag outer_endpoints payload_networks dns_transport');version(policy,1)
+        assert policy['proxy_tag']=='proxy' and policy['payload_networks'] in (['tcp'],['tcp','udp']),'invalid payload policy'
+        assert policy['dns_transport']==('udp' if 'udp' in policy['payload_networks'] else 'https'),'inconsistent DNS transport'
+        endpoints=policy['outer_endpoints']
+        assert isinstance(endpoints,list) and endpoints,'missing outer endpoints'
+        previous=None
+        for endpoint in endpoints:
+            keys(endpoint,'family address protocol port_start port_end')
+            assert type(endpoint['family']) is int and endpoint['family']==4,'invalid endpoint family'
+            ipv4(endpoint['address'])
+            assert endpoint['protocol'] in ('tcp','udp'),'invalid outer protocol'
+            assert all(type(endpoint[key]) is int for key in ('port_start','port_end')),'invalid outer port'
+            assert 1<=endpoint['port_start']<=endpoint['port_end']<=65535,'invalid outer range'
+            order=(int(ipaddress.IPv4Address(endpoint['address'])),endpoint['protocol'],endpoint['port_start'],endpoint['port_end'])
+            if previous:
+                assert previous<order,'noncanonical endpoint ordering'
+                if previous[:2]==order[:2]:assert previous[3]+1<order[2],'unmerged endpoint ranges'
+            previous=order
+        result=cls();result.data=value;result.raw=text;result.cgroup=group;result.gateway=gateway;result.policy=policy
+        result.cgroup_root=Path(group['mount'])/group['path']
+        return result
+
+    @classmethod
+    def load(cls,path=RUNTIME/'binding'):
+        path=Path(path)
+        assert not path.is_symlink() and path.is_file(),'binding must be a regular file'
+        metadata=path.stat()
+        assert metadata.st_uid==0 and metadata.st_mode&0o077==0,'binding must be root private'
+        binding=cls.from_text(path.read_text());binding.file=path;binding.verify_parent()
+        return binding
+
+    def session_path(self,sid):
+        assert re.fullmatch(r'[0-9a-f]{32}',sid),'invalid session ID'
+        return self.cgroup_root/(sid if self.cgroup['mode']=='v1' else 'dev-session-'+sid+'.service')
+
+    def service_path(self,sid):
+        self.session_path(sid)
+        parent='/system.slice' if self.cgroup['mode']=='v1' else '/'+self.cgroup['path']
+        return parent+'/dev-session-'+sid+'.service'
+
+    def verify_parent(self):
+        assert Path('/proc/sys/kernel/random/boot_id').read_text().strip()==self.cgroup['boot_id'],'boot identity changed'
+        for path,key in ((Path(self.cgroup['mount']),'mount_identity'),(self.cgroup_root,'identity')):
+            assert path.resolve()==path and path.is_dir(),'cgroup path changed'
+            metadata=path.stat()
+            assert metadata.st_uid==0 and metadata.st_mode&0o022==0,'cgroup parent is writable by nonroot'
+            assert '{}:{}'.format(metadata.st_dev,metadata.st_ino)==self.cgroup[key],'cgroup identity changed'
+        if hasattr(self,'file'):
+            assert not self.file.is_symlink() and self.file.read_text()==self.raw,'binding changed during acceptance'
+
+    def verify_membership(self,text,sid):
+        entries=[line.split(':',2) for line in text.splitlines()]
+        assert entries and all(len(entry)==3 for entry in entries),'invalid process cgroup evidence'
+        service=self.service_path(sid)
+        hierarchy=self.cgroup['manager_hierarchy']
+        manager=([entry for entry in entries if entry[0]=='0' and entry[1]==''] if hierarchy=='0' else
+                 [entry for entry in entries if 'name=systemd' in entry[1].split(',')])
+        assert len(manager)==1 and manager[0][2]==service,'process outside bound systemd service'
+        if self.cgroup['mode']=='v1':
+            controller=[entry for entry in entries if 'net_cls' in entry[1].split(',')]
+            assert len(controller)==1 and controller[0][2]=='/'+self.cgroup['path']+'/'+sid,'process outside bound net_cls group'
+
+    @staticmethod
+    def verify_socket_rows(text,inodes,service):
+        assert len(inodes)==2 and len(set(inodes))==2,'missing independently created TCP/UDP socket evidence'
+        for inode in inodes:
+            rows=[line for line in text.splitlines() if re.search(r'(?:^|\s)ino:'+str(inode)+r'(?:\s|$)',line)]
+            assert len(rows)==1,'created socket missing or ambiguous in ss evidence'
+            groups=re.findall(r'(?:^|\s)cgroup:([^\s]+)',rows[0])
+            assert groups and set(groups)=={service},'socket was created outside the bound service'
+
+    @staticmethod
+    def endpoint_bpf(endpoint):
+        port=('dst port '+str(endpoint['port_start']) if endpoint['port_start']==endpoint['port_end'] else
+              'dst portrange '+str(endpoint['port_start'])+'-'+str(endpoint['port_end']))
+        return '(dst host '+endpoint['address']+' and '+endpoint['protocol']+' and '+port+')'
+
+    def outer_bpf(self):
+        return '(ip and src host '+self.gateway['address']+' and ('+' or '.join(self.endpoint_bpf(e) for e in self.policy['outer_endpoints'])+'))'
+
+
+def udp_target(value):
+    try:
+        address,port=value.rsplit(':',1);address=str(ipaddress.IPv4Address(address));port=int(port)
+        assert 1<=port<=65535 and port!=53
+    except (ValueError,AssertionError):raise argparse.ArgumentTypeError('expected IPv4:non-DNS-port')
+    return address,port
 
 
 class Session:
@@ -155,14 +298,19 @@ class Suite:
     def __init__(self, args):
         self.output, self.user, self.repetitions = Path(args.output), args.user, args.repetitions
         self.output.mkdir(mode=0o700, parents=True, exist_ok=True)
+        assert not self.output.is_symlink() and self.output.stat().st_uid==0 and self.output.stat().st_mode&0o077==0,'output must be root private'
         self.sessions, self.servers, self.captures, self.results = [], [], [], []
+        self.namespace_fault=getattr(args,'namespace_fault','none')
+        self.udp_echo=getattr(args,'udp_echo',None)
+        self.binding=Binding.load()
+        (self.output/'binding.json').write_text(json.dumps(self.binding.data,indent=2)+'\n')
         self.next_probe_port=21000
         assert int(Path('/proc/sys/net/ipv4/ip_local_port_range').read_text().split()[0])>21199
         self.uid = int(command('id','-u',self.user).stdout)
         self.gid = int(command('id','-g',self.user).stdout)
         self.host_ip = json.loads(command('ip','-j','-4','route','get','1.1.1.1').stdout)[0]['prefsrc']
         self.interface = json.loads(command('ip','-j','-4','route','get','1.1.1.1').stdout)[0]['dev']
-        self.bridge, self.gateway, self.node, self.node_port = (RUNTIME/'binding').read_text().splitlines()
+        self.bridge=self.binding.gateway['bridge'];self.gateway=self.binding.gateway['address']
         address=json.loads(command('ip','-j','-4','addr','show','dev',self.bridge).stdout)[0]['addr_info'][0]
         self.bridge_network=str(ipaddress.ip_network(address['local']+'/'+str(address['prefixlen']),strict=False))
         local_addresses=[a['local'] for link in json.loads(command('ip','-j','-4','addr','show').stdout)
@@ -200,7 +348,8 @@ class Suite:
         end=time.monotonic()+16
         while time.monotonic()<end:
             unit=command('systemctl','show','--property=LoadState','--value','dev-session-'+sid+'.service',check=False).stdout.strip()
-            if not (CGROOT/sid).exists() and not (RUNTIME/'requests'/sid).exists() and unit=='not-found':
+            if not self.binding.session_path(sid).exists() and not (RUNTIME/'requests'/sid).exists() and unit=='not-found':
+                self.binding.verify_parent()
                 return
             time.sleep(0.1)
         raise AssertionError('session not reclaimed: '+sid)
@@ -258,8 +407,10 @@ class Suite:
         if strict:assert not errors,errors
 
     def physical_capture(self,name):
+        destinations=['(dst host 9.9.9.9 and dst port 44443)']
+        if self.udp_echo:destinations.append('(dst host '+self.udp_echo[0]+' and dst port '+str(self.udp_echo[1])+')')
         path=self.capture(name,self.interface,
-                          'src portrange 21000-21199 and dst host 9.9.9.9 and dst port 44443')
+                          'src portrange 21000-21199 and ('+' or '.join(destinations)+')')
         self.captures[-1]['physical']=True
         # Positive control proves the exact capture can see a direct host flow.
         # Workload attempts use 21001..21199; this root-only canary uses 21000.
@@ -289,12 +440,27 @@ class Suite:
         for key in ('CapInh','CapPrm','CapEff','CapAmb'):
             assert int(status[key].strip(),16)==0,(key,status[key])
         assert status['NoNewPrivs'].strip()=='1' and status['Seccomp'].strip()=='2'
-        assert ':net_cls,net_prio:/dev-session-v8/'+session.sid in info['cgroup']
-        assert ':name=systemd:/system.slice/dev-session-'+session.sid+'.service' in info['cgroup']
+        self.binding.verify_membership(info['cgroup_before_sockets'],session.sid)
+        self.binding.verify_membership(info['cgroup'],session.sid)
+        socket_evidence=None
+        try:
+            if self.binding.cgroup['mode']=='v2':
+                rows=command('ss','-H','-t','-u','-a','-n','-p','-e','--cgroup').stdout
+                (self.output/(session.name+'-socket-cgroups.log')).write_text(rows)
+                service=self.binding.service_path(session.sid)
+                self.binding.verify_socket_rows(rows,info['socket_inodes'],service)
+                socket_evidence={'inodes':info['socket_inodes'],'cgroup':service,'created_inside_service':True}
+            else:
+                classid=int((self.binding.session_path(session.sid)/'net_cls.classid').read_text().strip(),0)
+                assert classid==0x6d730001,'incorrect session net_cls classid'
+        finally:
+            session.value("[s.close() for s in state.pop('membership_sockets',[])];result=True")
+        self.binding.verify_parent()
         assert info['proxy_env']==[]
         return {'uid':info['uid'],'uids':uids,'groups':info['groups'],
                 'privilege_caps_zero':True,'cap_bnd':status['CapBnd'].strip(),
-                'no_new_privs':1,'seccomp':2}
+                'no_new_privs':1,'seccomp':2,'cgroup_mode':self.binding.cgroup['mode'],
+                'cgroup_mount':self.binding.cgroup['mount'],'socket_creation':socket_evidence}
 
     def echo(self, session, address, port, udp=False):
         code="""
@@ -324,6 +490,27 @@ with socket.socket(socket.AF_INET,socket.SOCK_STREAM if {tcp} else socket.SOCK_D
     result={{'rcode':flags&15,'answers':an}}
 """.format(name=name,tcp=tcp,address=address)
         return session.value(code)
+
+    def ordinary_udp(self,session):
+        assert self.udp_echo,'full network acceptance requires a controlled --udp-echo IPv4:port'
+        address,port=self.udp_echo
+        assert address not in {entry['address'] for entry in self.binding.policy['outer_endpoints']},'UDP echo must be separate from outer nodes'
+        self.next_probe_port+=1;source_port=self.next_probe_port;assert source_port<=21199
+        token='D8-UDP-'+uuid.uuid4().hex
+        self.udp_token=token.encode()
+        result=session.value('''
+import socket
+with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+    sock.settimeout(3);sock.bind(('0.0.0.0',{source_port}))
+    try:
+        sock.connect(({address!r},{port}));sock.send({token!r}.encode())
+        data=sock.recv(2048);result={{'echo':data=={token!r}.encode(),'received':True}}
+    except OSError as error:result={{'echo':False,'received':False,'errno':error.errno}}
+'''.format(source_port=source_port,address=address,port=port,token=token))
+        supported='udp' in self.binding.policy['payload_networks']
+        assert result['echo'] if supported else not result['received'],result
+        return dict(result,payload_udp=supported,source_port=source_port,target=[address,port],
+                    expected='echo through proxy' if supported else 'ordinary UDP fails closed')
 
     def https(self, session, keep=False):
         code="""
@@ -363,6 +550,59 @@ result={'response':data[:100].decode('ascii','replace')}
                 return
             time.sleep(0.2)
         raise AssertionError('gateway did not recover: '+p.stderr)
+
+    def after_namespace_fault(self,label):
+        """Inspect recovery without deleting bindings or repairing live guards."""
+        deadline=time.monotonic()+25
+        while True:
+            inspected=command('docker','inspect','worker',check=False)
+            try:
+                container=json.loads(inspected.stdout)[0];pid=container['State']['Pid']
+                assert pid>0 and container['State']['Running']
+                metadata=Path('/proc/'+str(pid)+'/ns/net').stat()
+                identity='{}:{}'.format(metadata.st_dev,metadata.st_ino)
+                break
+            except (ValueError,KeyError,IndexError,AssertionError,OSError):
+                if time.monotonic()>=deadline:raise AssertionError('gateway did not restart for namespace identity check')
+                time.sleep(0.2)
+        changed=identity!=self.binding.gateway['namespace_identity'] or container['Id']!=self.binding.gateway['container_id']
+        check=command(DEV,'check',check=False)
+        (self.output/(label+'-check.log')).write_text(check.stdout+check.stderr)
+        init_exit=None;rejection=None
+        if changed:
+            assert check.returncode!=0,'changed gateway namespace was admitted'
+            self.assert_rules()
+            init=command(DEV,'init',check=False)
+            (self.output/(label+'-init.log')).write_text(init.stdout+init.stderr)
+            init_exit=init.returncode
+            assert init.returncode!=0,'init rebound the gateway while prior binding remained'
+            self.assert_rules()
+            rejection=self.rejected_start(label+'-offline-rebind')
+        elif check.returncode:
+            rejection=self.rejected_start(label+'-policy-drift')
+        else:
+            self.gateway_ready()
+        self.assert_rules()
+        return {'namespace_before':self.binding.gateway['namespace_identity'],'namespace_after':identity,
+                'namespace_changed':changed,'check_exit':check.returncode,'init_exit':init_exit,
+                'rejected_start':rejection,'binding_and_guards_retained':True,
+                'offline_rebind_required':changed,'offline_maintenance_required':bool(check.returncode)}
+
+    def gateway_namespace_fault(self,action):
+        before=self.https(self.a,keep=True);assert before['ok'],before
+        try:
+            if action=='gateway-stop':command('docker','stop','--time','1','worker')
+            else:command('docker','kill','--signal=KILL','worker')
+            old=self.existing_https(self.a);new=self.https(self.a)
+            assert not old['ok'] and not new['ok'],{'old':old,'new':new}
+            self.rejected_start(action)
+            self.echo(self.b,'127.0.0.1',self.tcp.server_address[1])
+            self.forced_egress(self.a)
+        finally:command('docker','start','worker')
+        result=self.after_namespace_fault(action)
+        result.update(existing_connection_blocked_during_fault=True,new_connection_blocked_during_fault=True,
+                      other_session_loopback_alive=True)
+        return result
 
     def rejected_start(self, label):
         marker=Path('/tmp/d8-should-not-run-'+uuid.uuid4().hex)
@@ -413,6 +653,7 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
         return outcomes
 
     def run_core(self):
+        assert self.udp_echo,'--udp-echo is required for full TCP/UDP acceptance; use the separate fake upstream fixture'
         self.tcp=self.server(TCP,'0.0.0.0',0,TCPHandler)
         # Bind each UDP address so replies preserve the destination address;
         # a wildcard UDP listener would answer 127.0.0.2 from 127.0.0.1.
@@ -442,6 +683,7 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
             assert local_dns_tcp.received==0 and local_dns_udp.received==0
             return results
         self.record('all_dns_destinations_redirected',dns_checks)
+        self.record('ordinary_udp_capability',lambda:self.ordinary_udp(self.a))
         self.record('forced_physical_interface',lambda:self.forced_egress(self.a))
         def blocked():
             evidence=[]
@@ -463,12 +705,6 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
             assert response['exit']!=0;evidence.append(response)
             return evidence
         self.record('private_ipv6_privilege_denials',blocked)
-        self.record('gateway_stop',lambda:self.fault('gateway-stop',
-            lambda:command('docker','stop','--time','1','worker'),
-            lambda:command('docker','start','worker')))
-        self.record('gateway_core_kill',lambda:self.fault('gateway-kill',
-            lambda:command('docker','kill','--signal=KILL','worker'),
-            lambda:command('docker','start','worker')))
         self.record('host_default_route_removed',lambda:self.fault('host-route',
             lambda:command('ip','-4','route','del','default','via',self.gateway,'dev',self.bridge,'table','32190'),
             lambda:command('ip','-4','route','add','default','via',self.gateway,'dev',self.bridge,'table','32190')))
@@ -497,18 +733,31 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
             try:return self.rejected_start('bad-permissions')
             finally:path.chmod(mode)
         self.record('writable_policy_rejected',bad_permissions)
+        if self.namespace_fault!='none':
+            self.record(self.namespace_fault,lambda:self.gateway_namespace_fault(self.namespace_fault))
         self.stop_captures()
         def captures():
             physical=self.verify_physical_capture(self.wire)
             outer=command('tcpdump','-nn','-r',str(self.outer)).stdout.splitlines()
-            assert len(outer)>0 and all(' > '+self.node+'.'+self.node_port+': UDP' in x for x in outer),outer[:5]
+            assert outer,'no outer packets observed'
+            unexpected=command('tcpdump','-nn','-r',str(self.outer),'not '+self.binding.outer_bpf()).stdout.splitlines()
+            assert not unexpected,unexpected[:20]
+            endpoint_counts=[]
+            for endpoint in self.binding.policy['outer_endpoints']:
+                packets=command('tcpdump','-nn','-r',str(self.outer),self.binding.endpoint_bpf(endpoint)).stdout.splitlines()
+                endpoint_counts.append(dict(endpoint,packets=len(packets)))
             content=self.outer.read_bytes()
             qnames=[b''.join(bytes([len(label)])+label.encode() for label in name.split('.'))+b'\0'
                     for name in self.query_names]
             assert all(name not in content for name in qnames)
+            assert self.udp_token not in content,'ordinary UDP appeared in plaintext on outer link'
             dns=command('tcpdump','-nn','-r',str(self.dns_pcap)).stdout.splitlines()
-            assert len(dns)>0 and all(' > 1.1.1.1.53:' in x for x in dns),dns[:5]
-            return dict(physical,outer_udp_packets=len(outer),redirected_dns_packets=len(dns),plaintext_dns_on_outer=False)
+            unexpected_dns=command('tcpdump','-nn','-r',str(self.dns_pcap),
+                                   'not (ip and dst host 1.1.1.1 and (tcp or udp) and dst port 53)').stdout.splitlines()
+            assert dns and not unexpected_dns,unexpected_dns[:5]
+            return dict(physical,outer_packets=len(outer),outer_endpoints=endpoint_counts,
+                        redirected_dns_packets=len(dns),plaintext_dns_on_outer=False,
+                        dns_transport=self.binding.policy['dns_transport'],payload_networks=self.binding.policy['payload_networks'])
         self.record('packet_capture_evidence',captures)
         self.a.close();self.b.close()
         self.record('shared_rules_unchanged',lambda:self.assert_rules())
@@ -519,7 +768,8 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
 
     def assert_rules(self):
         assert self.policy_snapshot()==self.baseline
-        return {'owned_rule_lines':len(self.baseline)}
+        self.binding.verify_parent()
+        return {'owned_rule_lines':len(self.baseline),'binding_retained':True,'cgroup_parent_identity':self.binding.cgroup['identity']}
 
     def cleanup(self):
         self.stop_captures(strict=False)
@@ -535,6 +785,9 @@ def main():
     parser.add_argument('--user',default='ubuntu')
     parser.add_argument('--output',default='/root/dev-session-acceptance-20261009/core')
     parser.add_argument('--repetitions',type=int,default=100)
+    parser.add_argument('--udp-echo',type=udp_target,required=True,help='controlled non-DNS echo target, reachable only through the upstream fixture')
+    parser.add_argument('--namespace-fault',choices=('none','gateway-stop','gateway-kill'),default='none',
+                        help='last scenario; changed namespace leaves guards and binding in place for offline rebind')
     args=parser.parse_args()
     assert os.geteuid()==0,'requires root on a disposable test host'
     os.umask(0o077)
@@ -542,6 +795,124 @@ def main():
     try:suite.run_core()
     finally:suite.cleanup()
     print('HOST_CORE_ACCEPTANCE_PASSED',flush=True)
+
+
+class BindingTests(unittest.TestCase):
+    """Pure regression tests: no root, network, cgroup or firewall changes."""
+
+    @staticmethod
+    def document(mode='v2'):
+        return {'format':2, 'source_sha256':'a'*64, 'effective_sha256':'b'*64,
+                'policy_parser_sha256':'c'*64,
+                'cgroup':{'format':1, 'mode':mode, 'mount':'/sys/fs/cgroup' if mode=='v2' else '/sys/fs/cgroup/net_cls',
+                          'mount_identity':'25:1', 'manager_hierarchy':'0',
+                          'path':'devsession.slice' if mode=='v2' else 'dev-session-v8',
+                          'identity':'25:123', 'boot_id':'11111111-2222-3333-4444-555555555555'},
+                'gateway':{'bridge':'br-fixture', 'address':'172.19.0.2', 'container_id':'d'*64,
+                           'network_id':'e'*64, 'namespace_identity':'4:555'},
+                'proxy_policy':{'format':1, 'proxy_tag':'proxy', 'dns_transport':'udp',
+                                'payload_networks':['tcp','udp'], 'outer_endpoints':[
+                                    {'family':4,'address':'192.0.2.8','protocol':'tcp','port_start':443,'port_end':443},
+                                    {'family':4,'address':'198.51.100.9','protocol':'udp','port_start':8443,'port_end':8445}]}}
+
+    def test_version_two_dynamic_paths_and_membership(self):
+        sid='1'*32
+        for mode in ('v1','v2'):
+            with self.subTest(mode=mode):
+                binding=Binding.from_text(json.dumps(self.document(mode)))
+                leaf=sid if mode=='v1' else 'dev-session-'+sid+'.service'
+                self.assertEqual(binding.session_path(sid),binding.cgroup_root/leaf)
+                text=('7:net_prio,net_cls:/dev-session-v8/'+sid+'\n0::/system.slice/dev-session-'+sid+'.service\n'
+                      if mode=='v1' else '0::/devsession.slice/dev-session-'+sid+'.service\n')
+                binding.verify_membership(text,sid)
+                with self.assertRaises(AssertionError):
+                    binding.verify_membership(text.replace(sid,'2'*32),sid)
+                with self.assertRaises(AssertionError):
+                    binding.verify_membership(text.replace('.service','.service/child'),sid)
+
+    def test_binding_rejects_legacy_duplicate_keys_and_noncanonical_policy(self):
+        value=self.document()
+        bad=[ 'br-test\n172.19.0.2\n192.0.2.8\n443\n',
+              json.dumps(value)+'\n'+json.dumps(value),
+              json.dumps(value).replace('"format": 2','"format": 2, "format": 2',1)]
+        for section,key,replacement in [(None,'format',True),('cgroup','mount','/sys/fs/cgroup/../tmp'),
+                 ('cgroup','identity','25:0'),('gateway','container_id','bad'),
+                 ('proxy_policy','payload_networks',['udp']),('proxy_policy','dns_transport','https')]:
+            altered=json.loads(json.dumps(value));target=altered[section] if section else altered
+            target[key]=replacement;bad.append(json.dumps(altered))
+        altered=json.loads(json.dumps(value));altered['proxy_policy']['outer_endpoints'].reverse();bad.append(json.dumps(altered))
+        altered=json.loads(json.dumps(value));altered['proxy_policy']['outer_endpoints'][0]['extra']=1;bad.append(json.dumps(altered))
+        for document in bad:
+            with self.subTest(document=document[:80]), self.assertRaises((ValueError,AssertionError)):
+                Binding.from_text(document)
+
+    def test_outer_capture_filter_preserves_all_protocols_and_ranges(self):
+        binding=Binding.from_text(json.dumps(self.document()))
+        self.assertEqual(binding.outer_bpf(),
+            '(ip and src host 172.19.0.2 and ((dst host 192.0.2.8 and tcp and dst port 443) or '
+            '(dst host 198.51.100.9 and udp and dst portrange 8443-8445)))')
+
+    def test_socket_evidence_requires_each_created_inode_in_exact_service(self):
+        path='/devsession.slice/dev-session-'+'1'*32+'.service'
+        rows='tcp LISTEN 0 1 127.0.0.1:1234 0.0.0.0:* ino:101 cgroup:'+path+'\n'
+        rows+='udp UNCONN 0 0 127.0.0.1:1235 0.0.0.0:* ino:102 cgroup:'+path+'\n'
+        Binding.verify_socket_rows(rows,[101,102],path)
+        # iproute2 may print the same field from both -e and --cgroup.
+        Binding.verify_socket_rows(rows.replace('cgroup:'+path,'cgroup:'+path+' cgroup:'+path),[101,102],path)
+        for bad in (rows.replace('ino:102','ino:103'),rows.replace(path,path+'/child'),
+                    rows.replace('cgroup:'+path,'cgroup:/system.slice/unrelated.service'),rows+rows,
+                    rows.replace('cgroup:'+path,'cgroup:'+path+' cgroup:/system.slice/unrelated.service')):
+            with self.subTest(rows=bad), self.assertRaises(AssertionError):
+                Binding.verify_socket_rows(bad,[101,102],path)
+
+    def test_namespace_change_demands_check_and_init_refusal(self):
+        for check_exit,init_exit,accepted in ((1,1,True),(0,1,False),(1,0,False)):
+            with self.subTest(check=check_exit,init=init_exit),tempfile.TemporaryDirectory() as directory:
+                suite=object.__new__(Suite);suite.output=Path(directory)
+                suite.binding=Binding.from_text(json.dumps(self.document()))
+                suite.assert_rules=mock.Mock(return_value={'binding_retained':True})
+                suite.rejected_start=mock.Mock(return_value={'payload_executed':False})
+                suite.gateway_ready=mock.Mock(side_effect=AssertionError('changed namespace must not be admitted'))
+                calls=[]
+                def fake_command(*args,**kwargs):
+                    calls.append(args)
+                    if args==('docker','inspect','worker'):
+                        return subprocess.CompletedProcess(args,0,json.dumps([{'Id':'d'*64,'State':{'Pid':123,'Running':True}}]),'')
+                    assert args in ((DEV,'check'),(DEV,'init')),'unexpected external operation'
+                    return subprocess.CompletedProcess(args,check_exit if args[-1]=='check' else init_exit,'','refused')
+                original_stat=Path.stat
+                def fake_stat(path,*args,**kwargs):
+                    if str(path)=='/proc/123/ns/net':return SimpleNamespace(st_dev=4,st_ino=999)
+                    return original_stat(path,*args,**kwargs)
+                with mock.patch(__name__+'.command',side_effect=fake_command),mock.patch.object(Path,'stat',fake_stat):
+                    if accepted:
+                        result=suite.after_namespace_fault('test-namespace')
+                        self.assertTrue(result['offline_rebind_required'])
+                        self.assertTrue(result['binding_and_guards_retained'])
+                        self.assertIn((DEV,'init'),calls)
+                        suite.rejected_start.assert_called_once()
+                        self.assertGreaterEqual(suite.assert_rules.call_count,3)
+                    else:
+                        with self.assertRaises(AssertionError):suite.after_namespace_fault('test-namespace')
+                suite.gateway_ready.assert_not_called()
+
+    def test_tcp_only_udp_rejection_may_happen_during_send(self):
+        suite=object.__new__(Suite);suite.udp_echo=('192.0.2.254',40123);suite.next_probe_port=21000
+        document=self.document();document['proxy_policy'].update(payload_networks=['tcp'],dns_transport='https')
+        suite.binding=Binding.from_text(json.dumps(document))
+        sock=mock.MagicMock();sock.__enter__.return_value=sock
+        sock.send.side_effect=OSError(errno.ENETUNREACH,'test UDP rejection')
+        fake_socket=SimpleNamespace(AF_INET=2,SOCK_DGRAM=2,socket=mock.Mock(return_value=sock))
+        def evaluate(code):
+            scope={}
+            with mock.patch.dict('sys.modules',{'socket':fake_socket}):exec(code,scope)
+            return scope['result']
+        result=suite.ordinary_udp(SimpleNamespace(value=evaluate))
+        self.assertFalse(result['received'])
+        self.assertFalse(result['payload_udp'])
+        self.assertEqual(result['errno'],errno.ENETUNREACH)
+        suite.binding=Binding.from_text(json.dumps(self.document()))
+        with self.assertRaises(AssertionError):suite.ordinary_udp(SimpleNamespace(value=evaluate))
 
 
 if __name__=='__main__':main()

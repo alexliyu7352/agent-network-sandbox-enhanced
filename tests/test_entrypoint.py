@@ -150,6 +150,9 @@ def invoke():
                 gateway = os.environ.get("DEFAULT_GATEWAY", "172.19.0.1")
                 routes = [] if os.environ.get("NO_DEFAULT") == "1" else [
                     {"dst": "default", "gateway": gateway, "dev": "eth0", "flags": []}]
+                if os.environ.get("KERNEL_ROUTE_FILTER_OUTPUT") == "1" and "dev" in args:
+                    for route in routes:
+                        route.pop("dev", None)
                 if "-j" in args:
                     print(json.dumps(routes))
                 elif routes:
@@ -688,6 +691,10 @@ class GatewayTests(unittest.TestCase):
 
     def test_kernel_option_order_and_implicit_transport_module_are_accepted(self):
         result, _, _ = self.run_gateway({"KERNEL_CANONICAL_RULES": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_default_gateway_discovery_accounts_for_suppressed_device_fields(self):
+        result, _, _ = self.run_gateway({"KERNEL_ROUTE_FILTER_OUTPUT": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_readiness_rejects_extra_node_host_routes_and_extra_eth0_gateway_routes(self):
