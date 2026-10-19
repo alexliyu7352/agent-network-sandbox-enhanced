@@ -78,13 +78,14 @@ def check_tls:
 def check_transport:
   ensure(type == "object"; "transport must be an object")
   | .type as $type
-  | ensure(["http","ws","grpc","httpupgrade","quic"] | index($type) != null;
-           "unsupported V2Ray transport; use http, ws, grpc, httpupgrade, or quic")
+  | ensure($type != "httpupgrade";
+           "HTTPUpgrade is not accepted for pinned core 1.14.2 after paired reliability failures; use native TCP (omit transport), ws, http, grpc, or quic")
+  | ensure(["http","ws","grpc","quic"] | index($type) != null;
+           "unsupported V2Ray transport; use http, ws, grpc, or quic; omit transport for native TCP")
   | allowed(["type"] + (if $type == "http" then
        ["host","path","method","headers","idle_timeout","ping_timeout"]
      elif $type == "ws" then ["path","headers","max_early_data","early_data_header_name"]
-     elif $type == "grpc" then ["service_name","idle_timeout","ping_timeout","permit_without_stream"]
-     elif $type == "httpupgrade" then ["host","path","headers"] else [] end);
+     elif $type == "grpc" then ["service_name","idle_timeout","ping_timeout","permit_without_stream"] else [] end);
      "unknown V2Ray transport option")
   | optional_type(["path","method","idle_timeout","ping_timeout","service_name",
                    "early_data_header_name"]; "string"; "invalid transport string option")

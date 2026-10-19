@@ -92,13 +92,51 @@ result={'same_socket':True,'connect_calls':connection.fixture_connect_calls,'exc
 '''
 
 
+def command_category(value):
+    if not isinstance(value,(str,os.PathLike)):return None
+    name=Path(value).name
+    allowed={'ip','systemctl','systemd-run','iptables-legacy','ip6tables-legacy','findmnt',
+             'jq','openssl','worker','sing-box','python','python3','curl','dev-session'}
+    return name if name in allowed else 'external'
+
+
+class FixtureCommandError(RuntimeError):
+    def __init__(self,command,returncode):
+        super().__init__('fixture: command-failed')
+        self.command=command_category(command)
+        self.returncode=returncode if type(returncode) is int else None
+
+
+def failure_evidence(error):
+    """Describe the failing repository call without any subprocess payload."""
+    names={'AssertionError','RuntimeError','FixtureCommandError','TimeoutExpired','OSError',
+           'FileNotFoundError','FileExistsError','PermissionError','ValueError','TypeError',
+           'KeyError','AttributeError','UnicodeError','UnicodeDecodeError','CaseFailure'}
+    name=type(error).__name__
+    location={'function':'unknown','line':0};trace=error.__traceback__
+    while trace is not None:
+        code=trace.tb_frame.f_code
+        if (code.co_filename==str(Path(__file__).resolve()) and code.co_name not in ('run','ensure','main')
+                and re.fullmatch(r'[a-z_]{1,64}',code.co_name)):
+            location={'function':code.co_name,'line':trace.tb_lineno}
+        trace=trace.tb_next
+    command=None;returncode=None
+    timeout=isinstance(error,subprocess.TimeoutExpired)
+    if isinstance(error,FixtureCommandError):command,returncode=error.command,error.returncode
+    elif timeout:
+        argv=error.cmd
+        command=command_category(argv[0] if isinstance(argv,(tuple,list)) and argv else argv)
+    return {'format':1,'exception':name if name in names else 'Exception','location':location,
+            'command':command,'returncode':returncode,'timeout':timeout}
+
+
 def run(*args, check=True, timeout=40):
     result=subprocess.run(list(map(str,args)),stdin=subprocess.DEVNULL,capture_output=True,
                           text=True,timeout=timeout)
     if check and result.returncode:
-        # Arguments may name configuration files, but no diagnostic is allowed
-        # to echo their contents. All fixture credentials are fixed fake values.
-        raise RuntimeError('fixture command failed: '+str(args[0])+' (exit '+str(result.returncode)+')')
+        # Preserve only an allowlisted executable category and integer status.
+        # Arguments, private paths and captured output never enter diagnostics.
+        raise FixtureCommandError(args[0],result.returncode)
     return result
 
 
@@ -991,6 +1029,8 @@ if __name__=='__main__':
     try:main()
     except Exception as error:
         # Worker logs and malformed JSON may contain private source material.
+        print('UPSTREAM_FIXTURE_DIAGNOSTIC '+json.dumps(failure_evidence(error),sort_keys=True),
+              file=sys.stderr,flush=True)
         reason=str(error) if isinstance(error,RuntimeError) and re.fullmatch(r'fixture: [a-z][a-z0-9-]{0,79}',str(error)) else 'fixture: command-failed'
         print('UPSTREAM_FIXTURE_FAILED '+reason,file=sys.stderr,flush=True)
         raise SystemExit(1) from None

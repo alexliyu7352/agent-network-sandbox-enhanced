@@ -305,6 +305,8 @@ class Suite:
         self.namespace_fault=getattr(args,'namespace_fault','none')
         self.compose_project=getattr(args,'compose_project',None)
         self.udp_echo=getattr(args,'udp_echo',None)
+        self.payload_marker_policy=getattr(args,'payload_marker_policy','absent')
+        self.anytls_reuse_check=getattr(args,'anytls_reuse_check',False)
         self.binding=Binding.load()
         (self.output/'binding.json').write_text(json.dumps(self.binding.data,indent=2)+'\n')
         self.next_probe_port=21000
@@ -414,11 +416,28 @@ class Suite:
         if self.udp_echo:destinations.append('(dst host '+self.udp_echo[0]+' and dst port '+str(self.udp_echo[1])+')')
         path=self.capture(name,self.interface,
                           'src portrange 21000-21199 and ('+' or '.join(destinations)+')')
-        self.captures[-1]['physical']=True
+        capture=self.captures[-1]
+        capture['physical']=True
         # Positive control proves the exact capture can see a direct host flow.
         # Workload attempts use 21001..21199; this root-only canary uses 21000.
-        self.physical_canary(b'D8-CAPTURE-POSITIVE-CONTROL')
-        return path
+        marker=('D8-START-'+uuid.uuid4().hex).encode()
+        capture['initial_marker']=marker
+        end=time.monotonic()+3
+        while True:
+            assert capture['process'].poll() is None,'physical collector exited before readiness'
+            try:content=path.read_bytes()
+            except FileNotFoundError:content=b''
+            remaining=end-time.monotonic()
+            assert remaining>=0,'physical capture did not observe its initial canary'
+            if marker in content:
+                assert capture['process'].poll() is None,'physical collector exited before readiness'
+                return path
+            assert remaining>0,'physical capture did not observe its initial canary'
+            # A live tcpdump process or savefile header does not prove its
+            # filter was installed before the first send. Wait for actual data
+            # before starting any workload; bounded retries only send canaries.
+            self.physical_canary(marker)
+            time.sleep(min(0.05,remaining))
 
     def physical_canary(self,payload):
         with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
@@ -427,6 +446,14 @@ class Suite:
             sock.sendto(payload,('9.9.9.9',44443))
 
     def verify_physical_capture(self,path):
+        captures=[capture for capture in self.captures if capture['path']==path and capture.get('physical')]
+        assert len(captures)==1,'physical capture ownership missing'
+        marker=captures[0].get('initial_marker')
+        content=path.read_bytes()
+        assert isinstance(marker,bytes) and marker in content,'physical capture lost its initial canary'
+        # stop_captures has already required its freshly generated end marker
+        # before SIGINT. A repeated start packet cannot stand in for that end.
+        assert re.search(rb'D8-END-[0-9a-f]{32}',content),'physical capture missing its trailing canary'
         canary=command('tcpdump','-nn','-r',str(path),'src port 21000').stdout.splitlines()
         direct=command('tcpdump','-nn','-r',str(path),'src portrange 21001-21199').stdout.splitlines()
         assert len(canary)>=2,'physical capture did not observe both positive controls'
@@ -544,6 +571,87 @@ data=sock.recv(4096)
 if not data: raise ConnectionError('established TLS socket closed')
 result={'response':data[:100].decode('ascii','replace')}
 ''',10)
+
+    def anytls_hold_https(self):
+        result=self.https(self.a,keep=True)
+        assert result['ok'] and result['result']['status']==200 and result['result']['tls'],result
+        self.a.value(r'''
+import os
+original=state['kept_socket']
+assert original is state['https'].sock
+state['anytls_warm_identity']=(original,original.fileno(),os.fstat(original.fileno()).st_ino,original.getpeername())
+result=True
+''')
+        return result
+
+    def anytls_warm_https(self):
+        # Use the retained TLS socket directly. HTTPConnection.request() may
+        # silently reconnect, which would not prove another stream survived.
+        return self.a.value(r'''
+import http.client,os
+original,fd,inode,peer=state['anytls_warm_identity']
+def unchanged():
+    assert original is state['kept_socket'] and original is state['https'].sock
+    assert original.fileno()==fd and os.fstat(original.fileno()).st_ino==inode and original.getpeername()==peer
+unchanged()
+original.sendall(b'GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: keep-alive\r\n\r\n')
+response=http.client.HTTPResponse(original)
+try:
+    response.begin();body=response.read(65537)
+    assert response.status==200 and not response.will_close and len(body)<=65536 and response.length in (None,0)
+finally:response.close()
+unchanged()
+result={'status':200,'tls':True,'same_socket':True}
+''')
+
+    def anytls_new_https(self):
+        # An 8s application budget observes the pinned core's own 3s SYNACK
+        # watchdog. Generic HTTPS probes and every fault retain their budgets.
+        return self.b.call(r'''
+import http.client
+connection=http.client.HTTPSConnection('1.1.1.1',timeout=8)
+try:
+    connection.request('GET','/cdn-cgi/trace')
+    response=connection.getresponse();body=response.read(65537)
+    assert len(body)<=65536 and response.length in (None,0)
+    result={'status':response.status,'tls':connection.sock is not None,'body_length':len(body)}
+finally:connection.close()
+''',10)
+
+    def anytls_cancelled_dial_recovery(self):
+        """Record one known cancelled-dial limitation before independent faults.
+
+        This is deliberately outside https(), fault(), and the product probe.
+        It is not a general promise that one retry handles every idle pool.
+        """
+        assert self.anytls_reuse_check is True,'requires the explicit AnyTLS fixture check'
+        def healthy(value):
+            assert value['ok'] is True and value['result']['status']==200 and value['result']['tls'] is True,value
+        def retained():
+            value=self.anytls_warm_https()
+            assert value['status']==200 and value['tls'] is True and value['same_socket'] is True,value
+        self.assert_rules();retained()
+        started=time.monotonic();first=self.anytls_new_https();elapsed=time.monotonic()-started
+        assert 0<=elapsed<8,'new HTTPS observation exceeded its diagnostic budget'
+        first_evidence={'status':'passed','seconds':round(elapsed,6),'error_type':None}
+        second_evidence={'status':'not_needed'};attempts=1
+        if first['ok'] is True:
+            healthy(first)
+        else:
+            kind=first.get('error','').split(':',1)[0]
+            assert kind in ('SSLEOFError','ConnectionResetError','EOFError') and 2.5<=elapsed<=4.0,first
+            first_evidence.update(status='known_watchdog_failure',error_type=kind)
+        retained()
+        if first_evidence['status']=='known_watchdog_failure':
+            # Exactly one subsequent new connection, with the first failure
+            # retained in evidence. No sleep, pool reset or core restart.
+            started=time.monotonic();second=self.anytls_new_https();elapsed=time.monotonic()-started
+            healthy(second);assert 0<=elapsed<8,'second HTTPS exceeded its diagnostic budget'
+            second_evidence={'status':'passed','seconds':round(elapsed,6)};attempts=2
+        retained();self.assert_rules()
+        return {'format':1,'first_new_connection':first_evidence,'second_new_connection':second_evidence,
+                'new_connection_attempts':attempts,'existing_tls_socket_preserved':True,
+                'policy_and_binding_unchanged':True,'no_core_restart_or_pool_reset':True,'recovered':True}
 
     def gateway_ready(self):
         end=time.monotonic()+18
@@ -828,7 +936,7 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
                 self.echo(self.a,address,self.tcp.server_address[1]);self.echo(self.a,address,udps[address].server_address[1],True)
             return 'TCP/UDP on both loopback addresses'
         self.record('host_loopback',loopback)
-        self.record('public_https',lambda:self.assert_https())
+        self.record('public_https',self.anytls_hold_https if self.anytls_reuse_check else self.assert_https)
         def dns_checks():
             results=[]
             self.query_names=[]
@@ -861,6 +969,8 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
             assert response['exit']!=0;evidence.append(response)
             return evidence
         self.record('private_ipv6_privilege_denials',blocked)
+        if self.anytls_reuse_check:
+            self.record('anytls_cancelled_dial_recovery',self.anytls_cancelled_dial_recovery)
         self.record('controlled_upstream_node_outage',self.node_outage)
         self.record('gateway_TUN_link_down',self.tun_link_fault)
         self.record('host_default_route_removed',lambda:self.fault('host-route',
@@ -891,31 +1001,44 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
         if self.namespace_fault!='none':
             self.record(self.namespace_fault,lambda:self.gateway_namespace_fault(self.namespace_fault))
         self.stop_captures()
-        def captures():
-            physical=self.verify_physical_capture(self.wire)
-            outer=command('tcpdump','-nn','-r',str(self.outer)).stdout.splitlines()
-            assert outer,'no outer packets observed'
-            unexpected=command('tcpdump','-nn','-r',str(self.outer),'not '+self.binding.outer_bpf()).stdout.splitlines()
-            assert not unexpected,unexpected[:20]
-            endpoint_counts=[]
-            for endpoint in self.binding.policy['outer_endpoints']:
-                packets=command('tcpdump','-nn','-r',str(self.outer),self.binding.endpoint_bpf(endpoint)).stdout.splitlines()
-                endpoint_counts.append(dict(endpoint,packets=len(packets)))
-            content=self.outer.read_bytes()
-            qnames=[b''.join(bytes([len(label)])+label.encode() for label in name.split('.'))+b'\0'
-                    for name in self.query_names]
-            assert all(name not in content for name in qnames)
-            assert self.udp_token not in content,'ordinary UDP appeared in plaintext on outer link'
-            dns=command('tcpdump','-nn','-r',str(self.dns_pcap)).stdout.splitlines()
-            unexpected_dns=command('tcpdump','-nn','-r',str(self.dns_pcap),
-                                   'not (ip and dst host 1.1.1.1 and (tcp or udp) and dst port 53)').stdout.splitlines()
-            assert dns and not unexpected_dns,unexpected_dns[:5]
-            return dict(physical,outer_packets=len(outer),outer_endpoints=endpoint_counts,
-                        redirected_dns_packets=len(dns),plaintext_dns_on_outer=False,
-                        dns_transport=self.binding.policy['dns_transport'],payload_networks=self.binding.policy['payload_networks'])
-        self.record('packet_capture_evidence',captures)
+        self.record('packet_capture_evidence',self.packet_capture_evidence)
         self.a.close();self.b.close()
         self.record('shared_rules_unchanged',lambda:self.assert_rules())
+
+    def packet_capture_evidence(self):
+        marker_policy=self.payload_marker_policy
+        assert marker_policy in ('absent','encapsulated'),'unknown payload marker policy'
+        physical=self.verify_physical_capture(self.wire)
+        outer=command('tcpdump','-nn','-r',str(self.outer)).stdout.splitlines()
+        assert outer,'no outer packets observed'
+        unexpected=command('tcpdump','-nn','-r',str(self.outer),'not '+self.binding.outer_bpf()).stdout.splitlines()
+        assert not unexpected,unexpected[:20]
+        endpoint_counts=[]
+        for endpoint in self.binding.policy['outer_endpoints']:
+            packets=command('tcpdump','-nn','-r',str(self.outer),self.binding.endpoint_bpf(endpoint)).stdout.splitlines()
+            endpoint_counts.append(dict(endpoint,packets=len(packets)))
+        content=self.outer.read_bytes()
+        qnames=[b''.join(bytes([len(label)])+label.encode() for label in name.split('.'))+b'\0'
+                for name in self.query_names]
+        plaintext_dns=any(name in content for name in qnames)
+        plaintext_udp=self.udp_token in content
+        # Plain SOCKS/VLESS can expose application bytes inside an authorized
+        # proxy flow. Only the explicit test recipe selects that expectation;
+        # it never relaxes the endpoint, physical-interface or DNS-target gate.
+        # Byte absence alone is not a cryptographic confidentiality proof.
+        if marker_policy=='absent' or self.binding.policy['dns_transport']=='https':
+            assert not plaintext_dns,'DNS query marker appeared on outer link'
+        if marker_policy=='absent' or 'udp' not in self.binding.policy['payload_networks']:
+            assert not plaintext_udp,'ordinary UDP appeared in plaintext on outer link'
+        dns=command('tcpdump','-nn','-r',str(self.dns_pcap)).stdout.splitlines()
+        unexpected_dns=command('tcpdump','-nn','-r',str(self.dns_pcap),
+                               'not (ip and dst host 1.1.1.1 and (tcp or udp) and dst port 53)').stdout.splitlines()
+        assert dns and not unexpected_dns,unexpected_dns[:5]
+        return dict(physical,outer_packets=len(outer),outer_endpoints=endpoint_counts,
+                    unexpected_outer_packets=len(unexpected),redirected_dns_packets=len(dns),
+                    payload_marker_policy=marker_policy,plaintext_dns_on_outer=plaintext_dns,
+                    plaintext_udp_on_outer=plaintext_udp,
+                    dns_transport=self.binding.policy['dns_transport'],payload_networks=self.binding.policy['payload_networks'])
 
     def assert_https(self):
         result=self.https(self.a);assert result['ok'] and result['result']['status']==200,result
@@ -941,6 +1064,10 @@ def main():
     parser.add_argument('--output',default='/root/dev-session-acceptance-20261009/core')
     parser.add_argument('--repetitions',type=int,default=100)
     parser.add_argument('--udp-echo',type=udp_target,required=True,help='controlled non-DNS echo target, reachable only through the upstream fixture')
+    parser.add_argument('--payload-marker-policy',choices=('absent','encapsulated'),default='absent',
+                        help='test recipe expectation: unencrypted proxies may expose markers only inside exact allowed outer flows')
+    parser.add_argument('--anytls-reuse-check',action='store_true',
+                        help='record the pinned AnyTLS cancelled-dial limitation before independent core faults')
     parser.add_argument('--namespace-fault',choices=('none','gateway-stop','gateway-kill','gateway-recreate'),default='none',
                         help='last scenario; changed namespace leaves guards and binding in place for offline rebind')
     parser.add_argument('--compose-project',help='explicit owned project; required only for gateway-recreate on a fresh Compose test host')

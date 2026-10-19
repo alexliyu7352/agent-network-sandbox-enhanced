@@ -25,7 +25,7 @@ class NativeRecipeTests(unittest.TestCase):
 
     def test_all_recipes_keep_real_tun_dns_and_inline_node_trust(self):
         names=list(dict.fromkeys(runtime.case_names()+list(runtime.EXPERIMENTAL_CASES)))
-        self.assertEqual(len(names),47)
+        self.assertEqual(len(names),44)
         for name in names:
             with self.subTest(case=name):
                 plan=self.recipe(name);source=plan['source'];effective=plan['effective']
@@ -48,6 +48,14 @@ class NativeRecipeTests(unittest.TestCase):
                     self.assertEqual(plan['server']['outbounds'],[{'type':'direct','tag':'fixture-direct',
                                                                   'inet4_bind_address':fixture.ADDRESS}])
                     self.assertNotIn('override_address',json.dumps(plan['server']))
+
+    def test_httpupgrade_has_no_native_or_experimental_recipe(self):
+        for kind in ('trojan','vmess','vless'):
+            name=kind+'-httpupgrade'
+            with self.subTest(case=name):
+                self.assertNotIn(name,runtime.case_names()+list(runtime.EXPERIMENTAL_CASES))
+                with self.assertRaisesRegex(RuntimeError,'fixture: unknown-protocol-case'):
+                    self.recipe(name)
 
     def test_detour_and_wrappers_expose_only_outer_nodes(self):
         for name in ('detour','shadowtls1','shadowtls2','shadowtls3'):
@@ -136,6 +144,36 @@ class NativeRecipeTests(unittest.TestCase):
                 fixture.runtime_evidence(plan,metrics,'')
 
 
+class SafeDiagnosticTests(unittest.TestCase):
+    def test_command_failure_exposes_only_static_category_and_exit_status(self):
+        secret='PRIVATE-DIAGNOSTIC-CANARY'
+        result=subprocess.CompletedProcess([],17,secret+' stdout',secret+' stderr')
+        with mock.patch.object(fixture.subprocess,'run',return_value=result):
+            try:fixture.run('/private/'+secret+'/worker','--password',secret)
+            except RuntimeError as error:
+                evidence=fixture.failure_evidence(error)
+                self.assertNotIn(secret,str(error)+json.dumps(evidence))
+            else:self.fail('injected command failure was accepted')
+        self.assertEqual(evidence['format'],1)
+        self.assertEqual(evidence['command'],'worker')
+        self.assertEqual(evidence['returncode'],17)
+        self.assertFalse(evidence['timeout'])
+        self.assertNotIn('stdout',evidence);self.assertNotIn('stderr',evidence)
+
+    def test_timeout_and_unknown_executable_cannot_echo_command_arguments(self):
+        secret='PRIVATE-TIMEOUT-CANARY'
+        error=subprocess.TimeoutExpired(['/private/'+secret,'--secret',secret],1,
+                                        output=secret,stderr=secret)
+        with mock.patch.object(fixture.subprocess,'run',side_effect=error):
+            try:fixture.run('/private/'+secret,'--secret',secret)
+            except subprocess.TimeoutExpired as caught:evidence=fixture.failure_evidence(caught)
+            else:self.fail('injected timeout was accepted')
+        self.assertEqual(evidence['exception'],'TimeoutExpired')
+        self.assertEqual(evidence['command'],'external')
+        self.assertIsNone(evidence['returncode']);self.assertTrue(evidence['timeout'])
+        self.assertNotIn(secret,json.dumps(evidence))
+
+
 @unittest.skipUnless(os.geteuid()==0,'root-owned artifact contracts require root')
 class RenderIdentityTests(unittest.TestCase):
     def setUp(self):
@@ -160,6 +198,23 @@ class RenderIdentityTests(unittest.TestCase):
     def render(self):
         with mock.patch.object(fixture,'run',side_effect=self.boundary),redirect_stdout(io.StringIO()):
             fixture.render(self.args,self.output)
+
+    def test_cli_reports_setup_location_without_private_path_or_error_text(self):
+        secret='PRIVATE-CLI-DIAGNOSTIC-CANARY'
+        result=subprocess.run([fixture.sys.executable,str(Path(fixture.__file__).resolve()),'setup',
+            '--config',str(self.root/(secret+'.json')),'--engine',str(self.engine),'--output',str(self.output)],
+            stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,1)
+        self.assertNotIn(secret,result.stdout+result.stderr)
+        rows=[line[len('UPSTREAM_FIXTURE_DIAGNOSTIC '):] for line in result.stderr.splitlines()
+              if line.startswith('UPSTREAM_FIXTURE_DIAGNOSTIC ')]
+        self.assertEqual(len(rows),1)
+        evidence=json.loads(rows[0])
+        self.assertEqual(evidence['exception'],'AssertionError')
+        self.assertEqual(evidence['location']['function'],'setup')
+        self.assertGreater(evidence['location']['line'],0)
+        self.assertIsNone(evidence['command']);self.assertIsNone(evidence['returncode'])
+        self.assertFalse((self.output/'upstream-fixture-state.json').exists())
 
     def test_rendered_identity_roundtrip_and_source_immutable(self):
         self.render();source=Path(self.args.config);before=source.read_bytes()

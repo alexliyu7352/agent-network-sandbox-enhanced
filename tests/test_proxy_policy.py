@@ -161,13 +161,45 @@ class ProxyPolicyTests(unittest.TestCase):
 
     def test_v2ray_encapsulation_chooses_actual_transport(self):
         for kind in ("trojan", "vmess", "vless"):
-            for transport in ("http", "ws", "grpc", "httpupgrade", "quic"):
+            for transport in (None, "http", "ws", "grpc", "quic"):
                 with self.subTest(kind=kind, transport=transport):
-                    result = self.parse(config(node(kind, transport={"type": transport},
-                                                   tls={"enabled": True})))
+                    outbound = node(kind, tls={"enabled": True, "server_name": "proxy.example",
+                                              "certificate": ["PUBLIC-FAKE-CERTIFICATE"], "insecure": False})
+                    if transport is not None:
+                        outbound["transport"] = {"type": transport}
+                    value = config(outbound)
+                    result = self.parse(value)
                     self.assertEqual(result["outer_endpoints"],
                                      [endpoint(protocol="udp" if transport == "quic" else "tcp")])
                     self.assertEqual(result["payload_networks"], ["tcp", "udp"])
+                    effective = self.parse(value, "effective")["outbounds"][0]
+                    self.assertEqual(effective.pop("bind_interface"), "eth0")
+                    self.assertEqual(effective, outbound, "accepted alternatives must preserve TLS and auth")
+
+    def test_httpupgrade_rejected_for_every_base_protocol_and_graph_position(self):
+        reason = ("HTTPUpgrade is not accepted for pinned core 1.14.2 after paired reliability failures; "
+                  "use native TCP (omit transport), ws, http, grpc, or quic")
+        for kind in ("trojan", "vmess", "vless"):
+            wrapped = node(kind, transport={"type": "httpupgrade", "path": "/private-path",
+                                           "headers": {"X-Fixture-Auth": "TEST-CREDENTIAL-DO-NOT-PRINT"}})
+            for position in ("direct", "selector", "urltest", "inner-detour", "carrier-detour"):
+                with self.subTest(kind=kind, position=position):
+                    leaf = copy.deepcopy(wrapped)
+                    if position == "direct":
+                        value = config(leaf)
+                    elif position in {"selector", "urltest"}:
+                        leaf["tag"] = "wrapped"
+                        group = {"type": position, "tag": "proxy", "outbounds": ["good", "wrapped"]}
+                        if position == "selector":
+                            group["default"] = "good"
+                        value = config(group, node("http", "good", "192.0.2.2"), leaf)
+                    elif position == "inner-detour":
+                        leaf["detour"] = "carrier"
+                        value = config(leaf, node("hysteria2", "carrier", "192.0.2.2"))
+                    else:
+                        leaf["tag"] = "carrier"
+                        value = config(node("http", detour="carrier"), leaf)
+                    self.rejected(value, reason)
 
     def test_uot_and_multiplex_remove_native_shadowsocks_udp(self):
         for extra in ({"udp_over_tcp": True}, {"udp_over_tcp": {"enabled": True, "version": 1}},

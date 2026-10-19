@@ -115,3 +115,6 @@ HTTP CONNECT 隨後以新的獨立 binding 執行相同 17 項主機驗收。抓
 容器停止／重建／daemon restart 若改變 namespace 身分，預期行為是保留 binding 和共用封鎖、拒絕新會話，關閉既有會話後依[離線升級流程](offline-upgrade.md)處理。不能將直接刪掉 binding 後重新啟動記作故障恢復通過。
 
 任何合併仍須由使用者審閱最終測試結果後明確同意；本次提交只位於工作分支。
+
+
+逐協議原生矩陣、歷史 47 組之後發現的 HTTPUpgrade 可靠性反例、現行 44 組 inventory、AnyTLS 有界限制及後續關卡，另記於 [2026-10-19 追加驗證](validation-20261019-followup.md)。本頁早期通過紀錄保留，不用來抵銷後續失敗。

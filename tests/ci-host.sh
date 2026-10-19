@@ -159,11 +159,45 @@ if profile == "protocol-case":
         "gateway_half_route_removed", "failed_probe_no_payload", "extra_policy_rule_rejected",
         "writable_policy_rejected", "gateway-kill", "packet_capture_evidence", "shared_rules_unchanged",
     )
+    if case == "anytls":
+        expected = expected[:7] + ("anytls_cancelled_dial_recovery",) + expected[7:]
+    core_key = "core18" if case == "anytls" else "core17"
     core = loaded.get("core", [])
-    proofs["core17"] = tuple(row.get("name") for row in core) == expected
-    if not proofs["core17"] and suites["core"]["status"] == "passed":
+    proofs[core_key] = tuple(row.get("name") for row in core) == expected
+    if not proofs[core_key] and suites["core"]["status"] == "passed":
         suites["core"]["status"] = "invalid_results"
     details = {row.get("name"): row.get("detail") for row in core if isinstance(row.get("name"), str)}
+
+    if case == "anytls":
+        def anytls_recovery():
+            value = details["anytls_cancelled_dial_recovery"]
+            preserved = ("existing_tls_socket_preserved", "policy_and_binding_unchanged",
+                         "no_core_restart_or_pool_reset", "recovered")
+            if (not isinstance(value, dict) or set(value) != set(preserved) | {
+                    "format", "first_new_connection", "second_new_connection", "new_connection_attempts"}
+                    or type(value["format"]) is not int or value["format"] != 1
+                    or not all(value[name] is True for name in preserved)
+                    or type(value["new_connection_attempts"]) is not int): return False
+            first, second = value["first_new_connection"], value["second_new_connection"]
+            if (not isinstance(first, dict) or set(first) != {"status", "seconds", "error_type"}
+                    or not isinstance(second, dict)): return False
+
+            def within_budget(seconds):
+                # Bound before isfinite so an arbitrarily large JSON integer
+                # cannot overflow float conversion and prevent a failed manifest.
+                return type(seconds) in (int, float) and 0 <= seconds < 8 and math.isfinite(seconds)
+
+            if first["status"] == "passed":
+                return (value["new_connection_attempts"] == 1 and within_budget(first["seconds"])
+                        and first["error_type"] is None and second == {"status": "not_needed"})
+            seconds = first["seconds"]
+            return (first["status"] == "known_watchdog_failure"
+                    and type(seconds) in (int, float) and 2.5 <= seconds <= 4.0 and math.isfinite(seconds)
+                    and first["error_type"] in ("SSLEOFError", "ConnectionResetError", "EOFError")
+                    and value["new_connection_attempts"] == 2
+                    and set(second) == {"status", "seconds"} and second["status"] == "passed"
+                    and within_budget(second["seconds"]))
+        proof("anytls_cancelled_dial_recovery", anytls_recovery)
 
     def socket_origin():
         rows = details["two_session_credentials"]
@@ -185,11 +219,21 @@ if profile == "protocol-case":
 
     def packet_capture():
         capture = details["packet_capture_evidence"]
-        counts = ("positive_control_packets", "direct_workload_packets", "outer_packets", "redirected_dns_packets")
+        # These exact fixtures have no encrypted carrier for UDP payloads.
+        # Observed bytes still have to be inside the independently checked
+        # authorized outer flow. WebSocket masking is not encryption.
+        marker_policy = ("encapsulated" if case in ("socks5-uot", "vless", "vless-http", "vless-ws",
+                                                    "vless-grpc") else "absent")
+        counts = ("positive_control_packets", "direct_workload_packets", "outer_packets",
+                  "redirected_dns_packets", "unexpected_outer_packets")
         return (all(type(capture[name]) is int for name in counts)
                 and capture["positive_control_packets"] >= 2 and capture["direct_workload_packets"] == 0
                 and capture["outer_packets"] > 0 and capture["redirected_dns_packets"] > 0
-                and capture["plaintext_dns_on_outer"] is False
+                and capture["unexpected_outer_packets"] == 0
+                and capture["payload_marker_policy"] == marker_policy
+                and all(type(capture[name]) is bool for name in ("plaintext_dns_on_outer", "plaintext_udp_on_outer"))
+                and (marker_policy == "encapsulated" or
+                     (capture["plaintext_dns_on_outer"] is False and capture["plaintext_udp_on_outer"] is False))
                 and all(artifact("core/" + name + ".pcap", 25) for name in
                         ("physical-direct-probes", "gateway-outer", "redirected-dns")))
     proof("packet_capture", packet_capture)
@@ -222,6 +266,14 @@ if profile == "protocol-case":
                        "fixture_render", "fixture", "exit_ip", "core", "fixture_verify"]
     if case == "ssh": required_stages.append("fixture_python")
     recorded = [row.get("name") for row in stages if isinstance(row, dict)]
+    if case == "anytls":
+        # Recovery is one row inside the original core run. A separate retry
+        # stage or a reordered healthy/fault phase cannot supply this proof.
+        # The report also runs before results and fixture_cleanup are recorded.
+        proofs["anytls_stage_order"] = stages_valid and recorded in (
+            required_stages, required_stages + ["results"],
+            required_stages + ["results", "fixture_cleanup"],
+        )
     if case in ("hysteria-port-hopping", "hysteria2-port-hopping"):
         required_stages.append("fixture_continuity")
         def hopping_continuity():
@@ -655,6 +707,12 @@ ci_suites() {
 }
 
 ci_protocol_suites() {
+    local marker_policy=absent
+    local core_options=()
+    if [[ $CI_PROTOCOL_CASE == anytls ]]; then core_options+=(--anytls-reuse-check); fi
+    case "$CI_PROTOCOL_CASE" in
+        socks5-uot|vless|vless-http|vless-ws|vless-grpc) marker_policy=encapsulated ;;
+    esac
     # main has already completed exit-IP. Observe real rotation on one healthy
     # socket before a node outage or gateway kill could create another flow.
     if ci_needs_hopping_continuity "$CI_PROTOCOL_CASE"; then
@@ -664,7 +722,8 @@ ci_protocol_suites() {
     # refusal on gateway kill. No lifecycle stress or namespace adoption follows.
     ci_stage core timeout --signal=TERM --kill-after=30s 20m \
         python3 "$CI_ROOT/tests/host_acceptance.py" --user "$CI_ACCOUNT" \
-        --output "$CI_EVIDENCE/core" --udp-echo 192.0.2.254:40123 --namespace-fault gateway-kill
+        --output "$CI_EVIDENCE/core" --udp-echo 192.0.2.254:40123 \
+        --payload-marker-policy "$marker_policy" --namespace-fault gateway-kill "${core_options[@]}"
     ci_stage fixture_verify ci_protocol_fixture_verify
     ci_stage results ci_validate_results "$CI_EVIDENCE" protocol-case "$CI_PROTOCOL_CASE"
     cmp /run/dev-session-v8/binding "$CI_EVIDENCE/binding-initial.json"

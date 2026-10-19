@@ -45,7 +45,8 @@ USERNAME = "matrix-user"
 UUID = "00000000-0000-4000-8000-000000000001"
 TIMEOUT = 3.0
 EXPERIMENTAL_CASES = ()
-BLOCKED = {}
+BLOCKED = {name: "pinned-core-httpupgrade-paired-reliability-not-accepted"
+           for name in ("trojan-httpupgrade", "vmess-httpupgrade", "vless-httpupgrade")}
 
 
 class CaseFailure(Exception):
@@ -74,7 +75,7 @@ def case_names():
              "naive-quic", "naive-uot", "snell4", "snell6"]
     for kind in ("trojan", "vmess", "vless"):
         names.append(kind)
-        names.extend(kind + "-" + transport for transport in ("http", "ws", "grpc", "httpupgrade", "quic"))
+        names.extend(kind + "-" + transport for transport in ("http", "ws", "grpc", "quic"))
     return names + ["selector-trojan", "selector-hysteria2", "urltest", "detour",
                     "hysteria2-port-hopping", "hysteria-port-hopping",
                     "shadowtls1", "shadowtls2", "shadowtls3", "ssh"]
@@ -86,7 +87,7 @@ def is_hopping_case(name):
 
 def transport_options(kind):
     result = {"type": kind}
-    if kind in {"http", "ws", "httpupgrade"}:
+    if kind in {"http", "ws"}:
         result["path"] = "/matrix"
     if kind == "grpc":
         result["service_name"] = "matrix"
@@ -176,6 +177,7 @@ def compile_config(source, mode):
 
 
 def build_configs(name, original, ports, certificate, cert_path, key_path, ssh_host_key=None):
+    require(name not in BLOCKED, BLOCKED.get(name, "unknown-case"))
     require(name in case_names() or name in EXPERIMENTAL_CASES, "unknown-case")
     source = copy.deepcopy(original)
     source["log"] = {"level": "info", "timestamp": False}
@@ -700,7 +702,7 @@ def main():
     parser.add_argument("--engine", help="Actual pinned worker executable; required except with --list")
     parser.add_argument("--config", type=Path, default=ROOT / "network.json")
     parser.add_argument("--case", action="append", choices=case_names() + list(EXPERIMENTAL_CASES),
-                        help=f"Repeat to select cases; defaults to the verified {len(case_names())}-case matrix")
+                        help=f"Repeat to select cases; defaults to the accepted {len(case_names())}-case loopback matrix")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--check-only", action="store_true", help="Emit CONFIG_PASS only; never count configuration checks as runtime verification")
     parser.add_argument("--artifacts", type=Path, help="New root-private directory retaining fake fixture configs/logs; otherwise temporary files are removed")

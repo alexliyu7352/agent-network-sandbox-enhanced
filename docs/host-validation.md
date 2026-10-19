@@ -2,7 +2,9 @@
 
 本文件是目前版本的重驗清單，**不是宣稱所有項目已通過的結果表**。只在有控制台、可以回復、可接受網絡與服務中斷的測試主機執行。`tests/host_*.py` 會啟動會話、修改路由與規則，部分項目停止網關或重新啟動 Docker；不要直接在日常工作主機執行整套故障測試。
 
-截至 2026-10-19，已完成的證據包括 24／24 公開配置檢查、47／47 協議 loopback 案例，以及 Ubuntu 20.04.6 hybrid／v1 上 Hysteria2 和 HTTP 的核心／故障套件各 17／17。[CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891) 在 `58dcfad596856fc3696d138f84d1c0f37e6e0ebd` 通過 12／12 jobs：Ubuntu 26.04.1 原生純 v2 的兩個協議各測 healthy、stop、kill、recreate、Docker restart；Debian 13.7 KVM 純 v2 的兩個協議各測 healthy。Debian 的兩個 jobs 仍含路由、TUN 及受控上游中斷測試，但不含容器／Docker namespace 故障。
+截至 2026-10-19，歷史證據包括 24／24 公開配置檢查、初輪 47／47 協議 loopback 案例，以及 Ubuntu 20.04.6 hybrid／v1 上 Hysteria2 和 HTTP 的核心／故障套件各 17／17。[CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891) 在 `58dcfad596856fc3696d138f84d1c0f37e6e0ebd` 通過 12／12 jobs：Ubuntu 26.04.1 原生純 v2 的兩個協議各測 healthy、stop、kill、recreate、Docker restart；Debian 13.7 KVM 純 v2 的兩個協議各測 healthy。Debian 的兩個 jobs 仍含路由、TUN 及受控上游中斷測試，但不含容器／Docker namespace 故障。
+
+後續逐協議 CI 的第一輪為 50／59，未全數通過；HTTPUpgrade 追加重測失敗後已明確拒絕，現行必需矩陣為 44 個逐協議 jobs 加原有 12 個代表性 jobs。AnyTLS 另含一項有界限制與恢復驗證，第一條失敗保留，不在通用故障測試或產品探測加入重試。完整失敗紀錄與後續結果見[追加驗證](validation-20261019-followup.md)。
 
 各次版本、套件數量、封包與 socket 身分證據見 [驗證摘要](VERIFICATION.md)。以下清單也列出尚待擴充的測試範圍，不能把它的每個項目都當成已通過。配置／loopback 結果不代替主機層驗收，已測主機也不能代替其他協議、transport 或使用者實際遠端節點。歷史結果另保留於 [2026-10-10](host-acceptance-20261010.md) 與 [2026-10-09](host-acceptance-20261009.md)。
 
@@ -72,7 +74,7 @@ v2 還須核對 **socket 建立時的 cgroup**：在兩個受管 service 內各�
 | --- | --- |
 | Hysteria2 network:tcp | 節點 UDP；不能因內層 TCP 多放行節點 TCP |
 | Shadowsocks 原生、UoT、multiplex | 分別驗證 native TCP／UDP 和封裝後只需 TCP 的差異 |
-| Trojan／VMess／VLESS 的 http、ws、grpc、httpupgrade、quic | 四種 TCP transport 與 QUIC UDP 分開驗證 |
+| Trojan／VMess／VLESS 的 http、ws、grpc、quic | 三種 TCP transport 與 QUIC UDP 分開驗證；HTTPUpgrade 必須在編譯時明確拒絕 |
 | Hysteria 跳埠 | 只在正規化聯集內出站，測區間兩端、區間間隙和超出邊界的埠 |
 | selector／urltest | 所有可能候選的端點；urltest 另有每個候選的健康探測需求，探測網站本身不能直連 |
 | 多跳 detour | 只見真正最外層葉節點，不能直接連到內層 server；包括 UDP 經 UoT carrier 的組合 |
@@ -94,7 +96,7 @@ python3 tests/test_dns_runtime.py --engine /absolute/path/to/pinned-worker --pro
 
 先把範例中的 engine 路徑換成已核對版本的測試 binary。最後兩行是預期非零的負對照，不能當作整套測試失敗或以 `--check-only` 取代。loopback fixture 使用臨時服務、假認證及測試憑證；完整主機驗收仍需實際會話／防火牆／路由／封包證據。
 
-更廣的成對協議測試由 [`tests/protocol_runtime.py`](../tests/protocol_runtime.py) 執行。47 組已在固定核心上實際通過；每組先做正式 policy／effective 編譯，再將 TUN、介面與 DNS 邊界替換為 loopback fixture。這些替換表示結果沒有執行正式主機的 cgroup、TUN 或 firewall 路徑。SSH 另需在私有 Python 環境安裝固定 Paramiko 3.5.1 依賴。可重跑：
+更廣的成對協議測試由 [`tests/protocol_runtime.py`](../tests/protocol_runtime.py) 執行。初輪 47 組曾在固定核心各至少一次通過，三個 HTTPUpgrade 隨後因可靠性反例而拒絕；現行預設為 44 組。每組先做正式 policy／effective 編譯，再將 TUN、介面與 DNS 邊界替換為 loopback fixture。這些替換表示結果沒有執行正式主機的 cgroup、TUN 或 firewall 路徑。SSH 另需在私有 Python 環境安裝固定 Paramiko 3.5.1 依賴。可重跑：
 
 ```bash
 python3 tests/protocol_runtime.py --list
@@ -132,6 +134,8 @@ sudo python3 tests/host_exit_ip.py --user testagent \
 5. 插入、刪除或重排一條本工具規則，核對 exact-rule 檢查拒絕入場；這類完整性案例需按個別測試記錄，不因正常連線通過而視為已測。
 6. 停止或終止 gateway core，並在獨立測試主機分開執行 container stop/start、kill/start、recreate 或 Docker daemon restart。會改變 namespace 的故障放在最後；後續不能自動恢復成可入場狀態。
 
+PCAP 的開始必須由本次唯一 root canary 實際入檔證明，結束也要另有本次唯一末端 canary；重複的起始封包不能代替末端證據。對未加密 SOCKS5 UoT／VLESS，DNS 或 UDP marker 可以出現在精確允許的代理流內，測試須如實記錄可見性；這不允許其他外層端點、直連 DNS 或實體介面 workload 直連。DoH 及不支援 UDP 的出口仍不允許相應 marker。
+
 故障期間抓實體介面，確認不使用原本的直連出口；既有及新受管外網連線應失敗或中斷，另一會話的 loopback 仍可用。抓包必須有能被觀察到的正對照，再核對受管直連數為零，並逐一比對真正的外層 IP／TCP 或 UDP／埠區間。HTTP 的普通 UDP 拒絕與 Hysteria2 的實際 UDP echo 必須分開判定。**不要以清空 mangle 或全機防火牆注入故障。**
 
 同一 namespace 內的暫時故障只撤銷測試自己的精確變更，再由 `check` 核對原規則、路由與 binding。TUN down/up 在已測核心上會移除 `0.0.0.0/1` 和 `128.0.0.0/1`；harness 先保存兩條原路由及其餘 route snapshot，恢復 link 後只以 `ip route add` 補回缺失的原條目。若任一現存條目被改動、重複或其他路由改變，就拒絕復原；不能以 `replace`、重跑 `init` 或刪 binding 掩蓋問題。[故障與精確復原實作](../tests/host_acceptance.py)
@@ -157,7 +161,7 @@ namespace 變更後，`check`、`init` 和新 workload 入場都應拒絕，原 
 
 任何受管外網直出、身份失配後仍啟動工作負載、正常終端關閉留下未停止的工作程序，都應記為未通過。跳過項目要寫清原因；不能改成 unfiltered fallback，也不能以舊版結果、解析器通過或某個 HTTP 請求成功替代缺失的驗收。
 
-最新 CI 的離線 discover 是 248 項中的 247 通過、1 跳過：當時尚未建置 worker，也未設定 `DEV_NETWORK_TEST_ENGINE`，所以真實 ELF 的 stdin-hold 回歸跳過。另有 25／25 inline helper 測試通過；後續真實容器／主機套件另行記錄，不能把 offline skip 記成通過。完整結果、代表性 artifact SHA-256 和已知限制見 [驗證摘要](VERIFICATION.md)。本次工作分支尚未合併 `main`，測試通過不代表已取得合併批准。
+12-job 基線 CI 的離線 discover 是 248 項中的 247 通過、1 跳過：當時尚未建置 worker，也未設定 `DEV_NETWORK_TEST_ENGINE`，所以真實 ELF 的 stdin-hold 回歸跳過。另有 25／25 inline helper 測試通過；後續真實容器／主機套件另行記錄，不能把 offline skip 記成通過。完整結果、代表性 artifact SHA-256 和已知限制見 [驗證摘要](VERIFICATION.md)。本次工作分支尚未合併 `main`，測試通過不代表已取得合併批准。
 
 Ubuntu Focal 官方依據（文件依據不等於實機結果）：
 

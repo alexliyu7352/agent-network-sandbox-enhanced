@@ -31,7 +31,8 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
                      "selector-trojan", "selector-hysteria2", "urltest", "detour"):
             self.assertIn(kind, names)
         for kind in ("trojan", "vmess", "vless"):
-            for transport in ("http", "ws", "grpc", "httpupgrade", "quic"):
+            self.assertIn(kind, names)
+            for transport in ("http", "ws", "grpc", "quic"):
                 self.assertIn(kind + "-" + transport, names)
         self.assertEqual(len(names), len(set(names)))
 
@@ -119,18 +120,35 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
                     self.assertEqual(reply, {"peer": runtime.LOOPBACK, "token": "relay-" + str(index)})
                 self.assertEqual(relay.observed_ports, sorted(relay.ports))
 
-    def test_inventory_and_help_select_all_47_verified_recipes(self):
-        self.assertEqual(len(runtime.case_names()), 47)
+    def test_inventory_and_help_select_44_recipes_and_report_blocked_httpupgrade(self):
+        self.assertEqual(len(runtime.case_names()), 44)
         result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--list"],
                                 check=True, capture_output=True, text=True)
         inventory = json.loads(result.stdout)
         self.assertEqual(inventory["experimental_cases"], [])
         self.assertEqual(inventory["cases"], runtime.case_names())
-        self.assertEqual(inventory["blocked"], {})
+        blocked = {kind + "-httpupgrade" for kind in ("trojan", "vmess", "vless")}
+        self.assertEqual(set(inventory["blocked"]), blocked)
+        self.assertFalse(blocked.intersection(inventory["cases"] + inventory["experimental_cases"]))
+        for reason in inventory["blocked"].values():
+            self.assertIn("pinned-core", reason)
+            self.assertIn("paired-reliability", reason)
         help_result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--help"],
                                      check=True, capture_output=True, text=True)
-        self.assertIn("verified 47-case matrix", " ".join(help_result.stdout.split()))
+        self.assertIn("accepted 44-case loopback matrix", " ".join(help_result.stdout.split()))
         self.assertNotIn("Experimental cases", help_result.stdout)
+
+    def test_httpupgrade_cannot_be_selected_or_built_as_an_opt_in_case(self):
+        for kind in ("trojan", "vmess", "vless"):
+            name = kind + "-httpupgrade"
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(runtime.CaseFailure, "httpupgrade.*paired-reliability"):
+                    runtime.build_configs(name, self.original, self.ports, "TEST CERTIFICATE", "/fake/cert", "/fake/key")
+                result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--case", name],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("invalid choice", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_snell4_recipe_uses_the_real_server_version5_schema(self):
         _, client, server, policy = runtime.build_configs(

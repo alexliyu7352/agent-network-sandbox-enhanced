@@ -23,10 +23,10 @@
 | TUIC | TCP、UDP，可用 network 限制 | UDP | native／quic UDP relay 與 udp_over_stream 都保留 UDP 外層；它們不是把整個 QUIC 通道改成 TCP。 |
 | Shadowsocks 原生 | TCP、UDP，可用 network 限制 | TCP 內層需要 TCP；UDP 內層需要 UDP | 只放行實际使用的通道。拒絕 SIP003 plugin／plugin_opts。 |
 | Shadowsocks + UDP over TCP 或 multiplex | TCP、UDP，可用 network 限制 | TCP | 啟用 UoT 或多路複用時，UDP 也經 TCP；明確 disabled 的選項不改變原生外層。服務端須相容。 |
-| Trojan | TCP、UDP，可用 network 限制 | 預設 TCP；V2Ray QUIC 為 UDP | 支援下節列出的五種 V2Ray transport。 |
+| Trojan | TCP、UDP，可用 network 限制 | 預設 TCP；V2Ray QUIC 為 UDP | 支援下節列出的四種 V2Ray transport；HTTPUpgrade 明確拒絕。 |
 | VMess | TCP、UDP，可用 network 限制 | 預設 TCP；V2Ray QUIC 為 UDP | 服務端認證、security、packet_encoding、multiplex 與 TLS 仍由核心檢查。 |
 | VLESS | TCP、UDP，可用 network 限制 | 預設 TCP；V2Ray QUIC 為 UDP | 保留 flow、packet_encoding、TLS、Reality 等原始值；不猜測服務端需求。 |
-| AnyTLS | TCP、UDP | TCP | 核心自動使用 UoT 承載 UDP；禁止該核心不支援的 tcp_fast_open。 |
+| AnyTLS | TCP、UDP | TCP | 核心自動使用 UoT 承載 UDP；禁止該核心不支援的 tcp_fast_open。取消仍等待的上游 dial 後可能發生重用連線約三秒失敗，見[有界限制與恢復驗證](validation-20261019-followup.md)。 |
 | Snell 4／6 | TCP、UDP，可用 network 限制 | TCP | UDP 透過 TCP 通道承載。版本 4 的 obfs 與版本 6 的 mode 分開核對；不能把入口版本 5 當作出口版本。 |
 | HTTP／HTTPS CONNECT | TCP | TCP | 同為 type:http，HTTPS 使用 tls.enabled。會自動配套經 proxy 的 HTTPS DNS。 |
 | SOCKS4／4a | TCP | TCP | 必須明確 network:tcp；不能啟用 SOCKS5 的 UoT 擴充。 |
@@ -45,8 +45,9 @@
 | 功能 | 外層判定 | 支援邊界 |
 | --- | --- | --- |
 | transport 省略 | TCP | 使用協議本身的 TCP stream。 |
-| http、ws、grpc、httpupgrade | TCP | 僅接受固定版本對應 transport 的欄位。Host、path、headers、SNI 不改寫固定節點 IP。 |
+| http、ws、grpc | TCP | 僅接受固定版本對應 transport 的欄位。Host、path、headers、SNI 不改寫固定節點 IP。 |
 | quic | UDP | 要求啟用 TLS；不因內層 network:tcp 放行 TCP。 |
+| httpupgrade | 拒絕 | 固定 1.14.2 client／server 配對的追加重複測試未達可靠驗收。只限制此封裝；Trojan、VMess、VLESS 的原生 TCP 與其餘四種 transport 仍可使用。 |
 | 未知 transport，例如 kcp、tcp、xhttp | 拒絕 | 核心的枚舉不是任意 V2Ray／Xray transport 名稱。預設 TCP 以省略 transport 表達。 |
 | udp_over_tcp | 依承載協議轉成 TCP | SOCKS5、Shadowsocks、Naive 支援；接受布林或 enabled／version 物件，版本為核心支援的 1／2，0 表示預設。 |
 | multiplex | 依實際 transport | 支援 h2mux／smux／yamux；Shadowsocks 的 UDP 變成 TCP。Trojan／VMess／VLESS 的 QUIC transport 仍是 UDP。 |
@@ -141,6 +142,7 @@ jq -ceS --arg mode effective -f gateway-policy.jq network.json
 | --- | --- | --- |
 | domain／IPv6 節點、動態 domain_resolver／domain_strategy | 尚未實作地址發現、變更及雙棧政策生命週期 | 使用固定 IPv4；TLS server_name 仍可保留網域。 |
 | Hysteria2 realm、STUN、port mapping | 會引入額外發現服務及動態端點 | 使用固定 server／server_ports。 |
+| Trojan／VMess／VLESS 的 HTTPUpgrade 封裝 | 固定 1.14.2 配對在重複連線中出現失敗，三個原生主機案例也未通過；參見下方驗收修正紀錄 | 使用服務端相容的原生 TCP（省略 transport）、ws、http、grpc 或 quic，保留原有 TLS 驗證並重新驗收。 |
 | Shadowsocks SIP003 plugins | 插件可改傳输甚至啟動額外程序；尚未實作適配器 | 使用內建協議／transport 或已支持的 UoT／multiplex。 |
 | direct、bridge | 與只允許受控代理出口的路由模型不相容 | 使用真正代理出口及受管 route.final。 |
 | block 作出口候選 | 不提供可供會話與 DNS 使用的轉發通道 | 封鎖由受管網絡政策處理。 |
@@ -162,13 +164,13 @@ jq -ceS --arg mode effective -f gateway-policy.jq network.json
 
 靜態驗證由 [`tests/test_proxy_policy.py`](../tests/test_proxy_policy.py) 覆蓋：內層／外層分離、傳輸封裝、精確跳埠、圖引用、detour 通道相容、urltest 健康探測、DNS 自動選擇、未知出口通道拒絕、身份相關冪等性、多文件拒絕及錯誤不回顯憑證。24／24 份範例已通過兩種 jq 模式，也全部通過測試 VPS 的固定 `worker 1.14.2 check`。各次命令、版本與主機層證據另見 [2026-10-18 起的驗證紀錄](validation-20261018.md)。
 
-### 已完成的 47 組真實協議 loopback 測試
+### 歷史 47 組 loopback 與現行 44 組 inventory
 
-[`tests/protocol_runtime.py`](../tests/protocol_runtime.py) 已在測試 VPS 上累計完成 **47／47 組不同案例的實際 client／server 轉發及故障測試**。其中 46 組的 client 與 proxy server 都使用同一個 sing-box 1.14.2 執行檔；SSH 使用該核心 client 及獨立 Paramiko 3.5.1 server。核心版本及提交必須與本頁固定值一致。這是本次已執行案例的數量，不是所有可能配置組合的數量。
+[`tests/protocol_runtime.py`](../tests/protocol_runtime.py) 在追加重複測試之前，曾累計記錄 **47／47 組不同案例各一次的實際 client／server 轉發及故障測試通過**。其中 46 組的 client 與 proxy server 都使用同一個 sing-box 1.14.2 執行檔；SSH 使用該核心 client 及獨立 Paramiko 3.5.1 server。這份歷史包含三個 HTTPUpgrade 案例；它們隨後在下述可靠性測試中失敗，已撤出支援範圍。現行預設 loopback／native fixture inventory 為 **44 組**，不把早期 47 組的紀錄改寫成一輪新的 44 組結果，也不以單次通過宣稱所有配置組合可靠。
 
 首批 40 組另通過獨立固定核心配置檢查 **40／40**；Hysteria2 跳埠通過實際執行前的 client／server 核心檢查。2026-10-19 新增 Snell4 與 Hysteria1 跳埠的獨立 `--check-only` **2／2** 及 runtime **2／2** 均通過。SSH 與 ShadowTLS 1／2／3 的四組配置檢查也全部通過；SSH、ShadowTLS 1／3 首次 runtime 通過，ShadowTLS 2 在下述 cover fixture 修正後通過，並重跑三個 ShadowTLS 版本 **3／3** 通過。所有案例均通過執行前的核心配置檢查；SSH 的 `core_checked` 明確只有 `client`，其 Python server 不能算作核心檢查。
 
-| 已通過的組別 | 案例與實際範圍 |
+| 歷史單次通過的組別 | 案例與實際範圍 |
 | --- | --- |
 | Hysteria／TUIC，4 組 | Hysteria1 固定埠、Hysteria2 固定埠、TUIC 原生、TUIC udp_over_stream；均驗證 TCP 與 UDP。 |
 | Hysteria1／2 跳埠，2 組 | 兩個版本各自從八個宣告埠中實際觀察到兩個不同目的埠；同一 TCP stream 在切換後繼續轉發，並通過 UDP、DNS 與停止 server 的檢查。 |
@@ -180,16 +182,30 @@ jq -ceS --arg mode effective -f gateway-policy.jq network.json
 | Snell，2 組 | Snell6 client／server，以及 Snell4 client 對固定核心的 Snell5 inbound；後者使用相同 PSK 與 `obfs_mode:none`。兩者均通過 TCP、UDP、DNS、快取／TTL 與停止 server 後的阻斷；未外推到其他 server 版本或混淆設定。 |
 | SSH，1 組 | 固定核心 client 對獨立 Paramiko 3.5.1 server；假密碼及臨時 RSA host key。TCP、普通 UDP 拒絕、經代理且驗證憑證的 HTTPS DNS、快取／TTL、停止 server 後阻斷均通過。 |
 | ShadowTLS，3 組 | version 1／2／3 各包裝內層 chacha20-ietf-poly1305 Shadowsocks 加 UoT，使用私有 TLS cover。每組實際觀察三次 cover 握手及 cover／proxy 兩個入口轉發，TCP／UDP／DNS 與故障檢查均通過。 |
-| Trojan，6 組 | 預設傳輸及 http、ws、grpc、httpupgrade、quic，各自驗證 TCP 與 UDP。 |
-| VMess，6 組 | 預設傳輸及相同五種 transport，使用 security:auto，各自驗證 TCP 與 UDP。 |
-| VLESS，6 組 | 預設傳輸及相同五種 transport，各自驗證 TCP 與 UDP；沒有測試額外 flow 或 Reality 組合。 |
+| Trojan，6 組 | 預設傳輸及 http、ws、grpc、httpupgrade、quic，各自驗證 TCP 與 UDP；其中 HTTPUpgrade 已因追加測試失敗而拒絕，現行保留 5 組。 |
+| VMess，6 組 | 預設傳輸及相同五種 transport，使用 security:auto，各自驗證 TCP 與 UDP；HTTPUpgrade 已拒絕，現行保留 5 組。 |
+| VLESS，6 組 | 預設傳輸及相同五種 transport，各自驗證 TCP 與 UDP；HTTPUpgrade 已拒絕，現行保留 5 組。沒有測試額外 flow 或 Reality 組合。 |
 | 代理圖，4 組 | selector 分別預設選中 Trojan／Hysteria2；urltest 兩個候選的健康請求實際到達目的地；Trojan 經 Hysteria2 detour。 |
 
 每組先編譯正式 policy／effective 配置，再把 TUN 改成 loopback 入口、移除 fixture 不適用的 eth0 綁定，並將 DNS 邊界替換成本機測試地址。只有代理 server 可以把 `127.0.0.2` 的測試目的地轉到真正的 listener；server 的出口綁定 `127.0.0.3`。TCP／UDP 回應須帶有這個來源地址，原始目的地上的 canary 不能收到直連；TCP canary 即使只收到連線而沒有完整請求也會失敗。這個地址證明本機代理路徑，並非公網出口 IP。
 
 DNS 使用解析器選出的 UDP 或 HTTPS，檢查首次查詢、UDP／TCP 查詢共用快取及 TTL 到期後再次請求上游。HTTPS 以臨時可信憑證驗證名稱，沒有停用 TLS 驗證。停止 proxy server 後，既有 TCP、新 TCP、UDP 都必須失敗；再重新啟動 client 清除快取，未快取的 DNS 查詢也不得抵達上游。代理圖另核對預期入口的認證後轉發記錄；僅有 listener 啟動記錄不能通過。
 
-這些 fixture 不修改主機防火牆、全局路由或 resolver，也沒有測試 cgroup 匹配、TUN 隔離、容器故障政策、實體介面封包或實際 WAN 出口。JSON 結果中的 `configured_outer_endpoints` 是編譯結果，不是抓包觀測。47 組逐案例的原生主機矩陣仍待 CI 結果，不能以本頁 loopback 數字宣稱主機層全部通過；主機層驗收必須另外依 [實機驗收清單](host-validation.md) 執行。
+這些 loopback fixture 不修改主機防火牆、全局路由或 resolver，也沒有測試 cgroup 匹配、TUN 隔離、容器故障政策、實體介面封包或實際 WAN 出口。JSON 結果中的 `configured_outer_endpoints` 是編譯結果，不是抓包觀測。最初的 47 組原生主機矩陣也出現下述 HTTPUpgrade 失敗，不能以本頁歷史 loopback 數字宣稱主機層全部通過；現行 44 組的主機層驗收須另外依 [實機驗收清單](host-validation.md) 執行並查閱對應結果。
+
+### HTTPUpgrade 的追加驗收失敗與靜態拒絕
+
+2026-10-19 以相同固定 sing-box 1.14.2 client／server 進行純 loopback 對照，各案例建立 100 次連線、併發數為 4。保留協議原本的 TLS 設定，只比較省略 transport 的原生 TCP 與 HTTPUpgrade 封裝，結果如下：
+
+| 協議 | 原生 TCP 對照 | HTTPUpgrade | 失敗時的 server 訊息分類 |
+| --- | --- | --- | --- |
+| Trojan | 100／100 通過 | 82／100 通過，18 次失敗 | bad request／fallback disabled，共 18 次。 |
+| VMess | 100／100 通過 | 98／100 通過，2 次失敗 | bad request，共 2 次。 |
+| VLESS | 100／100 通過 | 98／100 通過，2 次失敗 | unknown protobuf header 174，共 2 次。 |
+
+三個 HTTPUpgrade 案例的失敗均在 workload 端表現為 TLS EOF。原生 TCP 對照合計 300／300 通過；固定核心配對的 HTTPUpgrade 合計 278／300 通過，未達本專案可靠驗收要求。初輪 [原生 CI run 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481) 的 Trojan／VLESS HTTPUpgrade 在准入或出口 IP 階段失敗；VMess HTTPUpgrade 則完成核心故障後因缺少起始 capture canary 失敗。後者的核心可靠性反例來自上述追加重測，不將擷取失敗錯當成協議錯誤。這些結果只證明本次固定核心配對尚不能可靠接納此封裝；沒有據此判定所有遠端 HTTPUpgrade 實作不可用，也沒有將失敗歸因為 outbound client 本身的漏洞。
+
+因此 `transport.type:"httpupgrade"` 現在由共用解析器以固定、明確原因拒絕；無論它是直接出口、群組候選或 detour 的內層／承載節點，policy 與 effective 模式都不輸出部分結果。`trojan-httpupgrade`、`vmess-httpupgrade`、`vless-httpupgrade` 從預設與可選案例移除，`--list` 只在 `blocked` 中保留原因，`experimental_cases` 維持空陣列。沒有建立替代 upstream helper、升級核心或改寫使用者 TLS。Trojan、VMess、VLESS 基礎協議仍保留；可按服務端能力選擇原生 TCP（省略 transport）、WebSocket、HTTP、gRPC 或 QUIC，並執行正常配置與運行時驗收。
 
 ### 跳埠的實際觀測及邊界
 
@@ -226,6 +242,6 @@ PROTOCOL_PYTHON=/tmp/protocol-fixture-venv/bin/python
 
 `--artifacts` 目錄須尚不存在，程式會以私有權限建立並保留假配置與詳細 log；省略時在結束後刪除暫存資料。輸出只包含固定階段原因及經整理的結果，不回顯原始配置或核心錯誤。
 
-不指定 `--case` 會執行全部 **47 組**；使用 `--case` 可指定一組或重複指定多組。`--check-only` 只回報 `CONFIG_PASS`，不啟動代理核心進行轉發，不能計作 runtime 通過；SSH 只能檢查核心 client 配置，其 Python server 不屬於 `worker check`。這些命令不建立受管會話。
+不指定 `--case` 會執行現行全部 **44 組**；使用 `--case` 可指定一組或重複指定多組。三個已拒絕的 HTTPUpgrade 案例不能用 `--case` 重新啟用；`--list` 會在 `blocked` 中列出原因。`--check-only` 只回報 `CONFIG_PASS`，不啟動代理核心進行轉發，不能計作 runtime 通過；SSH 只能檢查核心 client 配置，其 Python server 不屬於 `worker check`。這些命令不建立受管會話。
 
 任何新增「已實測支援」宣稱都應列出協議、transport、認證方式、實際 TCP／UDP、DNS、代理出口 IP，以及停止／中斷代理後無直連的證據，並註明是在 loopback 還是受管主機上執行；有 port hopping、selector 或 detour 時，完整主機驗收還需要實體介面端點觀測。既有結果只涵蓋當次列出的案例，不能外推到未測的協議或選項。

@@ -289,6 +289,8 @@ class ProtocolCaseChecks(unittest.TestCase):
             "positive_control_packets": 2, "direct_workload_packets": 0,
             "outer_packets": 12, "redirected_dns_packets": 8,
             "plaintext_dns_on_outer": False,
+            "plaintext_udp_on_outer": False, "unexpected_outer_packets": 0,
+            "payload_marker_policy": "absent",
             "outer_endpoints": [{"address": "192.0.2.1", "protocol": "tcp",
                                  "port_ranges": [[443, 443]], "packets": 12}],
         }
@@ -341,10 +343,11 @@ class ProtocolCaseChecks(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/host-acceptance.yml").read_text()
         block = workflow.split("  protocol-case:", 1)[1].split("    steps:", 1)[0]
         cases = re.findall(r"^          - ([a-z0-9-]+)$", block, re.MULTILINE)
-        self.assertEqual(len(cases), 47)
+        self.assertEqual(len(cases), 44)
         self.assertEqual(len(set(cases)), len(cases))
         self.assertEqual(set(cases), expected)
-        for case in ("ssh", "shadowtls1", "shadowtls2", "shadowtls3", "hysteria-port-hopping", "unknown", "../ssh"):
+        for case in ("ssh", "shadowtls1", "shadowtls2", "shadowtls3", "hysteria-port-hopping", "unknown", "../ssh",
+                     "trojan-httpupgrade", "vmess-httpupgrade", "vless-httpupgrade"):
             with self.subTest(case=case):
                 result = shell(HOST, 'CI_ROOT=$1; ci_validate_protocol_case "$2"', ROOT, case)
                 self.assertEqual(result.returncode == 0, case in expected, result.stderr)
@@ -562,6 +565,211 @@ class ProtocolCaseChecks(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads((root / "manifest.json").read_text())["status"], "failed")
+
+    def test_cleartext_proxy_markers_need_exact_recipe_and_zero_escape_evidence(self):
+        for mutation in ("none", "wrong_recipe_policy", "unexpected_outer", "direct_packet",
+                         "untyped_dns", "untyped_udp"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rows = self.completed_evidence(root, "vless")
+                capture = next(row['detail'] for row in rows if row['name'] == 'packet_capture_evidence')
+                capture.update(payload_marker_policy='encapsulated', plaintext_dns_on_outer=True,
+                               plaintext_udp_on_outer=True)
+                if mutation == 'wrong_recipe_policy': capture['payload_marker_policy'] = 'absent'
+                elif mutation == 'unexpected_outer': capture['unexpected_outer_packets'] = 1
+                elif mutation == 'direct_packet': capture['direct_workload_packets'] = 1
+                elif mutation == 'untyped_dns': capture['plaintext_dns_on_outer'] = 'true'
+                elif mutation == 'untyped_udp': capture['plaintext_udp_on_outer'] = 0
+                (root / 'core/results.json').write_text(json.dumps(rows))
+                result = shell(HOST, 'ci_validate_results "$1" protocol-case vless', root)
+                self.assertEqual(result.returncode == 0, mutation == 'none', result.stderr)
+
+    def test_encrypted_recipe_cannot_opt_into_visible_payloads(self):
+        for mutation in ('visible_dns', 'visible_udp', 'weakened_policy'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rows = self.completed_evidence(root, 'ssh')
+                capture = next(row['detail'] for row in rows if row['name'] == 'packet_capture_evidence')
+                if mutation == 'visible_dns': capture['plaintext_dns_on_outer'] = True
+                elif mutation == 'visible_udp': capture['plaintext_udp_on_outer'] = True
+                else: capture['payload_marker_policy'] = 'encapsulated'
+                (root / 'core/results.json').write_text(json.dumps(rows))
+                result = shell(HOST, 'ci_validate_results "$1" protocol-case ssh', root)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+
+    def test_marker_expectation_is_passed_to_each_native_recipe(self):
+        for case in ('vless', 'vless-http', 'vless-ws', 'vless-grpc',
+                     'socks5-uot', 'vless-quic', 'vmess', 'trojan', 'https', 'http'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                result = shell(
+                    HOST, 'CI_ROOT=$1; CI_EVIDENCE=$1; CI_ACCOUNT=ci-test; CI_PROTOCOL_CASE=$2; '
+                          'ci_stage() { printf "%s\\n" "$*" >>"$CI_EVIDENCE/stage-calls"; }; '
+                          'cmp() { :; }; ci_protocol_suites', td, case)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                core = next(line for line in (Path(td) / 'stage-calls').read_text().splitlines()
+                            if line.startswith('core '))
+                expected = 'encapsulated' if case in (
+                    'socks5-uot', 'vless', 'vless-http', 'vless-ws', 'vless-grpc') else 'absent'
+                self.assertIn('--payload-marker-policy ' + expected, core)
+
+    @staticmethod
+    def anytls_recovery_row(first_passed=False):
+        return {"name": "anytls_cancelled_dial_recovery", "passed": True, "detail": {
+            "format": 1,
+            "first_new_connection": {"status": "passed" if first_passed else "known_watchdog_failure",
+                                     "seconds": 0.05 if first_passed else 3.0,
+                                     "error_type": None if first_passed else "SSLEOFError"},
+            "second_new_connection": ({"status": "not_needed"} if first_passed else
+                                      {"status": "passed", "seconds": 0.05}),
+            "new_connection_attempts": 1 if first_passed else 2,
+            "existing_tls_socket_preserved": True, "policy_and_binding_unchanged": True,
+            "no_core_restart_or_pool_reset": True, "recovered": True,
+        }}
+
+    def test_anytls_requires_core18_and_records_only_the_declared_recovery_outcomes(self):
+        outcomes = ((True, 0.05, None), (False, 2.5, "SSLEOFError"),
+                    (False, 3.0, "ConnectionResetError"), (False, 4.0, "EOFError"))
+        for first_passed, seconds, error_type in outcomes:
+            with self.subTest(first_passed=first_passed, seconds=seconds, error_type=error_type), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rows = self.completed_evidence(root, 'anytls')
+                result = shell(HOST, 'ci_result_report "$1" protocol-case anytls', root)
+                self.assertNotEqual(result.returncode, 0, 'Old core17 evidence must not prove AnyTLS recovery')
+                row = self.anytls_recovery_row(first_passed)
+                row['detail']['first_new_connection'].update(seconds=seconds, error_type=error_type)
+                rows.insert(7, row)
+                (root / 'core/results.json').write_text(json.dumps(rows))
+                stages_path = root / 'stages.jsonl'
+                stages = stages_path.read_text().splitlines()
+                # The live results command runs before its own stage is
+                # recorded; the final manifest runs after fixture cleanup.
+                for finished in (len(stages) - 2, len(stages) - 1, len(stages)):
+                    stages_path.write_text('\n'.join(stages[:finished]) + '\n')
+                    result = shell(HOST, 'ci_result_report "$1" protocol-case anytls', root)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    report = json.loads(result.stdout)
+                    self.assertIs(report['proofs']['core18'], True)
+                    self.assertNotIn('core17', report['proofs'])
+                    self.assertIs(report['proofs']['anytls_cancelled_dial_recovery'], True)
+                    self.assertIs(report['proofs']['anytls_stage_order'], True)
+                result = shell(HOST, 'ci_write_manifest "$1" 0 anytls gateway-kill 0 "$2" protocol-case anytls', root, 'a' * 40)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                manifest = json.loads((root / 'manifest.json').read_text())
+                self.assertEqual(manifest['status'], 'passed')
+                self.assertEqual(manifest['suites']['core']['total'], 18)
+                self.assertEqual(manifest['suites']['lifecycle']['status'], 'not_requested')
+
+    def test_anytls_recovery_rejects_unbounded_untyped_or_incomplete_evidence(self):
+        mutations = [
+            ('format', True), ('format', 1.0), ('new_connection_attempts', 0),
+            ('new_connection_attempts', 3), ('new_connection_attempts', True),
+            ('new_connection_attempts', 2.0), ('new_connection_attempts', '2'),
+            ('first_new_connection.seconds', 2.499), ('first_new_connection.seconds', 4.001),
+            ('first_new_connection.seconds', float('nan')), ('first_new_connection.seconds', float('inf')),
+            ('first_new_connection.seconds', True), ('first_new_connection.seconds', '3.0'),
+            ('first_new_connection.seconds', 10 ** 1000),
+            ('first_new_connection.error_type', 'TimeoutError'), ('first_new_connection.error_type', None),
+            ('first_new_connection.status', 'failed'), ('first_new_connection.status', 'passed'),
+            ('second_new_connection.status', 'failed'), ('second_new_connection.status', 'not_needed'),
+            ('second_new_connection.seconds', -0.01), ('second_new_connection.seconds', 8),
+            ('second_new_connection.seconds', float('nan')), ('second_new_connection.seconds', float('inf')),
+            ('second_new_connection.seconds', True), ('second_new_connection.seconds', '0.05'),
+            ('existing_tls_socket_preserved', False), ('policy_and_binding_unchanged', False),
+            ('no_core_restart_or_pool_reset', False), ('recovered', False),
+            ('extra_retry_allowed', True), ('first_new_connection.extra', True),
+            ('second_new_connection.extra', True), ('missing_first_error', None), ('missing_flag', None),
+        ]
+        for key, value in mutations:
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rows = self.completed_evidence(root, 'anytls')
+                row = self.anytls_recovery_row()
+                details = row['detail']
+                if key == 'missing_first_error': details['first_new_connection'].pop('error_type')
+                elif key == 'missing_flag': details.pop('no_core_restart_or_pool_reset')
+                elif '.' in key:
+                    parent, field = key.split('.')
+                    details[parent][field] = value
+                else: details[key] = value
+                rows.insert(7, row)
+                (root / 'core/results.json').write_text(json.dumps(rows))
+                result = shell(HOST, 'ci_result_report "$1" protocol-case anytls', root)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                result = shell(HOST, 'ci_write_manifest "$1" 0 anytls gateway-kill 0 "$2" protocol-case anytls', root, 'a' * 40)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads((root / 'manifest.json').read_text())['status'], 'failed')
+
+        for mutation in ('retry_after_success', 'error_after_success', 'second_has_timing', 'first_over_budget'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rows = self.completed_evidence(root, 'anytls')
+                row = self.anytls_recovery_row(True)
+                details = row['detail']
+                if mutation == 'retry_after_success': details['new_connection_attempts'] = 2
+                elif mutation == 'error_after_success': details['first_new_connection']['error_type'] = 'SSLEOFError'
+                elif mutation == 'second_has_timing': details['second_new_connection']['seconds'] = 0
+                else: details['first_new_connection']['seconds'] = 8
+                rows.insert(7, row)
+                (root / 'core/results.json').write_text(json.dumps(rows))
+                self.assertNotEqual(shell(HOST, 'ci_validate_results "$1" protocol-case anytls', root).returncode, 0)
+
+    def test_anytls_recovery_cannot_move_after_faults_or_to_a_retry_stage(self):
+        for mutation in ('missing_row', 'duplicate_row', 'before_private_denials', 'after_node_fault',
+                         'failed_row', 'core_before_exit_ip', 'verify_before_core', 'extra_retry_stage'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rows = self.completed_evidence(root, 'anytls')
+                row = self.anytls_recovery_row()
+                rows.insert(7, row)
+                if mutation == 'missing_row': rows.pop(7)
+                elif mutation == 'duplicate_row': rows.insert(8, row)
+                elif mutation == 'before_private_denials': rows[6], rows[7] = rows[7], rows[6]
+                elif mutation == 'after_node_fault': rows[7], rows[8] = rows[8], rows[7]
+                elif mutation == 'failed_row': row['passed'] = False
+                (root / 'core/results.json').write_text(json.dumps(rows))
+                path = root / 'stages.jsonl'
+                stages = [json.loads(line) for line in path.read_text().splitlines()]
+                if mutation in ('core_before_exit_ip', 'verify_before_core'):
+                    left, right = ('exit_ip', 'core') if mutation == 'core_before_exit_ip' else ('core', 'fixture_verify')
+                    a, b = (next(index for index, stage in enumerate(stages) if stage['name'] == name) for name in (left, right))
+                    stages[a], stages[b] = stages[b], stages[a]
+                elif mutation == 'extra_retry_stage':
+                    stages.insert(9, {'name': 'anytls_retry', 'exit_code': 0})
+                path.write_text(''.join(json.dumps(stage) + '\n' for stage in stages))
+                self.assertNotEqual(shell(HOST, 'ci_validate_results "$1" protocol-case anytls', root).returncode, 0)
+
+    def test_other_protocols_keep_core17_without_anytls_recovery_exceptions(self):
+        for case in ('http', 'ssh', 'trojan'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rows = self.completed_evidence(root, case)
+                result = shell(HOST, 'ci_result_report "$1" protocol-case "$2"', root, case)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertIs(report['proofs']['core17'], True)
+                self.assertNotIn('anytls_cancelled_dial_recovery', report['proofs'])
+                rows.insert(7, self.anytls_recovery_row())
+                (root / 'core/results.json').write_text(json.dumps(rows))
+                self.assertNotEqual(shell(HOST, 'ci_validate_results "$1" protocol-case "$2"', root, case).returncode, 0)
+
+    def test_only_anytls_receives_the_explicit_reuse_check_flag(self):
+        workflow = (ROOT / '.github/workflows/host-acceptance.yml').read_text()
+        block = workflow.split('  protocol-case:', 1)[1].split('    steps:', 1)[0]
+        cases = re.findall(r'^          - ([a-z0-9-]+)$', block, re.MULTILINE)
+        self.assertIn('anytls', cases)
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                result = shell(
+                    HOST, 'CI_ROOT=$1; CI_EVIDENCE=$1; CI_ACCOUNT=ci-test; CI_PROTOCOL_CASE=$2; '
+                          'ci_stage() { printf "%s\\n" "$*" >>"$CI_EVIDENCE/calls"; }; '
+                          'cmp() { :; }; ci_protocol_suites', td, case)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = (Path(td) / 'calls').read_text().splitlines()
+                flagged = [line for line in calls if '--anytls-reuse-check' in line.split()]
+                self.assertEqual(len(flagged), 1 if case == 'anytls' else 0)
+                if flagged:
+                    self.assertTrue(flagged[0].startswith('core '))
+                    self.assertEqual(flagged[0].split().count('--anytls-reuse-check'), 1)
 
     @staticmethod
     def add_hopping_window(root, case):
