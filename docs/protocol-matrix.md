@@ -1,6 +1,6 @@
 # 固定核心的代理協議與網絡政策
 
-本頁記錄 `gateway-policy.jq` 已實作的**靜態配置適配範圍**。解析成功表示可以從設定推導受控外層端點，還必須通過同一映像的 `worker check`、主機／容器政策核對及運行時探測，才會建立可用會話。假認證範例、單元測試與核心配置檢查均不能代替遠端伺服器的實際轉發及故障阻斷驗收。
+本頁記錄 `gateway-policy.jq` 已實作的**靜態配置適配範圍**，並在末節列出已執行的核心配置檢查與真實協議 loopback 測試。解析成功表示可以從設定推導受控外層端點，還必須通過同一映像的 `worker check`、主機／容器政策核對及運行時探測，才會建立可用會話。假認證範例、單元測試與核心配置檢查均不能代替實際轉發及故障阻斷驗收；loopback 結果也不代替使用者遠端節點和主機防火牆的驗收。
 
 ## 版本依據
 
@@ -158,8 +158,63 @@ jq -ceS --arg mode effective -f gateway-policy.jq network.json
 
 ## 範例與驗證層次
 
-[`examples/proxies/`](../examples/proxies/) 包含 24 份完整配置：Hysteria 1／2 與跳埠、TUIC、Shadowsocks 原生／UoT／multiplex、Trojan、VMess QUIC、VLESS WebSocket、AnyTLS、Snell 4／6、HTTP／HTTPS、SOCKS TCP／UoT、SSH、Naive TCP／QUIC、selector、urltest、detour 及 ShadowTLS detour。它們只使用文件保留地址、範例名稱與假認證；不代表可用節點。依服務端要求修改原始配置，再交給程式生成有效配置。
+[`examples/proxies/`](../examples/proxies/) 包含 24 份完整配置：Hysteria 1／2、Hysteria2 跳埠、TUIC、Shadowsocks 原生／UoT／multiplex、Trojan、VMess QUIC、VLESS WebSocket、AnyTLS、Snell 4／6、HTTP／HTTPS、SOCKS TCP／UoT、SSH、Naive TCP／QUIC、selector、urltest、detour 及 ShadowTLS detour。它們只使用文件保留地址、範例名稱與假認證；不代表可用節點。依服務端要求修改原始配置，再交給程式生成有效配置。Hysteria1 跳埠不在這 24 份範例內。
 
-靜態驗證由 [`tests/test_proxy_policy.py`](../tests/test_proxy_policy.py) 覆蓋：內層／外層分離、傳輸封裝、精確跳埠、圖引用、detour 通道相容、urltest 健康探測、DNS 自動選擇、未知出口通道拒絕、身份相關冪等性、多文件拒絕及錯誤不回顯憑證。24 份範例已通過兩種 jq 模式，也全部通過測試 VPS 的固定 `worker 1.14.2 check`。真實 DNS 及主機轉發結果分開記錄於 [2026-10-18 驗證紀錄](validation-20261018.md)，不以解析器或核心配置檢查替代完整轉發驗收。
+靜態驗證由 [`tests/test_proxy_policy.py`](../tests/test_proxy_policy.py) 覆蓋：內層／外層分離、傳輸封裝、精確跳埠、圖引用、detour 通道相容、urltest 健康探測、DNS 自動選擇、未知出口通道拒絕、身份相關冪等性、多文件拒絕及錯誤不回顯憑證。24／24 份範例已通過兩種 jq 模式，也全部通過測試 VPS 的固定 `worker 1.14.2 check`。各次命令、版本與主機層證據另見 [2026-10-18 起的驗證紀錄](validation-20261018.md)。
 
-任何新增「已實測支援」宣稱都應列出協議、transport、認證方式、實際 TCP／UDP、DNS、代理出口 IP，以及停止／中斷代理後無直連的證據；有 port hopping、selector 或 detour 時還需要實體介面端點觀測。歷史只驗證 Hysteria2 的結果不能外推到其他協議。
+### 已完成的 41 組真實協議 loopback 測試
+
+[`tests/protocol_runtime.py`](../tests/protocol_runtime.py) 的首批 40 組配置已在測試 VPS 上通過獨立固定核心檢查 **40／40**，也通過實際 client／server 轉發及故障測試 **40／40**。第 41 組 Hysteria2 跳埠隨後單獨執行，通過實際執行前的 client／server 核心配置檢查及全部轉發／故障斷言；合計 **41／41 組 runtime 通過**。每組的 client 與 server 都使用同一個 sing-box 1.14.2 執行檔，版本及提交必須與本頁固定值一致。這是本次已執行案例的數量，不是所有可能配置組合的數量。
+
+| 已通過的組別 | 案例與實際範圍 |
+| --- | --- |
+| Hysteria／TUIC，4 組 | Hysteria1 固定埠、Hysteria2 固定埠、TUIC 原生、TUIC udp_over_stream；均驗證 TCP 與 UDP。 |
+| Hysteria2 跳埠，1 組 | 八個宣告埠中實際觀察到兩個不同目的埠；同一 TCP stream 在切換後繼續轉發，並通過 UDP、DNS 與停止 server 的檢查。 |
+| Shadowsocks，3 組 | chacha20-ietf-poly1305 的原生 TCP／UDP、UoT，以及 smux；沒有把其他 cipher 或 multiplex 實作算入本次結果。 |
+| AnyTLS，1 組 | TCP 與核心自動提供的 UoT UDP。 |
+| HTTP／HTTPS CONNECT，2 組 | 認證 CONNECT、普通 UDP 拒絕、經代理且驗證憑證的 HTTPS DNS。 |
+| SOCKS，4 組 | SOCKS4、SOCKS4a、SOCKS5 的明確 TCP 模式，以及 SOCKS5 UoT；TCP 模式均檢查普通 UDP 拒絕。 |
+| Naive，3 組 | TCP 外層、QUIC 外層、TCP 外層加 UoT；前兩者的普通 UDP 被拒絕，UoT 案例可轉發 UDP。 |
+| Snell，1 組 | Snell6 的 TCP 與 UDP；不涵蓋 Snell4。 |
+| Trojan，6 組 | 預設傳輸及 http、ws、grpc、httpupgrade、quic，各自驗證 TCP 與 UDP。 |
+| VMess，6 組 | 預設傳輸及相同五種 transport，使用 security:auto，各自驗證 TCP 與 UDP。 |
+| VLESS，6 組 | 預設傳輸及相同五種 transport，各自驗證 TCP 與 UDP；沒有測試額外 flow 或 Reality 組合。 |
+| 代理圖，4 組 | selector 分別預設選中 Trojan／Hysteria2；urltest 兩個候選的健康請求實際到達目的地；Trojan 經 Hysteria2 detour。 |
+
+每組先編譯正式 policy／effective 配置，再把 TUN 改成 loopback 入口、移除 fixture 不適用的 eth0 綁定，並將 DNS 邊界替換成本機測試地址。只有代理 server 可以把 `127.0.0.2` 的測試目的地轉到真正的 listener；server 的出口綁定 `127.0.0.3`。TCP／UDP 回應須帶有這個來源地址，原始目的地上的 canary 不能收到直連；TCP canary 即使只收到連線而沒有完整請求也會失敗。這個地址證明本機代理路徑，並非公網出口 IP。
+
+DNS 使用解析器選出的 UDP 或 HTTPS，檢查首次查詢、UDP／TCP 查詢共用快取及 TTL 到期後再次請求上游。HTTPS 以臨時可信憑證驗證名稱，沒有停用 TLS 驗證。停止 proxy server 後，既有 TCP、新 TCP、UDP 都必須失敗；再重新啟動 client 清除快取，未快取的 DNS 查詢也不得抵達上游。代理圖另核對預期入口的認證後轉發記錄；僅有 listener 啟動記錄不能通過。
+
+這些 fixture 不修改主機防火牆、全局路由或 resolver，也沒有測試 cgroup 匹配、TUN 隔離、容器故障政策、實體介面封包或實際 WAN 出口。JSON 結果中的 `configured_outer_endpoints` 是編譯結果，不是抓包觀測。主機層驗收必須另外依 [實機驗收清單](host-validation.md) 執行。
+
+### 跳埠的實際觀測及邊界
+
+第 41 個 `hysteria2-port-hopping` 案例已在固定核心上實際通過。八個明確 UDP 埠共用一個 QUIC backend，當次真正觀察到兩個不同目的埠，既有 TCP stream 在切換後仍可轉發，UDP、DNS 快取／TTL 及停止 server 後的阻斷也全部通過。`observed_hop_ports` 只列真正收到流量的埠；不能把完整配置列表當作八個埠都已輪轉。
+
+這組 loopback relay 結果仍不能代替實體介面上對允許區間、間隙、區間兩端及越界埠的主機防火牆驗證。Hysteria1 跳埠也必須另行驗收。
+
+### 已適配但仍未完成對應 runtime 的範圍
+
+| 範圍 | 已有證據 | 尚缺的證據 |
+| --- | --- | --- |
+| SSH | 靜態政策適配；公開 SSH 範例通過固定核心配置檢查。 | 固定核心沒有 SSH server inbound，尚未建立獨立 SSH 伺服器 fixture；TCP、HTTPS DNS 與故障阻斷未由該協議實測。 |
+| Snell4 | 靜態政策適配；公開 version:4 範例通過固定核心配置檢查。 | 核心提供 version:5／6 的 server inbound，本次尚未驗證可與 version:4 client 互通的服務端。這不宣稱 version:5 必定不相容；Snell6 通過也不能代替 Snell4。 |
+| ShadowTLS 1／2／3 detour | 靜態包裝／引用圖適配；公開的 version:3 detour 範例通過固定核心配置檢查。 | 尚缺 TLS cover server 加內層轉發協議的成對 fixture；各包裝版本、UDP 封裝及停止 server 後的行為均未實測。 |
+| Hysteria1 跳埠 | 靜態明確埠區間適配；固定埠的 Hysteria1 已完成上述 runtime。 | 本次沒有 Hysteria1 跳埠範例的獨立核心檢查或實際輪轉結果，不能沿用 Hysteria2 的證據。 |
+
+核心邊界依據固定版本的 [註冊表](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/include/registry.go)、[Snell outbound](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/protocol/snell/outbound.go)、[Snell inbound](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/protocol/snell/inbound.go)、[ShadowTLS inbound](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/protocol/shadowtls/inbound.go) 及固定 sing-quic 的 [hopping 實作](https://github.com/SagerNet/sing-quic/blob/6a3a24d65b99/hysteria/hop.go)。未列為已測的 cipher、認證模式、TLS／uTLS／Reality 設定、flow、混淆、UoT 版本或其他 multiplex 組合，仍只能按靜態適配及實際配置檢查的證據描述。
+
+### 重跑命令
+
+需要 Python 3、jq、openssl，以及可執行的固定核心。`--artifacts` 目錄須尚不存在，程式會以私有權限建立並保留假配置與詳細 log；省略時在結束後刪除暫存資料。輸出只包含固定階段原因及經整理的結果，不回顯原始配置或核心錯誤。
+
+```sh
+python3 tests/protocol_runtime.py --list
+python3 tests/protocol_runtime.py --engine /absolute/path/to/pinned-worker --check-only --artifacts /tmp/protocol-config-check
+python3 tests/protocol_runtime.py --engine /absolute/path/to/pinned-worker --artifacts /tmp/protocol-runtime-check
+python3 tests/protocol_runtime.py --engine /absolute/path/to/pinned-worker --case hysteria2-port-hopping --artifacts /tmp/protocol-hopping-check
+```
+
+目前不指定 `--case` 會執行全部 41 組，包含跳埠案例；使用 `--case` 可指定一組或重複指定多組。`--check-only` 只回報 `CONFIG_PASS`，不啟動代理核心進行轉發，不能計作 runtime 通過。這些命令不建立受管會話。
+
+任何新增「已實測支援」宣稱都應列出協議、transport、認證方式、實際 TCP／UDP、DNS、代理出口 IP，以及停止／中斷代理後無直連的證據，並註明是在 loopback 還是受管主機上執行；有 port hopping、selector 或 detour 時，完整主機驗收還需要實體介面端點觀測。既有結果只涵蓋當次列出的案例，不能外推到未測的協議或選項。

@@ -640,9 +640,42 @@ result={'response':data[:100].decode('ascii','replace')}
         return command('nsenter','--net='+str(namespace),'--',*args)
 
     def tun_link_fault(self):
-        return self.fault('gateway-tun-down',
-            lambda:self.gateway_command('ip','link','set','dev','tun0','down'),
-            lambda:self.gateway_command('ip','link','set','dev','tun0','up'))
+        prefixes=('0.0.0.0/1','128.0.0.0/1')
+        def read_routes():
+            rows=json.loads(self.gateway_command('ip','-j','-4','route','show','table','main').stdout)
+            assert isinstance(rows,list) and all(isinstance(row,dict) and isinstance(row.get('dst'),str)
+                                                for row in rows),'unexpected gateway route JSON'
+            return rows
+        def canonical(rows):return sorted(json.dumps(row,sort_keys=True) for row in rows)
+        def unrelated(rows):return canonical([row for row in rows if row['dst'] not in prefixes])
+        before=read_routes();saved={}
+        for prefix in prefixes:
+            rows=[row for row in before if row['dst']==prefix]
+            # These are the exact host iproute2 rows created by the gateway.
+            # Refuse other attributes before injecting a fault we cannot undo.
+            assert rows==[{'dst':prefix,'dev':'tun0','scope':'link','flags':[]}],\
+                'TUN fault requires exactly reproducible preexisting half routes'
+            saved[prefix]=rows[0]
+        restored=[]
+        def restore():
+            self.gateway_command('ip','link','set','dev','tun0','up')
+            current=read_routes();missing=[]
+            assert unrelated(current)==unrelated(before),'unrelated gateway routes changed during TUN fault'
+            # Link down removes the /1 routes on Linux; link up retains the
+            # connected subnet but does not recreate these explicit routes.
+            # Preflight BOTH destinations before adding any missing entry.
+            for prefix in prefixes:
+                rows=[row for row in current if row['dst']==prefix]
+                assert not rows or rows==[saved[prefix]],'gateway half route changed during TUN fault'
+                if not rows:missing.append(saved[prefix])
+            for row in missing:
+                self.gateway_command('ip','-4','route','add',row['dst'],'dev',row['dev'],
+                                     'scope',row['scope'],'table','main')
+                restored.append(row['dst'])
+            assert canonical(read_routes())==canonical(before),'gateway routes were not restored exactly'
+        result=self.fault('gateway-tun-down',
+            lambda:self.gateway_command('ip','link','set','dev','tun0','down'),restore)
+        return dict(result,missing_half_routes_restored=len(restored),gateway_route_snapshot_restored=True)
 
     def node_outage(self):
         addresses=sorted({endpoint['address'] for endpoint in self.binding.policy['outer_endpoints']},
@@ -1005,17 +1038,93 @@ class FaultTests(unittest.TestCase):
                          ['198.51.100.9/32','192.0.2.8/32'])
         suite.gateway_ready.assert_not_called()
 
-    def test_tun_is_restored_even_if_fault_observation_raises(self):
+    def tun_boundary(self,suite,after_up=None,retain_first=False,discard_add=False):
+        halves=[{'dst':prefix,'dev':'tun0','scope':'link','flags':[]}
+                for prefix in ('0.0.0.0/1','128.0.0.0/1')]
+        before=[{'dst':'default','gateway':'172.19.0.1','dev':'eth0','flags':[]},
+                {'dst':'172.19.0.0/16','dev':'eth0','protocol':'kernel','scope':'link','prefsrc':'172.19.0.2','flags':[]},
+                {'dst':'192.0.2.8','gateway':'172.19.0.1','dev':'eth0','flags':[]},
+                {'dst':'198.18.0.0/15','dev':'tun0','protocol':'kernel','scope':'link','prefsrc':'198.18.0.1','flags':[]}]+halves
+        state={'routes':json.loads(json.dumps(before)),'up':True}
+        def boundary(*args):
+            if args==('ip','-j','-4','route','show','table','main'):
+                return subprocess.CompletedProcess(args,0,json.dumps(state['routes']),'')
+            if args==('ip','link','set','dev','tun0','down'):
+                state['up']=False
+                state['routes']=[row for row in state['routes'] if row['dst'] not in ('0.0.0.0/1','128.0.0.0/1')]
+            elif args==('ip','link','set','dev','tun0','up'):
+                state['up']=True
+                if retain_first:state['routes'].append(dict(halves[0]))
+                if after_up:after_up(state['routes'])
+            elif args[:4]==('ip','-4','route','add'):
+                self.assertTrue(state['up'])
+                self.assertIn(args[4],('0.0.0.0/1','128.0.0.0/1'))
+                self.assertFalse(any(row['dst']==args[4] for row in state['routes']))
+                self.assertEqual(dict(zip(args[5::2],args[6::2])),{'dev':'tun0','scope':'link','table':'main'})
+                if not discard_add:state['routes'].append(next(dict(row) for row in halves if row['dst']==args[4]))
+            else:raise AssertionError('unexpected route fault command')
+            return subprocess.CompletedProcess(args,0,'','')
+        suite.gateway_command.side_effect=boundary
+        def ready():
+            self.assertTrue(state['up'])
+            self.assertCountEqual(state['routes'],before)
+        suite.gateway_ready.side_effect=ready
+        return state,before
+
+    def test_tun_restores_lost_half_routes_even_if_fault_observation_raises(self):
         for fail in (False,True):
-            with self.subTest(fail=fail):
-                suite=self.suite()
-                if fail:suite.existing_https.side_effect=RuntimeError('observation failed')
-                if fail:
-                    with self.assertRaisesRegex(RuntimeError,'observation failed'):suite.tun_link_fault()
-                else:suite.tun_link_fault()
-                self.assertEqual([call.args for call in suite.gateway_command.call_args_list],
-                    [('ip','link','set','dev','tun0','down'),('ip','link','set','dev','tun0','up')])
-                suite.gateway_ready.assert_called_once();suite.assert_rules.assert_called_once()
+            for retain_first in (False,True):
+                with self.subTest(fail=fail,retain_first=retain_first):
+                    suite=self.suite();state,before=self.tun_boundary(suite,retain_first=retain_first)
+                    if fail:suite.existing_https.side_effect=RuntimeError('observation failed')
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError,'observation failed'):suite.tun_link_fault()
+                    else:suite.tun_link_fault()
+                    self.assertCountEqual(state['routes'],before)
+                    calls=[call.args for call in suite.gateway_command.call_args_list]
+                    self.assertEqual(calls[0],('ip','-j','-4','route','show','table','main'))
+                    self.assertEqual([args[4] for args in calls if args[:4]==('ip','-4','route','add')],
+                                     ['128.0.0.0/1'] if retain_first else ['0.0.0.0/1','128.0.0.0/1'])
+                    suite.gateway_ready.assert_called_once();suite.assert_rules.assert_called_once()
+
+    def test_tun_refuses_changed_or_duplicate_halves_before_adding_any_routes(self):
+        alterations=[
+            [{'dst':'128.0.0.0/1','dev':'eth0','scope':'link','flags':[]}],
+            [{'dst':'128.0.0.0/1','dev':'tun0','scope':'link','metric':9,'flags':[]}],
+            [{'dst':'128.0.0.0/1','dev':'tun0','scope':'link','flags':[]}]*2,
+            [{'dst':'203.0.113.0/24','dev':'eth0','scope':'link','flags':[]}]]
+        for rows in alterations:
+            with self.subTest(rows=rows):
+                suite=self.suite();state,before=self.tun_boundary(suite,after_up=lambda routes:routes.extend(rows))
+                with self.assertRaises(AssertionError):suite.tun_link_fault()
+                self.assertTrue(state['up'])
+                calls=[call.args for call in suite.gateway_command.call_args_list]
+                self.assertFalse(any(args[:4]==('ip','-4','route','add') for args in calls))
+                for row in rows:self.assertIn(row,state['routes'])
+                suite.gateway_ready.assert_not_called();suite.assert_rules.assert_not_called()
+
+    def test_tun_requires_reproducible_preexisting_routes_before_injection(self):
+        for alteration in ('missing','duplicate','metric'):
+            with self.subTest(alteration=alteration):
+                suite=self.suite();state,before=self.tun_boundary(suite)
+                if alteration=='missing':state['routes'].pop()
+                elif alteration=='duplicate':state['routes'].append(dict(state['routes'][-1]))
+                else:state['routes'][-1]['metric']=9
+                original=json.loads(json.dumps(state['routes']))
+                with self.assertRaises(AssertionError):suite.tun_link_fault()
+                self.assertEqual(state['routes'],original)
+                self.assertTrue(state['up'])
+                self.assertTrue(all(call.args==('ip','-j','-4','route','show','table','main')
+                                    for call in suite.gateway_command.call_args_list))
+                suite.https.assert_not_called();suite.gateway_ready.assert_not_called()
+
+    def test_tun_route_restoration_requires_exact_readback(self):
+        suite=self.suite();state,before=self.tun_boundary(suite,discard_add=True)
+        with self.assertRaises(AssertionError):suite.tun_link_fault()
+        calls=[call.args for call in suite.gateway_command.call_args_list]
+        self.assertEqual(len([args for args in calls if args[:4]==('ip','-4','route','add')]),2)
+        self.assertNotEqual(state['routes'],before)
+        suite.gateway_ready.assert_not_called();suite.assert_rules.assert_not_called()
 
     def test_gateway_command_mutates_only_the_bound_namespace(self):
         for inode in (555,999):

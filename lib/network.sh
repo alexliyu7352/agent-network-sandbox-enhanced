@@ -224,13 +224,15 @@ proxy_endpoint_rows() {
     ' <<<"$PROXY_POLICY_JSON" 2>/dev/null
 }
 
-gateway_open() {
-    local info net nid cid pid again netpath expected
-    info=$(timeout --signal=KILL 10s docker inspect "$GATEWAY") || return
+gateway_container_config_matches() {
     jq -e --arg config "$ROOT/network.json" 'length==1 and (.[0] | .State.Running==true and .State.Pid>0 and
       .HostConfig.Privileged==false and .HostConfig.NetworkMode!="host" and
       .HostConfig.ReadonlyRootfs==true and (.HostConfig.CapDrop==["ALL"]) and
-      (.HostConfig.CapAdd|sort)==["NET_ADMIN","NET_RAW"] and
+      # Docker versions expose capability names with or without CAP_.
+      # Normalize that prefix once, keeping exact cardinality and names.
+      (.HostConfig.CapAdd|type=="array" and
+        (map(if type=="string" then ltrimstr("CAP_") else error("invalid capability") end)|sort)
+          ==["NET_ADMIN","NET_RAW"]) and
       any(.HostConfig.SecurityOpt[]; .=="no-new-privileges:true" or .=="no-new-privileges") and
       ([.Mounts[]|select(.Destination=="/etc/worker/network.json")]|length==1 and
         .[0].Source==$config and .[0].RW==false and .[0].Type=="bind") and
@@ -238,7 +240,13 @@ gateway_open() {
       .HostConfig.Sysctls["net.ipv6.conf.all.disable_ipv6"]=="1" and
       .HostConfig.Sysctls["net.ipv6.conf.default.disable_ipv6"]=="1" and
       .HostConfig.Sysctls["net.ipv6.conf.lo.disable_ipv6"]=="1" and
-      (.NetworkSettings.Networks|length==1))' <<<"$info" >/dev/null || return
+      (.NetworkSettings.Networks|length==1))' >/dev/null
+}
+
+gateway_open() {
+    local info net nid cid pid again netpath expected
+    info=$(timeout --signal=KILL 10s docker inspect "$GATEWAY") || return
+    gateway_container_config_matches <<<"$info" || return
     cid=$(jq -r '.[0].Id' <<<"$info")
     pid=$(jq -r '.[0].State.Pid' <<<"$info")
     nid=$(jq -r '.[0].NetworkSettings.Networks[].NetworkID' <<<"$info")
