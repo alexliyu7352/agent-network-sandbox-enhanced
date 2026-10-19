@@ -2,8 +2,10 @@
 import json
 from pathlib import Path
 import socket
+import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -18,11 +20,14 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
                       "dns": 31005, "ingress_tcp": 31006, "ingress_udp": 31007,
                       "ingress_dns": 31008}
         self.ports.update({"hop" + str(index): 31100 + index for index in range(8)})
+        self.ports["cover"] = 31200
 
     def test_matrix_includes_protocol_transports_and_graphs(self):
         names = runtime.case_names()
         for kind in ("hysteria", "hysteria2", "tuic", "shadowsocks", "anytls", "http", "https",
-                     "socks5-tcp", "socks5-uot", "naive", "naive-quic", "snell6",
+                     "socks5-tcp", "socks5-uot", "naive", "naive-quic", "snell4", "snell6",
+                     "hysteria-port-hopping", "hysteria2-port-hopping",
+                     "ssh", "shadowtls1", "shadowtls2", "shadowtls3",
                      "selector-trojan", "selector-hysteria2", "urltest", "detour"):
             self.assertIn(kind, names)
         for kind in ("trojan", "vmess", "vless"):
@@ -34,12 +39,17 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
         for name in runtime.case_names():
             with self.subTest(case=name):
                 source, client, server, policy = runtime.build_configs(
-                    name, self.original, self.ports, "TEST CERTIFICATE", "/fake/cert", "/fake/key")
+                    name, self.original, self.ports, "TEST CERTIFICATE", "/fake/cert", "/fake/key",
+                    ssh_host_key="ssh-rsa TEST-EPHEMERAL-HOST-KEY")
                 self.assertNotIn("PRIVATE-SOURCE-MUST-NOT-BE-COPIED", json.dumps([source, client, server]))
-                self.assertEqual(server["route"]["rules"][-1], {"action": "reject"})
-                self.assertEqual(server["outbounds"][0]["inet4_bind_address"], runtime.PROXY_EXIT)
+                if name == "ssh":
+                    self.assertEqual(server["fixture"], "paramiko-3.5.1")
+                    self.assertEqual(server["allowed_ports"], [self.ports["tcp"], self.ports["dns"]])
+                else:
+                    self.assertEqual(server["route"]["rules"][-1], {"action": "reject"})
+                    self.assertEqual(server["outbounds"][0]["inet4_bind_address"], runtime.PROXY_EXIT)
+                    self.assertTrue(all(item["listen"] == "127.0.0.1" for item in server["inbounds"]))
                 self.assertTrue(all(item["listen"] == "127.0.0.1" for item in client["inbounds"]))
-                self.assertTrue(all(item["listen"] == "127.0.0.1" for item in server["inbounds"]))
                 self.assertTrue(all(item["address"] in {"127.0.0.1", "127.0.0.2"}
                                     for item in policy["outer_endpoints"]))
                 self.assertEqual(client["dns"]["servers"][0]["detour"], "proxy")
@@ -109,14 +119,18 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
                     self.assertEqual(reply, {"peer": runtime.LOOPBACK, "token": "relay-" + str(index)})
                 self.assertEqual(relay.observed_ports, sorted(relay.ports))
 
-    def test_experimental_recipes_do_not_expand_the_verified_default(self):
-        self.assertEqual(len(runtime.case_names()), 41)
+    def test_inventory_and_help_select_all_47_verified_recipes(self):
+        self.assertEqual(len(runtime.case_names()), 47)
         result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--list"],
                                 check=True, capture_output=True, text=True)
         inventory = json.loads(result.stdout)
-        self.assertEqual(inventory["experimental_cases"], ["snell4", "hysteria-port-hopping"])
+        self.assertEqual(inventory["experimental_cases"], [])
         self.assertEqual(inventory["cases"], runtime.case_names())
-        self.assertFalse(set(inventory["experimental_cases"]) & set(inventory["cases"]))
+        self.assertEqual(inventory["blocked"], {})
+        help_result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--help"],
+                                     check=True, capture_output=True, text=True)
+        self.assertIn("verified 47-case matrix", " ".join(help_result.stdout.split()))
+        self.assertNotIn("Experimental cases", help_result.stdout)
 
     def test_snell4_recipe_uses_the_real_server_version5_schema(self):
         _, client, server, policy = runtime.build_configs(
@@ -144,6 +158,59 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
         self.assertEqual(actual, {31100 + index for index in range(8)})
         self.assertEqual({entry["protocol"] for entry in policy["outer_endpoints"]}, {"udp"})
         self.assertNotIn(inbound["listen_port"], actual)
+
+    def test_shadowtls_uses_only_the_wrapper_endpoint_and_injects_inner_uot(self):
+        for version in (1, 2, 3):
+            _, client, server, policy = runtime.build_configs(
+                "shadowtls" + str(version), self.original, self.ports,
+                "TEST CERTIFICATE", "/fake/cert", "/fake/key")
+            self.assertEqual(client["outbounds"][0]["detour"], "cover")
+            self.assertTrue(client["outbounds"][0]["udp_over_tcp"])
+            self.assertEqual(client["outbounds"][1]["version"], version)
+            wrapper = next(item for item in server["inbounds"] if item["type"] == "shadowtls")
+            self.assertEqual(wrapper["detour"], "proxy-in")
+            self.assertEqual(wrapper["handshake"], {"server": runtime.LOOPBACK, "server_port": 31200})
+            self.assertEqual({item["protocol"] for item in policy["outer_endpoints"]}, {"tcp"})
+            self.assertEqual([item["port_start"] for item in policy["outer_endpoints"]], [31002])
+
+    def test_cover_sends_no_post_handshake_records_into_shadowtls2_payload(self):
+        # v2 stops using the TLS client after its handshake. Any cover session
+        # ticket that arrives afterwards is mistaken for inner proxy payload.
+        # Drive a real TLS1.3 handshake without TCP timing or a sing-box binary.
+        with tempfile.TemporaryDirectory(prefix="protocol-cover-test-") as directory:
+            certificate, key = runtime.create_certificate(Path(directory))
+            with runtime.TLSCoverServer(0, certificate, key) as cover:
+                client_context = ssl.create_default_context(cafile=str(certificate))
+                client_context.minimum_version = ssl.TLSVersion.TLSv1_3
+                client_in, client_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+                server_in, server_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+                client = client_context.wrap_bio(client_in, client_out,
+                                                 server_hostname=runtime.SERVER_NAME)
+                server = cover.context.wrap_bio(server_in, server_out, server_side=True)
+                with self.assertRaises(ssl.SSLWantReadError):
+                    client.do_handshake()
+                server_in.write(client_out.read())
+                with self.assertRaises(ssl.SSLWantReadError):
+                    server.do_handshake()
+                client_in.write(server_out.read())
+                client.do_handshake()
+                server_in.write(client_out.read())
+                server.do_handshake()
+                self.assertEqual(client.version(), "TLSv1.3")
+                self.assertEqual(server_out.pending, 0,
+                                 "cover records after handshake corrupt the ShadowTLS2 inner stream")
+
+    def test_ssh_pins_ephemeral_host_key_and_uses_tcp_only_dns_policy(self):
+        _, client, server, policy = runtime.build_configs(
+            "ssh", self.original, self.ports, "TEST CERTIFICATE", "/fake/cert", "/fake/key",
+            ssh_host_key="ssh-rsa TEST-EPHEMERAL-HOST-KEY")
+        self.assertEqual(client["outbounds"][0]["host_key"], ["ssh-rsa TEST-EPHEMERAL-HOST-KEY"])
+        self.assertEqual(client["outbounds"][0]["user"], runtime.USERNAME)
+        self.assertEqual(client["outbounds"][0]["password"], runtime.PASSWORD)
+        self.assertEqual(policy["payload_networks"], ["tcp"])
+        self.assertEqual(policy["dns_transport"], "https")
+        self.assertEqual(server["fixture"], "paramiko-3.5.1")
+        self.assertEqual(server["allowed_ports"], [31003, 31005])
 
 
 if __name__ == "__main__":

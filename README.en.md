@@ -8,7 +8,7 @@ This is an enhanced version of the original simple SOCKS edition. It **includes 
 
 The included `network.json` uses Hysteria2 as an example. This edition reads supported configurations for the pinned sing-box 1.14.2 core and derives the required outer TCP/UDP connections, port hopping, outbound candidates and detours. It configures the host and container routes, firewall and DNS automatically. Changing a supported protocol does not require editing two sets of rules; see the [protocol and feature matrix](docs/protocol-matrix.md) for the complete boundary.
 
-The program also selects a usable cgroup v1 or v2 mode automatically, **preferring v1**. Implemented support and real-host verification are recorded separately; previous v1 use does not establish acceptance of a pure v2 host.
+The program also selects a usable cgroup v1 or v2 mode automatically, **preferring v1**. Controlled host tests with Hysteria2 and HTTP CONNECT have passed on Ubuntu 20.04.6 hybrid/v1, Ubuntu 26.04.1 pure v2, and Debian 13.7 KVM pure v2. See the [verification records](docs/VERIFICATION.md) for each environment's tested failure scenarios and limits.
 
 The agent still runs on your computer and can use files, development tools, and local services that its account can normally access. It can also launch GUI applications. This project focuses on reducing the obvious proxy settings and TUN interface clues available to ordinary telemetry, making the network environment less likely to be mistakenly flagged as unusual. The maintainer has used this setup with Claude Code for several months, with stable everyday operation.
 
@@ -45,7 +45,7 @@ This project also uses TUN internally. The difference is that it places TUN insi
 
 ## What you need before starting
 
-- **A compatible Linux/systemd computer.** The program first tries writable cgroup v1 `net_cls` with a working kernel match, then systemd cgroup v2 with legacy `xt_cgroup --path`. Both IPv4 and IPv6 matches must work; startup is refused if neither mode qualifies. An Ubuntu 20.04/systemd 245 hybrid host is the verified baseline; complete real-host acceptance of pure v2 remains pending.
+- **A compatible Linux/systemd computer.** The program first tries writable cgroup v1 `net_cls` with a working kernel match, then systemd cgroup v2 with legacy `xt_cgroup --path`. Both IPv4 and IPv6 matches must work; startup is refused if neither mode qualifies. Tested environments include Ubuntu 20.04.6/systemd 245 hybrid, Ubuntu 26.04.1/systemd 259 pure v2, and Debian 13.7/systemd 257 pure v2. Other versions still require local capability checks and the corresponding acceptance tests.
 - **A standard Docker installation and Docker Compose.** Docker must be managed by the system administrator. Rootless Docker, or placing the gateway inside another ordinary container, is not a direct substitute.
 - **Legacy firewall tools.** The system needs `iptables-legacy`, `ip6tables-legacy`, and their corresponding restore commands. You do not need to switch the computer's default firewall tools to legacy.
 - **A proxy node usable with the pinned core.** Nodes currently need fixed IPv4 addresses, and the final proxy must guarantee TCP. Supported protocols, explicit port ranges and proxy chains are described below; domain/IPv6 nodes and dynamic discovery have not been adapted.
@@ -373,7 +373,7 @@ You can open multiple sessions at once, but they share one exit configuration. E
 
 | Situation | Recommended action |
 | --- | --- |
-| The system has only cgroup v2 | The program tries systemd v2 and both IPv4/IPv6 legacy path matches, refusing startup if requirements are missing. Complete pure-v2 acceptance remains pending CI/dedicated-host testing; do not blindly change boot settings. |
+| The system has only cgroup v2 | The program tries systemd v2 and both IPv4/IPv6 legacy path matches, refusing startup if requirements are missing. Ubuntu 26.04.1 and Debian 13.7 KVM passed the pure-v2 scope listed below; this does not remove local capability checks or justify blindly changing boot settings. |
 | Changing protocol, transport, port hopping or detours | Configure a supported combination from the [protocol matrix](docs/protocol-matrix.md); rules are derived automatically. Discovery beyond fixed IPv4 and unlisted capabilities are rejected. |
 | Changing any source configuration or the compiler after initialization | Source, effective and compiler hashes must match. Close every session and [rebind offline](docs/offline-upgrade.md). Password, TLS, logging and JSON-format-only changes also count. |
 | Container restart/recreation/rebuild or Docker network recreation | A changed container ID, network ID or network namespace requires offline rebinding, even if the container name stays the same. |
@@ -438,11 +438,21 @@ For repeat verification, use the [real-host acceptance checklist](docs/host-vali
 
 ### Existing verification records
 
-This work rechecked the Ubuntu 20.04 hybrid/v1 baseline, and every public proxy example passed configuration checking with the actual sing-box 1.14.2 core. Controlled Hysteria2/UDP DNS and HTTP CONNECT/verified HTTPS DNS fixtures passed shared caching across TCP/UDP queries, TTL expiry/refetch, and no direct fallback for ordinary UDP through HTTP. Disabling the cache and removing the HTTPS DNS detour failed their negative controls as expected. These results do not establish acceptance of every protocol, transport, a complete cgroup v2 host, or your actual remote node.
+As of **2026-10-19**, results are recorded by the layer actually exercised:
 
-Complete pure-v2 real-host/CI acceptance remains pending, as does complete testing with actual X11/Wayland windows. Earlier Hysteria2 networking, installation, permission and launcher results remain historical records. Consult the corresponding verification documents for each run's versions, commands, skip reasons and test counts.
+| Layer and environment | Verified scope |
+| --- | --- |
+| Configuration checks | All 24 public proxy examples passed the shared compiler and actual sing-box 1.14.2 core checks. Their fake endpoints are not usable nodes. |
+| Real protocol loopback | All 47 client/server cases passed TCP, UDP delivery or refusal according to capability, DNS caching/TTL, and blocking after server shutdown; these include Hysteria1/2 port hopping, Snell4, SSH, and ShadowTLS 1/2/3. This layer does not run host cgroup, TUN, or firewall acceptance. |
+| Ubuntu 20.04.6 hybrid/v1 | Hysteria2 and HTTP CONNECT each passed 17/17 core/failure checks and exit-IP comparison. Additional v1 results include lifecycle 10/10 with 100 short sessions, capabilities 13/13, and CLI 9/9. |
+| Ubuntu 26.04.1 native pure v2 | Hysteria2 and HTTP each ran healthy, gateway-stop, gateway-kill, gateway-recreate, and docker-restart: all 10 CI jobs passed, including real sessions, packet inspection, exit-IP comparison, and lifecycle checks. |
+| Debian 13.7 KVM pure v2 | Both Hysteria2 and HTTP healthy jobs passed: each includes core 16/16, lifecycle 10/10, 100 short sessions, and exit-IP comparison. Container/Docker namespace failure scenarios on Debian are outside these two jobs' scope. |
 
-To avoid publishing host information, raw logs, packet captures, and private deployment data are not included in the public edition. See the [verification records](docs/VERIFICATION.md) for the retained technical summary.
+The pure-v2 results come from [CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891) at `58dcfad596856fc3696d138f84d1c0f37e6e0ebd`: **12/12 jobs passed**. The v2 evidence also matches actual socket inodes created by sessions to their service cgroups. Container recreation changed both the container ID and namespace. The old binding and shared rules remained, while `check`, `init`, and new workload admission refused the changed identity. Offline rebinding is required; the program does not automatically adopt a new namespace.
+
+Controlled DNS tests cover shared caching across TCP/UDP queries, TTL expiry/refetch, and expected failures when disabling the cache or removing the HTTPS DNS detour. SSH uses the pinned core client and a separate Paramiko 3.5.1 server. ShadowTLS uses an inner Shadowsocks/UoT proxy and a private TLS cover that sends no session tickets; certificate verification remains enabled. These results apply to the concrete configurations in the [protocol matrix](docs/protocol-matrix.md). The complete host egress matrix for individual protocols and actual X11/Wayland window acceptance still await their respective results. Unlisted protocol options and host environments do not inherit the results above.
+
+Host fixtures use isolated proxies with fake authentication on the same machine. Exit-IP equality proves that managed requests match an independent observation from the designated fixture; it does not establish remote anonymity or the quality of your actual node. See the [verification records](docs/VERIFICATION.md) for versions, commands, CI artifacts, skip reasons, and historical results. Public summaries omit private nodes, credentials, actual exit IPs, and raw packet captures. These changes remain on a work branch and have not been merged into `main`; merging requires separate review and explicit approval.
 
 ## FAQ
 

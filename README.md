@@ -8,7 +8,7 @@
 
 隨附的 `network.json` 使用 Hysteria2 作為配置範例。本版會依固定 sing-box 1.14.2 核心的受支援配置，自動推導代理的外層 TCP／UDP、跳埠、候選出口及 detour，配套主機和容器的路由、防火牆與 DNS。更換受支援協議不需要手改兩套規則；完整邊界見 [協議與功能矩陣](docs/protocol-matrix.md)。
 
-本版也會自動選擇可用的 cgroup v1／v2，**優先 v1**。新模式的實作範圍與實機驗收狀態分開記錄，不把原有 v1 的使用經驗當成純 v2 已驗收。
+本版也會自動選擇可用的 cgroup v1／v2，**優先 v1**。Ubuntu 20.04.6 hybrid／v1、Ubuntu 26.04.1 純 v2，以及 Debian 13.7 KVM 純 v2 已有 Hysteria2 與 HTTP CONNECT 的受控實機結果；各系統實際涵蓋的故障與限制見 [驗證紀錄](docs/VERIFICATION.md)。
 
 Agent 仍然在你的電腦上運行，可以使用原本有權存取的檔案、開發工具和本機服務，也可以啟動 GUI 應用。這個專案的重點，是減少一般遙測容易看到的代理設定與 TUN 網卡線索，降低網絡環境被誤判為異常的機會。維護者已使用本方案運行 Claude Code 數月，日常運行穩定。
 
@@ -45,7 +45,7 @@ Agent 仍然在你的電腦上運行，可以使用原本有權存取的檔案�
 
 ## 使用前需要準備什麼
 
-- **符合條件的 Linux／systemd 電腦。** 自動優先選擇可寫入且通過核心匹配探測的 cgroup v1 `net_cls`；否則嘗試 systemd cgroup v2 與 legacy `xt_cgroup --path`。IPv4、IPv6 兩套匹配都要可用，兩種模式皆不符合就拒絕啟動。Ubuntu 20.04／systemd 245 的 hybrid 主機是已測基線；純 v2 的完整實機驗收仍待完成。
+- **符合條件的 Linux／systemd 電腦。** 自動優先選擇可寫入且通過核心匹配探測的 cgroup v1 `net_cls`；否則嘗試 systemd cgroup v2 與 legacy `xt_cgroup --path`。IPv4、IPv6 兩套匹配都要可用，兩種模式皆不符合就拒絕啟動。已測環境包括 Ubuntu 20.04.6／systemd 245 的 hybrid 主機，以及 Ubuntu 26.04.1／systemd 259、Debian 13.7／systemd 257 的純 v2 主機；其他版本仍須通過本機能力探測與相應驗收。
 - **一般的 Docker 安裝與 Docker Compose。** 需要由系統管理員管理的 Docker，不能直接換成 rootless Docker 或把網關放進另一層普通容器。
 - **legacy 版防火牆工具。** 系統需有 `iptables-legacy`、`ip6tables-legacy` 及對應的 restore 命令；不要求你把整台電腦的預設工具切換成 legacy。
 - **可供固定核心使用的代理節點。** 節點目前必須是固定 IPv4，最終代理至少保證 TCP。可用協議、明確跳埠區間及代理鏈見下方說明；網域／IPv6 節點與動態發現尚未適配。
@@ -373,7 +373,7 @@ HTTPS 檢查只在啟動時做一次，不是持續健康監控，也不會自�
 
 | 情況 | 建議怎麼處理 |
 | --- | --- |
-| 系統只有 cgroup v2 | 自動嘗試 systemd v2 與 IPv4／IPv6 legacy path 匹配；條件不足就拒絕。純 v2 完整驗收仍待 CI／專用主機完成，不建議為此盲目改開機設定。 |
+| 系統只有 cgroup v2 | 自動嘗試 systemd v2 與 IPv4／IPv6 legacy path 匹配；條件不足就拒絕。Ubuntu 26.04.1 與 Debian 13.7 KVM 已通過下列純 v2 測試範圍；不要因此跳過本機探測或盲目改開機設定。 |
 | 更換協議、transport、跳埠或 detour | 按 [協議矩陣](docs/protocol-matrix.md) 填寫配置，規則自動推導；固定 IPv4 以外的發現方式及未列入的能力明確拒絕。 |
 | 已初始化後修改任何原始設定或解析器 | 原始、有效設定及解析器的雜湊均須一致；先關閉全部會話，再 [離線重新綁定](docs/offline-upgrade.md)。僅密碼、TLS、log 或 JSON 格式改變也包括在內。 |
 | 容器 restart／recreate／rebuild 或 Docker 網絡重建 | container ID、network ID 或網絡 namespace 身分改變就不能沿用 binding；同名容器也一樣，需要離線重新綁定。 |
@@ -438,11 +438,21 @@ sha256sum -c MANIFEST.sha256
 
 ### 已有驗證紀錄
 
-本次工作已重新檢查 Ubuntu 20.04 hybrid／v1 基線，全部公開代理範例亦已通過真實 sing-box 1.14.2 的配置檢查。受控 Hysteria2／UDP DNS 與 HTTP CONNECT／驗證 TLS 的 HTTPS DNS 已完成跨 TCP／UDP 查詢快取、TTL 到期重新查詢及 HTTP 普通 UDP 無直連回退測試；停用快取與移除 HTTPS DNS detour 的負對照按預期失敗。這些證據不代表所有協議、所有傳輸、完整 cgroup v2 或真實遠端節點都已驗收。
+截至 **2026-10-19**，證據按實際執行層次分開記錄：
 
-純 v2 的完整實機／CI 驗收仍待完成，X11／Wayland 真實視窗的完整驗收也尚未完成。較早的 Hysteria2 網絡、安裝、權限與啟動器結果保留為歷史紀錄；當次版本、命令、跳過原因與測試數以對應驗收文件為準。
+| 層次與環境 | 已通過的範圍 |
+| --- | --- |
+| 配置檢查 | 24／24 份公開代理範例通過共用解析器及真實 sing-box 1.14.2 核心檢查；假節點不因此變成可用節點。 |
+| 真實協議 loopback | 47／47 組 client／server 案例通過 TCP、按能力提供或拒絕的 UDP、DNS 快取／TTL 及停止 server 後的阻斷；包含 Hysteria1／2 跳埠、Snell4、SSH 與 ShadowTLS 1／2／3。這一層不執行主機 cgroup／TUN／防火牆驗收。 |
+| Ubuntu 20.04.6 hybrid／v1 | Hysteria2 與 HTTP CONNECT 的核心／故障套件各 17／17，兩者的代理出口 IP 比對通過。另完成 v1 生命週期 10／10（含 100 個短會話）、能力 13／13、CLI 9／9。 |
+| Ubuntu 26.04.1 原生純 v2 | Hysteria2／HTTP 各執行 healthy、gateway-stop、gateway-kill、gateway-recreate、docker-restart，共 10／10 CI jobs 通過；包括真實會話、封包、出口 IP 與生命週期驗收。 |
+| Debian 13.7 KVM 純 v2 | Hysteria2／HTTP 的 healthy jobs 共 2／2 通過；各含核心 16／16、生命週期 10／10、100 個短會話及出口 IP 比對。Debian 的容器／Docker namespace 故障不在這兩個 job 範圍內。 |
 
-為避免公開主機資料，原始日誌、封包擷取和私人部署資料不隨公開版提供；保留的技術摘要見 [驗證紀錄](docs/VERIFICATION.md)。
+純 v2 結果來自 [CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891)（`58dcfad596856fc3696d138f84d1c0f37e6e0ebd`），**12／12 jobs 通過**。v2 證據另核對會話建立的實際 socket inode 與所屬 service cgroup。容器重建確實更換 container ID 與 namespace；舊 binding／共同規則保留，`check`、`init` 及新工作負載入場拒絕，必須離線重新綁定，沒有自動沿用新 namespace。
+
+受控 DNS 測試包括跨 TCP／UDP 查詢共用快取、TTL 到期重新查詢，以及停用快取、移除 HTTPS DNS detour 的預期失敗負對照。SSH 使用固定核心 client 與獨立 Paramiko 3.5.1 server；ShadowTLS 使用內層 Shadowsocks／UoT 與不發送 session ticket 的私有 TLS cover，憑證驗證保持啟用。這些結果限於[協議矩陣](docs/protocol-matrix.md)列出的具體配置。逐協議完整主機出口矩陣與真實 X11／Wayland 視窗驗收尚待相應結果；其他未列出的協議選項和主機環境不能沿用上述通過狀態。
+
+主機 fixture 使用同機隔離的假認證代理；出口 IP 比對證明受管請求與指定 fixture 的獨立觀測一致，不能證明遠端匿名性或使用者實際節點的品質。版本、命令、CI artifacts、跳過原因與歷史結果見 [驗證紀錄](docs/VERIFICATION.md)。公開摘要不包含私人節點、憑證、實際出口 IP 或原始封包。本次改動仍在工作分支，尚未合併 `main`；合併須另行審閱與明確批准。
 
 ## 常見問題
 

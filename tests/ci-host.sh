@@ -28,6 +28,37 @@ ci_validate_case() {
     [[ $3 =~ ^[1-9][0-9]{0,2}$ ]] && (( 10#$3 <= 200 ))
 }
 
+ci_validate_protocol_case() {
+    [[ $1 =~ ^[a-z][a-z0-9-]{0,63}$ ]] || return 1
+    python3 "$CI_ROOT/tests/protocol_runtime.py" --list |
+        jq -e --arg name "$1" '(.cases + .experimental_cases) | index($name) != null' >/dev/null
+}
+
+ci_archive_public_config() {
+    # Only replace the committed, public example in this fresh private checkout.
+    # Never inherit a configuration from the host or overwrite an existing backup.
+    python3 - "$CI_ROOT" "$CI_BASE/public-network-example.json" "$CI_REVISION" <<'PY'
+import os, pathlib, stat, subprocess, sys
+checkout, backup = map(pathlib.Path, sys.argv[1:3])
+source = checkout / "network.json"
+metadata = source.lstat()
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+    raise SystemExit("Refusing an untrusted or linked source")
+expected = subprocess.check_output(["git", "-C", str(checkout), "show", sys.argv[3] + ":network.json"])
+if source.read_bytes() != expected:
+    raise SystemExit("Source differs from this commit's public example")
+descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "wb") as stream:
+    stream.write(expected)
+def identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+if identity(source.lstat()) != identity(metadata) or source.read_bytes() != expected:
+    raise SystemExit("Source changed during archival")
+source.unlink()
+PY
+}
+
 ci_write_config() {
     # Build a fixture source from literals, never from a user's proxy settings.
     # The self-signed Hy2 certificate belongs only to this disposable fixture.
@@ -64,40 +95,155 @@ with (pathlib.Path(path) / "stages.jsonl").open("a") as stream:
 PY
 }
 
-ci_validate_results() {
-    python3 - "$1" <<'PY'
-import json, pathlib, sys
-for name in ("core", "lifecycle"):
-    path = pathlib.Path(sys.argv[1]) / name / "results.json"
-    rows = json.loads(path.read_text())
-    if not isinstance(rows, list) or not rows or not all(row.get("passed") is True for row in rows):
-        raise SystemExit("Missing or failed real acceptance results: " + name)
-PY
-}
-
-ci_write_manifest() {
-    python3 - "$@" <<'PY'
-import datetime, hashlib, json, pathlib, sys
-directory, status, protocol, scenario, repetitions, revision = sys.argv[1:]
-root = pathlib.Path(directory)
-suites = {}
-for name in ("core", "lifecycle"):
+ci_result_report() {
+    python3 - "$1" "${2:-representative}" "${3:-}" <<'PY'
+import json, pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+profile, case = sys.argv[2:]
+suites, proofs, loaded = {}, {}, {}
+required = ("core", "lifecycle") if profile != "protocol-case" else ("core",)
+for name in required:
     path = root / name / "results.json"
     try:
+        if path.is_symlink(): raise ValueError("linked results")
         rows = json.loads(path.read_text())
-        if not isinstance(rows, list) or not rows:
+        if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
             raise ValueError("empty or invalid results")
+        loaded[name] = rows
         passed = sum(row.get("passed") is True for row in rows)
         suites[name] = {"status": "passed" if passed == len(rows) else "failed",
                         "passed": passed, "total": len(rows), "results": str(path.relative_to(root))}
     except FileNotFoundError:
         suites[name] = {"status": "not_run"}
-    except (ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError):
         suites[name] = {"status": "invalid_results"}
-stages_path = root / "stages.jsonl"
-stages = [json.loads(row) for row in stages_path.read_text().splitlines()] if stages_path.exists() else []
-passed = (status == "0" and all(row["exit_code"] == 0 for row in stages)
-          and all(suite["status"] == "passed" for suite in suites.values()))
+
+def read_json(name):
+    path = root / name
+    if path.is_symlink(): raise ValueError("linked proof")
+    return json.loads(path.read_text())
+
+def artifact(name, minimum=1):
+    path = root / name
+    return path.is_file() and not path.is_symlink() and path.stat().st_size >= minimum
+
+def proof(name, check):
+    try: proofs[name] = check() is True
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError): proofs[name] = False
+
+def flags(value, names):
+    return (isinstance(value, dict) and set(names) <= value.keys()
+            and all(flag is True for flag in value.values()))
+
+stages = []
+try:
+    path = root / "stages.jsonl"
+    if path.is_symlink(): raise ValueError("linked stages")
+    stages = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    stages_valid = all(isinstance(row, dict) and isinstance(row.get("name"), str)
+                       and type(row.get("exit_code")) is int and row["exit_code"] == 0 for row in stages)
+except (OSError, ValueError, TypeError):
+    stages_valid = False
+
+if profile == "protocol-case":
+    suites["lifecycle"] = {"status": "not_requested",
+                           "scope": "This protocol job runs core faults; the representative jobs run lifecycle stress."}
+    expected = (
+        "two_session_credentials", "host_loopback", "public_https", "all_dns_destinations_redirected",
+        "ordinary_udp_capability", "forced_physical_interface", "private_ipv6_privilege_denials",
+        "controlled_upstream_node_outage", "gateway_TUN_link_down", "host_default_route_removed",
+        "gateway_half_route_removed", "failed_probe_no_payload", "extra_policy_rule_rejected",
+        "writable_policy_rejected", "gateway-kill", "packet_capture_evidence", "shared_rules_unchanged",
+    )
+    core = loaded.get("core", [])
+    proofs["core17"] = tuple(row.get("name") for row in core) == expected
+    if not proofs["core17"] and suites["core"]["status"] == "passed":
+        suites["core"]["status"] = "invalid_results"
+    details = {row.get("name"): row.get("detail") for row in core if isinstance(row.get("name"), str)}
+
+    def socket_origin():
+        rows = details["two_session_credentials"]
+        if not isinstance(rows, list) or len(rows) != 2: return False
+        services, inodes = set(), set()
+        for row in rows:
+            birth = row["socket_creation"]
+            if row["cgroup_mode"] != "v2" or birth["created_inside_service"] is not True: return False
+            service = birth["cgroup"]
+            if not isinstance(service, str) or not re.fullmatch(r"/devsession\.slice/dev-session-[0-9a-f]{32}\.service", service):
+                return False
+            values = birth["inodes"]
+            if not isinstance(values, list) or len(values) != 2 or not all(type(value) is int and value > 0 for value in values):
+                return False
+            services.add(service); inodes.update(values)
+        return (len(services) == 2 and len(inodes) == 4 and
+                all(artifact("core/" + name + "-socket-cgroups.log") for name in ("session-A", "session-B")))
+    proof("socket_origin", socket_origin)
+
+    def packet_capture():
+        capture = details["packet_capture_evidence"]
+        counts = ("positive_control_packets", "direct_workload_packets", "outer_packets", "redirected_dns_packets")
+        return (all(type(capture[name]) is int for name in counts)
+                and capture["positive_control_packets"] >= 2 and capture["direct_workload_packets"] == 0
+                and capture["outer_packets"] > 0 and capture["redirected_dns_packets"] > 0
+                and capture["plaintext_dns_on_outer"] is False
+                and all(artifact("core/" + name + ".pcap", 25) for name in
+                        ("physical-direct-probes", "gateway-outer", "redirected-dns")))
+    proof("packet_capture", packet_capture)
+
+    def exit_ip():
+        value = read_json("exit-ip/results.json")
+        address = value["exit_ip"]
+        return (value["format"] == 1 and value["passed"] is True and address["valid_ipv4"] is True
+                and type(address["family"]) is int and address["family"] == 4 and address["matches"] is True
+                and flags(value["checks"], ("workload_identity", "workload_cgroup", "session_reclaimed",
+                          "postcheck", "binding_retained", "fixture_bound_to_source", "owned_upstream_namespace")))
+    proof("exit_ip", exit_ip)
+
+    def fixture_verify():
+        value = read_json("fixture-verification.json")
+        return (value["format"] == 1 and value["protocol_case"] == case and value["passed"] is True
+                and flags(value["checks"], ("source_unchanged", "recipe_unchanged", "namespace_owned",
+                          "services_active", "helper_evidence")))
+    proof("fixture_verify", fixture_verify)
+
+    def namespace_fault():
+        value = details["gateway-kill"]
+        names = ("namespace_changed", "binding_and_guards_retained", "offline_rebind_required",
+                 "existing_connection_blocked_during_fault", "new_connection_blocked_during_fault",
+                 "other_session_loopback_alive")
+        return all(value[name] is True for name in names) and value["check_exit"] == value["init_exit"] == 125
+    proof("namespace_fault", namespace_fault)
+    proofs["lifecycle_not_requested"] = not (root / "lifecycle").exists()
+    required_stages = ["dependencies", "offline", "offline_helpers", "docker_backend", "fixture_engine",
+                       "fixture_render", "fixture", "exit_ip", "core", "fixture_verify"]
+    if case == "ssh": required_stages.append("fixture_python")
+    recorded = [row.get("name") for row in stages if isinstance(row, dict)]
+    proofs["required_stages"] = stages_valid and all(recorded.count(name) == 1 for name in required_stages)
+
+passed = (profile in ("representative", "protocol-case") and stages_valid
+          and all(suites[name]["status"] == "passed" for name in required) and all(proofs.values()))
+report = {"passed": passed, "suites": suites, "proofs": proofs, "stages": stages}
+print(json.dumps(report))
+raise SystemExit(0 if passed else 1)
+PY
+}
+
+ci_validate_results() { ci_result_report "$@" >/dev/null; }
+
+ci_write_manifest() {
+    local report
+    report=$(ci_result_report "$1" "${7:-representative}" "${8:-}") || :
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "${7:-representative}" "${8:-}" "$report" <<'PY'
+import datetime, hashlib, json, pathlib, sys
+directory, status, protocol, scenario, repetitions, revision, profile, case, report = sys.argv[1:]
+root = pathlib.Path(directory)
+report = json.loads(report)
+suites, stages = report["suites"], report["stages"]
+passed = status == "0" and report["passed"]
+if profile == "protocol-case":
+    names = [row.get("name") for row in stages if isinstance(row, dict)]
+    passed = (passed and scenario == "gateway-kill" and repetitions == "0" and protocol == case
+              and names.count("results") == names.count("fixture_cleanup") == 1)
 files = []
 for path in sorted(root.rglob("*")):
     if path.is_file() and not path.is_symlink() and path.name != "manifest.json":
@@ -105,8 +251,9 @@ for path in sorted(root.rglob("*")):
                       "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
 manifest = {"format": 1, "status": "passed" if passed else "failed", "exit_code": int(status),
             "revision": revision, "protocol": protocol, "scenario": scenario,
+            "acceptance_profile": profile, "protocol_case": case or None,
             "repetitions": int(repetitions), "required_cgroup": "v2",
-            "suites": suites, "stages": stages, "evidence": files,
+            "suites": suites, "proofs": report["proofs"], "stages": stages, "evidence": files,
             "finished_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "scope": "This job only; other operating systems and protocols are not implied."}
 temp = root / ".manifest.tmp"
@@ -314,9 +461,77 @@ ci_initialize() {
     return "$status"
 }
 
-ci_fixture() {
+ci_ssh_python() {
+    # setup-python is pinned in the workflow. System Python 3.14 is kept intact;
+    # cffi 1.17.1 publishes a regular CPython 3.13 wheel, not a 3.14 wheel.
+    [[ $CI_PYTHON_BOOTSTRAP =~ ^/opt/hostedtoolcache/Python/3\.13\.16/x64/bin/python(3(\.13)?)?$ &&
+       -x $CI_PYTHON_BOOTSTRAP && ! -e $CI_BASE/ssh-venv ]] || ci_fail 'Require the selected official Python 3.13.16 runtime'
+    "$CI_PYTHON_BOOTSTRAP" -I -c 'import platform,sys,sysconfig; assert sys.version_info[:3]==(3,13,16) and platform.python_implementation()=="CPython" and not sysconfig.get_config_var("Py_GIL_DISABLED")'
+    "$CI_PYTHON_BOOTSTRAP" -I -m venv --copies "$CI_BASE/ssh-venv"
+    "$CI_FIXTURE_PYTHON" -I -m pip --isolated --disable-pip-version-check install \
+        --only-binary=:all: --no-deps --no-cache-dir --index-url https://pypi.org/simple pip==25.1.1
+    "$CI_FIXTURE_PYTHON" -I -m pip --isolated --disable-pip-version-check install \
+        --only-binary=:all: --no-deps --no-cache-dir --index-url https://pypi.org/simple \
+        --report "$CI_EVIDENCE/ssh-pip-report.json" \
+        paramiko==3.5.1 cryptography==44.0.3 bcrypt==4.1.3 PyNaCl==1.5.0 cffi==1.17.1 pycparser==2.22
+    "$CI_FIXTURE_PYTHON" -I -m pip --isolated --disable-pip-version-check check
+    "$CI_FIXTURE_PYTHON" -I - "$CI_EVIDENCE/ssh-python.json" <<'PY'
+import importlib.metadata, json, pathlib, sys, sysconfig
+expected = {"pip": "25.1.1", "paramiko": "3.5.1", "cryptography": "44.0.3", "bcrypt": "4.1.3",
+            "PyNaCl": "1.5.0", "cffi": "1.17.1", "pycparser": "2.22"}
+versions = {name: importlib.metadata.version(name) for name in expected}
+assert versions == expected and sys.version_info[:3] == (3, 13, 16)
+assert sys.prefix != sys.base_prefix and not sysconfig.get_config_var("Py_GIL_DISABLED")
+result = {"python_version": sys.version, "executable": sys.executable, "prefix": sys.prefix,
+          "base_prefix": sys.base_prefix, "packages": versions, "isolated_venv": True}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(result, indent=2) + "\n")
+print(json.dumps(result))
+PY
+    timeout --signal=TERM --kill-after=10s 5m "$CI_FIXTURE_PYTHON" -I -m unittest discover \
+        -s "$CI_ROOT/tests" -p 'test_protocol*.py' -v
+}
+
+ci_build_worker() {
     local extract
-    ci_write_config "$CI_PROTOCOL" "$CI_ROOT/network.json"
+    docker compose --project-directory "$CI_ROOT" build --pull worker
+    extract=$(docker create --name d8-ci-engine-extract --entrypoint /bin/true worker:1.14.2-v8)
+    docker cp "$extract:/usr/local/bin/worker" "$CI_BASE/worker"
+    docker rm "$extract"
+    chmod 700 "$CI_BASE/worker"
+    "$CI_BASE/worker" version | tee "$CI_EVIDENCE/worker-version.txt"
+    [[ $(head -n 1 "$CI_EVIDENCE/worker-version.txt") == 'sing-box version 1.14.2' ]]
+    python3 - "$CI_EVIDENCE/worker-version.txt" <<'PY'
+import pathlib, sys
+assert "af6e64c3b69e6132ebaee0e1a3d24e93903f6709" in pathlib.Path(sys.argv[1]).read_text()
+PY
+    sha256sum "$CI_BASE/worker" >"$CI_EVIDENCE/worker-sha256.txt"
+}
+
+ci_protocol_fixture() {
+    local -a python_option=()
+    if [[ -n ${CI_FIXTURE_PYTHON:-} ]]; then python_option=(--python "$CI_FIXTURE_PYTHON"); fi
+    python3 "$CI_ROOT/tests/host_upstream_fixture.py" "$1" \
+        --protocol-case "$CI_PROTOCOL_CASE" --config "$CI_ROOT/network.json" \
+        --engine "$CI_BASE/worker" --output "$CI_FIXTURE" "${python_option[@]}"
+}
+
+ci_protocol_render() {
+    ci_archive_public_config
+    ci_protocol_fixture render
+}
+
+ci_protocol_fixture_verify() {
+    ci_protocol_fixture verify
+    # Only these documented, address/auth-free helper summaries are exported.
+    # Server configs, host keys, certificates, and the descriptor stay private.
+    install -m 600 "$CI_FIXTURE/runtime-state.json" "$CI_EVIDENCE/runtime-state.json"
+    install -m 600 "$CI_FIXTURE/fixture-verification.json" "$CI_EVIDENCE/fixture-verification.json"
+}
+
+ci_fixture() {
+    if [[ ${CI_PROFILE:-representative} == representative ]]; then
+        ci_write_config "$CI_PROTOCOL" "$CI_ROOT/network.json"
+    fi
     # Both real suites invoke this private manager by absolute path. Hosted
     # images may have a runner-writable /usr/local/bin; keep installer trust
     # checks intact and avoid publishing a launcher there.
@@ -328,17 +543,14 @@ ci_fixture() {
         >/etc/sudoers.d/dev-session-ci
     chmod 440 /etc/sudoers.d/dev-session-ci
     visudo -cf /etc/sudoers.d/dev-session-ci
-    docker compose --project-directory "$CI_ROOT" build --pull worker
-    extract=$(docker create --name d8-ci-engine-extract --entrypoint /bin/true worker:1.14.2-v8)
-    docker cp "$extract:/usr/local/bin/worker" "$CI_BASE/worker"
-    docker rm "$extract"
-    chmod 700 "$CI_BASE/worker"
-    "$CI_BASE/worker" version | tee "$CI_EVIDENCE/worker-version.txt"
-    [[ $(head -n 1 "$CI_EVIDENCE/worker-version.txt") == 'sing-box version 1.14.2' ]]
-    sha256sum "$CI_BASE/worker" >"$CI_EVIDENCE/worker-sha256.txt"
-    python3 "$CI_ROOT/tests/host_upstream_fixture.py" setup \
-        --config "$CI_ROOT/network.json" --engine "$CI_BASE/worker" --output "$CI_FIXTURE" \
-        --udp-echo-address 192.0.2.254 --udp-echo-port 40123
+    if [[ ${CI_PROFILE:-representative} == protocol-case ]]; then
+        ci_protocol_fixture setup
+    else
+        ci_build_worker
+        python3 "$CI_ROOT/tests/host_upstream_fixture.py" setup \
+            --config "$CI_ROOT/network.json" --engine "$CI_BASE/worker" --output "$CI_FIXTURE" \
+            --udp-echo-address 192.0.2.254 --udp-echo-port 40123
+    fi
     cp "$CI_FIXTURE/fixture-info.json" "$CI_EVIDENCE/fixture-info.json"
     docker compose --project-directory "$CI_ROOT" up -d --no-build worker
     local ready=false attempt
@@ -348,13 +560,21 @@ ci_fixture() {
     done
     [[ $ready == true ]] || ci_fail 'Gateway never published readiness'
     ci_initialize
-    jq -e --arg protocol "$CI_PROTOCOL" '
-      .format==2 and .cgroup.mode=="v2" and
-      (if $protocol=="http" then .proxy_policy.payload_networks==["tcp"] and
-            .proxy_policy.dns_transport=="https"
-       else .proxy_policy.payload_networks==["tcp","udp"] and
-            .proxy_policy.dns_transport=="udp" end)
-    ' /run/dev-session-v8/binding >/dev/null
+    if [[ ${CI_PROFILE:-representative} == protocol-case ]]; then
+        local policy
+        policy=$(jq -ceS --arg mode policy -f "$CI_ROOT/gateway-policy.jq" "$CI_ROOT/network.json")
+        jq -e --argjson expected "$policy" \
+            '.format==2 and .cgroup.mode=="v2" and .proxy_policy==$expected' \
+            /run/dev-session-v8/binding >/dev/null
+    else
+        jq -e --arg protocol "$CI_PROTOCOL" '
+          .format==2 and .cgroup.mode=="v2" and
+          (if $protocol=="http" then .proxy_policy.payload_networks==["tcp"] and
+                .proxy_policy.dns_transport=="https"
+           else .proxy_policy.payload_networks==["tcp","udp"] and
+                .proxy_policy.dns_transport=="udp" end)
+        ' /run/dev-session-v8/binding >/dev/null
+    fi
     cp /run/dev-session-v8/binding "$CI_EVIDENCE/binding-initial.json"
 }
 
@@ -393,12 +613,23 @@ ci_suites() {
     if [[ $CI_SCENARIO == healthy ]]; then "$CI_ROOT/dev-session" check; fi
 }
 
+ci_protocol_suites() {
+    # All transport cases get node/TUN/route faults plus old/new connection
+    # refusal on gateway kill. No lifecycle stress or namespace adoption follows.
+    ci_stage core timeout --signal=TERM --kill-after=30s 20m \
+        python3 "$CI_ROOT/tests/host_acceptance.py" --user "$CI_ACCOUNT" \
+        --output "$CI_EVIDENCE/core" --udp-echo 192.0.2.254:40123 --namespace-fault gateway-kill
+    ci_stage fixture_verify ci_protocol_fixture_verify
+    ci_stage results ci_validate_results "$CI_EVIDENCE" protocol-case "$CI_PROTOCOL_CASE"
+    cmp /run/dev-session-v8/binding "$CI_EVIDENCE/binding-initial.json"
+}
+
 ci_snapshot() {
     python3 - "$CI_EVIDENCE" <<'PY'
 import json, pathlib, subprocess, sys
 root = pathlib.Path(sys.argv[1])
 commands = [
-    ["uname", "-a"], ["systemctl", "--version"], ["iptables-legacy", "--version"],
+    ["uname", "-a"], ["python3", "--version"], ["systemctl", "--version"], ["iptables-legacy", "--version"],
     ["ip6tables-legacy", "--version"], ["docker", "version"], ["docker", "compose", "version"],
     ["findmnt", "--json", "--list", "--types", "cgroup,cgroup2", "--output", "TARGET,FSTYPE,FSROOT,OPTIONS"],
     ["systemctl", "show", "devsession.slice", "--property=ActiveState,ControlGroup,FragmentPath"],
@@ -440,9 +671,9 @@ ci_finish() {
         ci_record_stage "$CI_EVIDENCE" fixture_cleanup "$cleanup_status" 0
     fi
     (( cleanup_status == 0 )) || status=1
-    ci_validate_results "$CI_EVIDENCE" >/dev/null 2>&1 || status=1
+    ci_validate_results "$CI_EVIDENCE" "$CI_PROFILE" "$CI_PROTOCOL_CASE" >/dev/null 2>&1 || status=1
     ci_write_manifest "$CI_EVIDENCE" "$status" "$CI_PROTOCOL" "$CI_SCENARIO" \
-        "$CI_REPETITIONS" "$CI_REVISION" || status=1
+        "$CI_REPETITIONS" "$CI_REVISION" "$CI_PROFILE" "$CI_PROTOCOL_CASE" || status=1
     # Leave the gateway, slice, firewall and binding in place until the hosted
     # VM is destroyed. Cleanup only owns the separately created upstream fixture.
     exit "$status"
@@ -454,17 +685,34 @@ ci_main() {
     umask 077
     ci_require_disposable ||
         ci_fail 'This script requires an explicitly marked disposable GitHub-hosted VM'
-    CI_PROTOCOL=''; CI_SCENARIO=''; CI_REPETITIONS=100
+    CI_PROTOCOL=''; CI_SCENARIO=''; CI_REPETITIONS=100; CI_PROTOCOL_CASE=''
+    CI_PROFILE=representative; CI_PYTHON_BOOTSTRAP=''; CI_FIXTURE_PYTHON=''
+    local repetitions_set=false
     while (( $# )); do
         case $1 in
             --protocol) [[ $# -ge 2 ]] || ci_fail 'Missing protocol'; CI_PROTOCOL=$2; shift 2 ;;
             --scenario) [[ $# -ge 2 ]] || ci_fail 'Missing scenario'; CI_SCENARIO=$2; shift 2 ;;
-            --repetitions) [[ $# -ge 2 ]] || ci_fail 'Missing repetitions'; CI_REPETITIONS=$2; shift 2 ;;
-            *) ci_fail 'Usage: ci-host.sh --protocol hysteria2|http --scenario healthy|gateway-stop|gateway-kill|gateway-recreate|docker-restart [--repetitions 1..200]' ;;
+            --repetitions) [[ $# -ge 2 ]] || ci_fail 'Missing repetitions'; CI_REPETITIONS=$2; repetitions_set=true; shift 2 ;;
+            --protocol-case) [[ $# -ge 2 && -z $CI_PROTOCOL_CASE ]] || ci_fail 'Missing or duplicate protocol case'; CI_PROTOCOL_CASE=$2; shift 2 ;;
+            --fixture-python) [[ $# -ge 2 && -z $CI_PYTHON_BOOTSTRAP ]] || ci_fail 'Missing or duplicate fixture Python'; CI_PYTHON_BOOTSTRAP=$2; shift 2 ;;
+            *) ci_fail 'Usage: ci-host.sh --protocol hysteria2|http --scenario healthy|gateway-stop|gateway-kill|gateway-recreate|docker-restart [--repetitions 1..200], or --protocol-case CASE [--fixture-python OFFICIAL_PYTHON_3_13_16]' ;;
         esac
     done
-    ci_validate_case "$CI_PROTOCOL" "$CI_SCENARIO" "$CI_REPETITIONS" || ci_fail 'Invalid CI case'
     CI_BASE=/root/dev-session-ci; CI_ROOT=$CI_BASE/repo
+    if [[ -n $CI_PROTOCOL_CASE ]]; then
+        [[ -z $CI_PROTOCOL && -z $CI_SCENARIO && $repetitions_set == false ]] ||
+            ci_fail 'Protocol-case jobs fix the fault to gateway-kill and do not request lifecycle repetitions'
+        if [[ $CI_PROTOCOL_CASE == ssh ]]; then
+            [[ -n $CI_PYTHON_BOOTSTRAP ]] || ci_fail 'SSH requires an explicit official Python 3.13.16 runtime'
+            CI_FIXTURE_PYTHON=$CI_BASE/ssh-venv/bin/python
+        else
+            [[ -z $CI_PYTHON_BOOTSTRAP ]] || ci_fail 'A fixture Python override is only used by the SSH case'
+        fi
+        CI_PROFILE=protocol-case; CI_PROTOCOL=$CI_PROTOCOL_CASE; CI_SCENARIO=gateway-kill; CI_REPETITIONS=0
+    else
+        [[ -z $CI_PYTHON_BOOTSTRAP ]] || ci_fail 'A fixture Python override requires the SSH protocol case'
+        ci_validate_case "$CI_PROTOCOL" "$CI_SCENARIO" "$CI_REPETITIONS" || ci_fail 'Invalid CI case'
+    fi
     CI_EVIDENCE=$CI_BASE/evidence; CI_FIXTURE=$CI_BASE/private-fixture
     CI_ACCOUNT=d8-ci-agent; CI_STAGE=''; CI_STAGE_STARTED=$SECONDS
     CI_REVISION=${CI_GITHUB_SHA:-}
@@ -473,6 +721,9 @@ ci_main() {
        $(git -C "$CI_ROOT" rev-parse HEAD) == "$CI_REVISION" &&
        -z $(git -C "$CI_ROOT" status --porcelain) ]] || ci_fail 'Require a fresh root-private exact-SHA checkout'
     [[ $(stat -c '%u:%a' "$CI_BASE") == 0:700 && $(stat -c '%u:%a' "$CI_ROOT") == 0:700 ]]
+    if [[ $CI_PROFILE == protocol-case ]]; then
+        ci_validate_protocol_case "$CI_PROTOCOL_CASE" || ci_fail 'Unknown protocol recipe'
+    fi
     [[ ! -e /run/dev-session-v8 && ! -e /run/systemd/system/devsession.slice &&
        ! -e /sys/fs/cgroup/devsession.slice && ! -e $CI_EVIDENCE && ! -e $CI_FIXTURE ]]
     ! getent passwd "$CI_ACCOUNT" >/dev/null
@@ -487,12 +738,17 @@ ci_main() {
         python3 -m unittest discover -s "$CI_ROOT/tests" -p 'test_*.py' -v
     ci_stage offline_helpers ci_offline_helpers
     ci_stage docker_backend ci_docker_legacy
+    if [[ $CI_PROFILE == protocol-case ]]; then
+        if [[ $CI_PROTOCOL_CASE == ssh ]]; then ci_stage fixture_python ci_ssh_python; fi
+        ci_stage fixture_engine ci_build_worker
+        ci_stage fixture_render ci_protocol_render
+    fi
     ci_stage fixture ci_fixture
     ci_stage exit_ip timeout --signal=TERM --kill-after=30s 5m \
         python3 "$CI_ROOT/tests/host_exit_ip.py" --user "$CI_ACCOUNT" \
         --fixture-output "$CI_FIXTURE" --upstream-namespace d8-test-upstream \
         --output "$CI_EVIDENCE/exit-ip"
-    ci_suites
+    if [[ $CI_PROFILE == protocol-case ]]; then ci_protocol_suites; else ci_suites; fi
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then ci_main "$@"; fi

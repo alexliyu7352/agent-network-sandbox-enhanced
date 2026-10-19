@@ -98,3 +98,137 @@ jobs:
           path: ${{ runner.temp }}/dev-session-evidence
           if-no-files-found: error
           retention-days: 14
+
+  protocol-case:
+    # One fresh native VM per recipe. The 12 representative jobs above retain
+    # their lifecycle/recreation/restart coverage; this matrix adds each wire
+    # protocol, transport, wrapper, and graph with the full core fault suite.
+    if: ${{ github.event.repository.private == false }}
+    name: ubuntu-26.04 / protocol-case / ${{ matrix.case }} / gateway-kill
+    runs-on: ubuntu-26.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - hysteria
+          - hysteria2
+          - tuic
+          - tuic-over-stream
+          - shadowsocks
+          - shadowsocks-uot
+          - shadowsocks-mux
+          - anytls
+          - http
+          - https
+          - socks4-tcp
+          - socks4a-tcp
+          - socks5-tcp
+          - socks5-uot
+          - naive
+          - naive-quic
+          - naive-uot
+          - snell6
+          - trojan
+          - trojan-http
+          - trojan-ws
+          - trojan-grpc
+          - trojan-httpupgrade
+          - trojan-quic
+          - vmess
+          - vmess-http
+          - vmess-ws
+          - vmess-grpc
+          - vmess-httpupgrade
+          - vmess-quic
+          - vless
+          - vless-http
+          - vless-ws
+          - vless-grpc
+          - vless-httpupgrade
+          - vless-quic
+          - selector-trojan
+          - selector-hysteria2
+          - urltest
+          - detour
+          - hysteria2-port-hopping
+          - snell4
+          - hysteria-port-hopping
+          - shadowtls1
+          - shadowtls2
+          - shadowtls3
+          - ssh
+    steps:
+      - name: Fetch this public commit into a fresh root-private checkout
+        env:
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SERVER_URL" == https://github.com ]]
+          [[ "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$CI_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          sudo env CI_REPOSITORY="$CI_REPOSITORY" CI_COMMIT="$CI_COMMIT" bash <<'ROOT'
+          set -euo pipefail
+          umask 077
+          test ! -e /root/dev-session-ci
+          mkdir -m 700 /root/dev-session-ci
+          git init -q /root/dev-session-ci/repo
+          git -C /root/dev-session-ci/repo fetch --no-tags --depth=1 \
+            "https://github.com/$CI_REPOSITORY.git" "$CI_COMMIT"
+          git -C /root/dev-session-ci/repo checkout -q --detach FETCH_HEAD
+          test "$(git -C /root/dev-session-ci/repo rev-parse HEAD)" = "$CI_COMMIT"
+          ROOT
+
+      - name: Select an exact compatible Python for the isolated SSH fixture
+        if: ${{ matrix.case == 'ssh' }}
+        id: ssh-python
+        # Official actions/setup-python v6.0.0; regular CPython, not 3.13t.
+        # Ubuntu 26.04's system Python is 3.14. The pinned cffi wheel supports 3.13.
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.13.16'
+          architecture: x64
+          check-latest: false
+
+      - name: Run the native protocol fixture, exit-IP proof, and core faults
+        env:
+          CI_PROTOCOL_CASE: ${{ matrix.case }}
+          CI_COMMIT: ${{ github.sha }}
+          CI_SELECTED_PYTHON: ${{ steps.ssh-python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          python_options=()
+          if [[ "$CI_PROTOCOL_CASE" == ssh ]]; then
+            test -n "$CI_SELECTED_PYTHON"
+            python_options=(--fixture-python "$CI_SELECTED_PYTHON")
+          fi
+          sudo env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            CI_DISPOSABLE_HOST=github-actions CI_GITHUB_SHA="$CI_COMMIT" \
+            bash /root/dev-session-ci/repo/tests/ci-host.sh \
+            --protocol-case "$CI_PROTOCOL_CASE" "${python_options[@]}"
+
+      - name: Export only this protocol's evidence, including failure results
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          destination="$RUNNER_TEMP/dev-session-evidence"
+          mkdir -m 700 "$destination"
+          if sudo test -d /root/dev-session-ci/evidence; then
+            sudo cp -a /root/dev-session-ci/evidence/. "$destination/"
+            sudo chown -R "$(id -u):$(id -g)" "$destination"
+          fi
+          if [[ ! -f "$destination/manifest.json" ]]; then
+            printf '%s\n' '{"format":1,"status":"failed","acceptance_profile":"protocol-case","reason":"bootstrap did not produce a completed manifest","suites":{"core":{"status":"not_run"},"lifecycle":{"status":"not_requested"}}}' \
+              >"$destination/manifest.json"
+          fi
+          cat "$destination/manifest.json" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload protocol evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ubuntu-26.04-protocol-${{ matrix.case }}-gateway-kill
+          path: ${{ runner.temp }}/dev-session-evidence
+          if-no-files-found: error
+          retention-days: 14

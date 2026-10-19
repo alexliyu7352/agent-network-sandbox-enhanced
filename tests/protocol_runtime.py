@@ -24,6 +24,7 @@ import select
 import shutil
 import socket
 import socketserver
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -43,13 +44,8 @@ PASSWORD = "public-protocol-matrix-fake-password"
 USERNAME = "matrix-user"
 UUID = "00000000-0000-4000-8000-000000000001"
 TIMEOUT = 3.0
-EXPERIMENTAL_CASES = ("snell4", "hysteria-port-hopping")
-BLOCKED = {
-    "ssh": "The pinned core has no SSH server inbound; a separately managed SSH fixture is required.",
-    "snell4": "Opt-in snell4 tests a v4 client against the native v5 server; compatibility is not part of the default verified matrix.",
-    "shadowtls": "A local cover TLS server and protocol injection chain need a dedicated fixture.",
-    "hysteria1-port-hopping": "Opt-in hysteria-port-hopping requires actual observed rotation; not part of the default verified matrix.",
-}
+EXPERIMENTAL_CASES = ()
+BLOCKED = {}
 
 
 class CaseFailure(Exception):
@@ -75,11 +71,13 @@ def case_names():
     names = ["hysteria", "hysteria2", "tuic", "tuic-over-stream", "shadowsocks",
              "shadowsocks-uot", "shadowsocks-mux", "anytls", "http", "https",
              "socks4-tcp", "socks4a-tcp", "socks5-tcp", "socks5-uot", "naive",
-             "naive-quic", "naive-uot", "snell6"]
+             "naive-quic", "naive-uot", "snell4", "snell6"]
     for kind in ("trojan", "vmess", "vless"):
         names.append(kind)
         names.extend(kind + "-" + transport for transport in ("http", "ws", "grpc", "httpupgrade", "quic"))
-    return names + ["selector-trojan", "selector-hysteria2", "urltest", "detour", "hysteria2-port-hopping"]
+    return names + ["selector-trojan", "selector-hysteria2", "urltest", "detour",
+                    "hysteria2-port-hopping", "hysteria-port-hopping",
+                    "shadowtls1", "shadowtls2", "shadowtls3", "ssh"]
 
 
 def is_hopping_case(name):
@@ -153,8 +151,8 @@ def protocol_pair(name, tag, port, certificate, cert_path, key_path):
             inbound["users"] = [{"username": USERNAME, "password": PASSWORD}]
     elif kind == "snell":
         # The pinned core's option/snell.go exposes client versions 4/6 and
-        # server versions 5/6. Using the real server schema is an interoperability
-        # experiment, not an assumption that the version numbers are aliases.
+        # server versions 5/6. The v4 case verifies interoperability against
+        # the actual v5 inbound schema.
         outbound.update(version=4 if name == "snell4" else 6, psk=PASSWORD)
         inbound.update(version=5 if name == "snell4" else 6, psk=PASSWORD)
         if name == "snell4":
@@ -177,7 +175,7 @@ def compile_config(source, mode):
     return json.loads(result.stdout)
 
 
-def build_configs(name, original, ports, certificate, cert_path, key_path):
+def build_configs(name, original, ports, certificate, cert_path, key_path, ssh_host_key=None):
     require(name in case_names() or name in EXPERIMENTAL_CASES, "unknown-case")
     source = copy.deepcopy(original)
     source["log"] = {"level": "info", "timestamp": False}
@@ -197,6 +195,26 @@ def build_configs(name, original, ports, certificate, cert_path, key_path):
         inner.update(server=BOUNDARY, detour="carrier")
         outbounds, inbounds = [inner, carrier], [inner_in, carrier_in]
         extra_ports.append(ports["proxy"])
+    elif name in {"shadowtls1", "shadowtls2", "shadowtls3"}:
+        version = int(name[-1])
+        inner, inner_in = protocol_pair("shadowsocks-uot", "proxy", ports["proxy"], certificate, cert_path, key_path)
+        inner.update(server=BOUNDARY, detour="cover")
+        wrapper = {"type": "shadowtls", "tag": "cover", "server": LOOPBACK,
+                   "server_port": ports["proxy2"], "version": version, "password": PASSWORD,
+                   "tls": {"enabled": True, "server_name": SERVER_NAME, "certificate": [certificate]}}
+        wrapper_in = {"type": "shadowtls", "tag": "cover-in", "listen": LOOPBACK,
+                      "listen_port": ports["proxy2"], "version": version, "detour": "proxy-in",
+                      "handshake": {"server": LOOPBACK, "server_port": ports["cover"]}}
+        if version == 2:
+            wrapper_in["password"] = PASSWORD
+        elif version == 3:
+            wrapper_in.update(users=[{"name": USERNAME, "password": PASSWORD}], strict_mode=True)
+        outbounds, inbounds = [inner, wrapper], [inner_in, wrapper_in]
+    elif name == "ssh":
+        require(bool(ssh_host_key), "ssh-fixture-host-key-required")
+        outbounds = [{"type": "ssh", "tag": "proxy", "server": LOOPBACK, "server_port": ports["proxy"],
+                      "user": USERNAME, "password": PASSWORD, "host_key": [ssh_host_key]}]
+        inbounds = []
     else:
         outbound, inbound = protocol_pair(name, "proxy", ports["proxy"], certificate, cert_path, key_path)
         if is_hopping_case(name):
@@ -233,6 +251,10 @@ def build_configs(name, original, ports, certificate, cert_path, key_path):
             {"action": "reject"},
         ]},
     }
+    if name == "ssh":
+        server = {"fixture": "paramiko-3.5.1", "listen_port": ports["proxy"],
+                  "allowed_ports": [ports["tcp"], ports["dns"]],
+                  "host_key_path": str(Path(cert_path).parent / "ssh-host-key.pem")}
     return source, client, server, policy
 
 
@@ -284,6 +306,42 @@ class UDPHandler(socketserver.BaseRequestHandler):
         # Canary listeners also record arbitrary DNS/TLS bytes without logging them.
         response = {"peer": self.client_address[0], "token": message.decode(errors="replace").strip()}
         sock.sendto(json.dumps(response).encode() + b"\n", self.client_address)
+
+
+class TLSCoverServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, port, certificate, key):
+        super().__init__((LOOPBACK, port), TLSCoverHandler)
+        self.handshakes = 0
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.minimum_version = ssl.TLSVersion.TLSv1_2
+        # sing-shadowtls v0.2.1 v2_conn.go treats records after the handshake
+        # as inner proxy data. OpenSSL's TLS1.3 session tickets would therefore
+        # corrupt that stream; this handshake-only fixture needs no resumption.
+        self.context.num_tickets = 0
+        self.context.load_cert_chain(certificate, key)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        try:
+            connection.settimeout(TIMEOUT)
+            secured = self.context.wrap_socket(connection, server_side=True)
+            self.handshakes += 1
+            return secured, address
+        except BaseException:
+            connection.close()
+            raise
+
+
+class TLSCoverHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            while self.request.recv(4096):
+                pass
+        except OSError:
+            pass
 
 
 class MultiportRelay:
@@ -426,11 +484,17 @@ def graph_evidence(name, log, ports):
         expected = {"a": ports["tcp"], "b": ports["tcp"]}
     elif name == "detour":
         expected = {"proxy": ports["tcp"], "carrier": ports["proxy"]}
+    elif name in {"shadowtls1", "shadowtls2", "shadowtls3"}:
+        expected = {"proxy": ports["tcp"]}
     plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", log)
     for tag, port in expected.items():
         pattern = (re.escape("[" + tag + "-in]") + r":[^\n]*\binbound connection to "
                    + re.escape(BOUNDARY + ":" + str(port)) + r"(?:\s|$)")
         require(re.search(pattern, plain) is not None, "graph-forwarding-evidence")
+    if name in {"shadowtls1", "shadowtls2", "shadowtls3"}:
+        require(re.search(r"inbound/shadowtls\[cover-in\]:[^\n]*\binbound connection to ", plain) is not None,
+                "shadowtls-wrapper-forwarding-evidence")
+        return ["cover", "proxy"]
     return list(expected)
 
 
@@ -448,12 +512,23 @@ def core_check(binary, config, log, stage):
 def start_core(binary, config, log, stage):
     with log.open("ab") as output:
         process = subprocess.Popen([binary, "run", "-c", str(config)], stdout=output, stderr=output)
+    return wait_for_start(process, log, stage, "sing-box started")
+
+
+def start_ssh_server(config, log):
+    with log.open("ab") as output:
+        process = subprocess.Popen([sys.executable, str(Path(__file__).with_name("protocol_ssh_fixture.py")),
+                                    "--config", str(config)], stdout=output, stderr=output)
+    return wait_for_start(process, log, "start-ssh-fixture", "protocol-ssh started")
+
+
+def wait_for_start(process, log, stage, ready_text):
     try:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise CaseFailure(stage)
-            if "sing-box started" in log.read_text(errors="replace"):
+            if ready_text in log.read_text(errors="replace"):
                 return process
             time.sleep(0.03)
         raise CaseFailure(stage)
@@ -477,6 +552,13 @@ def run_case(binary, name, original, directory, check_only=False):
     directory.mkdir(mode=0o700)
     certificate, key = create_certificate(directory)
     certificate_text = certificate.read_text()
+    ssh_host_key = None
+    if name == "ssh":
+        import protocol_ssh_fixture
+        try:
+            ssh_host_key = protocol_ssh_fixture.create_host_key(directory / "ssh-host-key.pem")
+        except RuntimeError:
+            raise CaseFailure("ssh-fixture-paramiko-3.5.1-required") from None
     processes = []
     persistent = None
     with ExitStack() as stack:
@@ -487,34 +569,54 @@ def run_case(binary, name, original, directory, check_only=False):
         port_fields = ["proxy", "proxy2", "dns", "ingress_tcp", "ingress_udp", "ingress_dns"]
         if is_hopping_case(name):
             port_fields.extend("hop" + str(index) for index in range(8))
+        if name in {"shadowtls1", "shadowtls2", "shadowtls3"}:
+            port_fields.append("cover")
         for field in port_fields:
             port = dns_fixture.free_dns_port()
             while port in ports.values():
                 port = dns_fixture.free_dns_port()
             ports[field] = port
-        _, _, _, policy = build_configs(name, original, ports, certificate_text, str(certificate), str(key))
+        _, _, _, policy = build_configs(name, original, ports, certificate_text, str(certificate), str(key), ssh_host_key)
         if policy["dns_transport"] == "https":
             resolver = stack.enter_context(serving(dns_fixture.HTTPSServer(certificate, key)))
         else:
             resolver = stack.enter_context(serving(dns_fixture.UDPServer()))
         ports["dns"] = resolver.server_address[1]
+        # The resolver gets a new ephemeral port after preliminary policy
+        # compilation. Reassign any previously free fixture port it claimed.
+        for field in port_fields:
+            if field != "dns" and ports[field] == ports["dns"]:
+                replacement = dns_fixture.free_dns_port()
+                while replacement in ports.values():
+                    replacement = dns_fixture.free_dns_port()
+                ports[field] = replacement
         canaries = [stack.enter_context(serving(TCPSink((BOUNDARY, ports["tcp"])))),
                     stack.enter_context(serving(UDPSink((BOUNDARY, ports["udp"])))),
                     stack.enter_context(serving(TCPSink((BOUNDARY, ports["dns"])))),
                     stack.enter_context(serving(UDPSink((BOUNDARY, ports["dns"]))))]
-        source, client, server, policy = build_configs(name, original, ports, certificate_text, str(certificate), str(key))
+        source, client, server, policy = build_configs(name, original, ports, certificate_text, str(certificate), str(key), ssh_host_key)
         write_private(directory / "managed-source.json", source)
         write_private(directory / "client.json", client)
         write_private(directory / "server.json", server)
-        core_check(binary, directory / "server.json", directory / "server.log", "core-check-server")
+        if name != "ssh":
+            core_check(binary, directory / "server.json", directory / "server.log", "core-check-server")
         core_check(binary, directory / "client.json", directory / "client.log", "core-check-client")
         if check_only:
-            return {"case": name, "status": "CONFIG_PASS", "runtime_tested": False}
+            return {"case": name, "status": "CONFIG_PASS", "runtime_tested": False,
+                    "core_checked": ["client"] if name == "ssh" else ["client", "server"],
+                    "server_fixture": "paramiko-3.5.1" if name == "ssh" else "sing-box-1.14.2"}
         try:
             relay = None
             if is_hopping_case(name):
                 relay = stack.enter_context(MultiportRelay([ports["hop" + str(index)] for index in range(8)], ports["proxy"]))
-            proxy = start_core(binary, directory / "server.json", directory / "server.log", "start-server")
+            cover = None
+            if name in {"shadowtls1", "shadowtls2", "shadowtls3"}:
+                cover = stack.enter_context(serving(TLSCoverServer(ports["cover"], certificate, key)))
+                canaries.append(stack.enter_context(serving(TCPSink((BOUNDARY, ports["proxy"])))))
+            if name == "ssh":
+                proxy = start_ssh_server(directory / "server.json", directory / "server.log")
+            else:
+                proxy = start_core(binary, directory / "server.json", directory / "server.log", "start-server")
             processes.append(proxy)
             client_process = start_core(binary, directory / "client.json", directory / "client.log", "start-client")
             processes.append(client_process)
@@ -554,6 +656,8 @@ def run_case(binary, name, original, directory, check_only=False):
             require(refreshed == "203.0.113.2" and resolver.query_count == 2, "dns-ttl-refetch")
             require(not resolver.errors, "dns-resolver-fixture")
             graph_forwarded = graph_evidence(name, (directory / "server.log").read_text(errors="replace"), ports)
+            if cover is not None:
+                require(cover.handshakes > 0, "shadowtls-cover-handshake-not-observed")
             if name == "urltest":
                 health_requests = [message for _, message in tcp_sink.seen if message.startswith((b"GET ", b"HEAD "))]
                 require(len(health_requests) >= 2, "urltest-all-candidate-health-requests")
@@ -578,6 +682,9 @@ def run_case(binary, name, original, directory, check_only=False):
                     "server_stop": ["existing-tcp-refused", "new-tcp-refused", "udp-refused", "uncached-dns-refused"],
                     "direct_canaries": "no-traffic", "host_firewall_tested": False,
                     "graph_forwarded": graph_forwarded,
+                    "server_fixture": "paramiko-3.5.1" if name == "ssh" else "sing-box-1.14.2",
+                    "core_checked": ["client"] if name == "ssh" else ["client", "server"],
+                    "cover_handshakes": cover.handshakes if cover is not None else 0,
                     "observed_hop_ports": observed_hop_ports,
                     "configured_outer_endpoints": policy["outer_endpoints"]}
         finally:
@@ -593,7 +700,7 @@ def main():
     parser.add_argument("--engine", help="Actual pinned worker executable; required except with --list")
     parser.add_argument("--config", type=Path, default=ROOT / "network.json")
     parser.add_argument("--case", action="append", choices=case_names() + list(EXPERIMENTAL_CASES),
-                        help="Repeat to select cases; defaults to the verified 41-case matrix. Experimental cases require explicit selection")
+                        help=f"Repeat to select cases; defaults to the verified {len(case_names())}-case matrix")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--check-only", action="store_true", help="Emit CONFIG_PASS only; never count configuration checks as runtime verification")
     parser.add_argument("--artifacts", type=Path, help="New root-private directory retaining fake fixture configs/logs; otherwise temporary files are removed")

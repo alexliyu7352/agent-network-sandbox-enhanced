@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = ROOT / "tests/ci-host.sh"
@@ -251,6 +252,316 @@ class HostBootstrapTests(unittest.TestCase):
             self.assertEqual(shell(HOST, 'ci_validate_results "$1"', td).returncode, 0)
             (Path(td) / "core/results.json").write_text(json.dumps([{"passed": False}]))
             self.assertNotEqual(shell(HOST, 'ci_validate_results "$1"', td).returncode, 0)
+
+
+class ProtocolCaseChecks(unittest.TestCase):
+    """Synthetic evidence exercises reporting; no real acceptance is claimed."""
+
+    @staticmethod
+    def completed_evidence(root, case="ssh"):
+        names = (
+            "two_session_credentials", "host_loopback", "public_https",
+            "all_dns_destinations_redirected", "ordinary_udp_capability",
+            "forced_physical_interface", "private_ipv6_privilege_denials",
+            "controlled_upstream_node_outage", "gateway_TUN_link_down",
+            "host_default_route_removed", "gateway_half_route_removed",
+            "failed_probe_no_payload", "extra_policy_rule_rejected",
+            "writable_policy_rejected", "gateway-kill", "packet_capture_evidence",
+            "shared_rules_unchanged",
+        )
+        rows = [{"name": name, "passed": True, "detail": {}} for name in names]
+        details = {row["name"]: row for row in rows}
+        details["two_session_credentials"]["detail"] = [
+            {"cgroup_mode": "v2", "socket_creation": {
+                "inodes": [101 + index * 2, 102 + index * 2],
+                "cgroup": "/devsession.slice/dev-session-" + str(index + 1) * 32 + ".service",
+                "created_inside_service": True,
+            }} for index in range(2)
+        ]
+        details["gateway-kill"]["detail"] = {
+            "namespace_changed": True, "check_exit": 125, "init_exit": 125,
+            "binding_and_guards_retained": True, "offline_rebind_required": True,
+            "existing_connection_blocked_during_fault": True,
+            "new_connection_blocked_during_fault": True,
+            "other_session_loopback_alive": True,
+        }
+        details["packet_capture_evidence"]["detail"] = {
+            "positive_control_packets": 2, "direct_workload_packets": 0,
+            "outer_packets": 12, "redirected_dns_packets": 8,
+            "plaintext_dns_on_outer": False,
+            "outer_endpoints": [{"address": "192.0.2.1", "protocol": "tcp",
+                                 "port_ranges": [[443, 443]], "packets": 12}],
+        }
+        for name in ("core", "exit-ip"):
+            (root / name).mkdir()
+        (root / "core/results.json").write_text(json.dumps(rows))
+        for name in ("physical-direct-probes", "gateway-outer", "redirected-dns"):
+            (root / "core" / (name + ".pcap")).write_bytes(b"synthetic packet evidence" * 2)
+        for name in ("session-A", "session-B"):
+            (root / "core" / (name + "-socket-cgroups.log")).write_text("synthetic ss evidence\n")
+        (root / "exit-ip/results.json").write_text(json.dumps({
+            "format": 1, "passed": True,
+            "exit_ip": {"valid_ipv4": True, "family": 4, "matches": True},
+            "checks": {name: True for name in (
+                "workload_identity", "workload_cgroup", "session_reclaimed", "postcheck",
+                "binding_retained", "fixture_bound_to_source", "owned_upstream_namespace")},
+        }))
+        (root / "fixture-verification.json").write_text(json.dumps({
+            "format": 1, "protocol_case": case, "passed": True,
+            "checks": {name: True for name in (
+                "source_unchanged", "recipe_unchanged", "namespace_owned",
+                "services_active", "helper_evidence")},
+        }))
+        stages = ["dependencies", "offline", "offline_helpers", "docker_backend"]
+        if case == "ssh":
+            stages.append("fixture_python")
+        stages += ["fixture_engine", "fixture_render", "fixture", "exit_ip", "core",
+                   "fixture_verify", "results", "fixture_cleanup"]
+        (root / "stages.jsonl").write_text("".join(
+            json.dumps({"name": name, "exit_code": 0}) + "\n" for name in stages
+        ))
+        return rows
+
+    def test_each_protocol_case_still_requires_a_disposable_host(self):
+        result = subprocess.run(
+            ["bash", str(HOST), "--protocol-case", "ssh"], capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin"}, timeout=10,
+        )
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn("disposable GitHub-hosted VM", result.stderr)
+        self.assertNotIn("CI_STAGE=", result.stdout)
+
+    def test_case_inventory_and_workflow_cover_all_default_and_opt_in_recipes(self):
+        inventory = subprocess.run(
+            ["python3", str(ROOT / "tests/protocol_runtime.py"), "--list"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        data = json.loads(inventory.stdout)
+        expected = set(data["cases"] + data["experimental_cases"])
+        workflow = (ROOT / ".github/workflows/host-acceptance.yml").read_text()
+        block = workflow.split("  protocol-case:", 1)[1].split("    steps:", 1)[0]
+        cases = re.findall(r"^          - ([a-z0-9-]+)$", block, re.MULTILINE)
+        self.assertEqual(len(cases), 47)
+        self.assertEqual(len(set(cases)), len(cases))
+        self.assertEqual(set(cases), expected)
+        for case in ("ssh", "shadowtls1", "shadowtls2", "shadowtls3", "hysteria-port-hopping", "unknown", "../ssh"):
+            with self.subTest(case=case):
+                result = shell(HOST, 'CI_ROOT=$1; ci_validate_protocol_case "$2"', ROOT, case)
+                self.assertEqual(result.returncode == 0, case in expected, result.stderr)
+
+    def test_only_the_verified_public_source_is_archived_and_never_overwritten(self):
+        for changed, linked, backup_present in ((False, False, False), (True, False, False),
+                                               (False, True, False), (False, False, True)):
+            with self.subTest(changed=changed, linked=linked, backup=backup_present), tempfile.TemporaryDirectory() as td:
+                base = Path(td)
+                checkout = base / "repo"
+                checkout.mkdir(mode=0o700)
+                subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+                source = checkout / "network.json"
+                source.write_text('{"public_fixture":true}\n')
+                subprocess.run(["git", "-C", str(checkout), "add", "network.json"], check=True)
+                subprocess.run(["git", "-C", str(checkout), "-c", "user.name=CI test", "-c",
+                                "user.email=ci@example.invalid", "commit", "-qm", "public fixture"], check=True)
+                revision = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+                # Reading a verified file can update atime on a normal host;
+                # that must not be mistaken for changing its contents/identity.
+                os.utime(source, ns=(0, source.stat().st_mtime_ns))
+                if changed:
+                    source.write_text('{"unexpected_source":true}\n')
+                if linked:
+                    original = checkout / "linked-source"
+                    source.rename(original)
+                    source.symlink_to(original)
+                backup = base / "public-network-example.json"
+                if backup_present:
+                    backup.write_text("do not overwrite\n")
+                result = shell(
+                    HOST, 'CI_ROOT=$1; CI_BASE=$2; CI_REVISION=$3; ci_archive_public_config',
+                    checkout, base, revision,
+                )
+                allowed = not (changed or linked or backup_present)
+                self.assertEqual(result.returncode == 0, allowed, result.stderr)
+                self.assertEqual(source.exists(), not allowed)
+                if allowed:
+                    self.assertEqual(backup.read_text(), '{"public_fixture":true}\n')
+                    self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+                elif backup_present:
+                    self.assertEqual(backup.read_text(), "do not overwrite\n")
+
+    def test_protocol_case_kills_last_without_running_lifecycle_or_rebinding(self):
+        for failed_stage in (None, "core", "fixture_verify"):
+            with self.subTest(failed_stage=failed_stage), tempfile.TemporaryDirectory() as td:
+                result = shell(
+                    HOST, 'CI_ROOT=$1; CI_EVIDENCE=$1; CI_ACCOUNT=ci-test; CI_PROTOCOL_CASE=ssh; '
+                          'CI_TEST_FAIL=$2; ci_stage() { printf "%s\\n" "$*" >>"$CI_EVIDENCE/calls"; '
+                          '[[ $1 != "$CI_TEST_FAIL" ]] || return 39; }; '
+                          'cmp() { printf "%s\\n" binding-retained >>"$CI_EVIDENCE/calls"; }; '
+                          'ci_protocol_suites', td, failed_stage or "",
+                )
+                self.assertEqual(result.returncode, 39 if failed_stage else 0, result.stderr)
+                calls = (Path(td) / "calls").read_text().splitlines()
+                self.assertTrue(calls[0].endswith("--namespace-fault gateway-kill"), calls)
+                expected = ["core"] if failed_stage == "core" else ["core", "fixture_verify"]
+                if failed_stage is None:
+                    expected += ["results", "binding-retained"]
+                    self.assertIn("protocol-case ssh", calls[2])
+                self.assertEqual([row.split()[0] for row in calls], expected)
+                self.assertNotIn("lifecycle", "\n".join(calls))
+
+    def test_generic_fixture_phases_keep_the_case_and_explicit_ssh_interpreter(self):
+        for case in ("http", "ssh"):
+            for phase in ("render", "setup", "verify"):
+                with self.subTest(case=case, phase=phase), tempfile.TemporaryDirectory() as td:
+                    interpreter = str(Path(td) / "ssh-venv/bin/python") if case == "ssh" else ""
+                    result = shell(
+                        HOST, 'CI_ROOT=$1/repo; CI_BASE=$1; CI_FIXTURE=$1/private-fixture; '
+                              'CI_PROTOCOL_CASE=$2; CI_FIXTURE_PYTHON=$3; '
+                              'python3() { printf "%s\\n" "$@" >"$CI_BASE/argv"; return 39; }; '
+                              'ci_protocol_fixture "$4"', td, case, interpreter, phase,
+                    )
+                    self.assertEqual(result.returncode, 39, result.stderr)
+                    argv = (Path(td) / "argv").read_text().splitlines()
+                    self.assertEqual(argv[:4], [str(Path(td) / "repo/tests/host_upstream_fixture.py"),
+                                               phase, "--protocol-case", case])
+                    if case == "ssh": self.assertEqual(argv[-2:], ["--python", interpreter])
+                    else: self.assertNotIn("--python", argv)
+
+    def test_failed_fixture_verification_never_exports_stale_helper_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fixture = root / "private-fixture"
+            fixture.mkdir()
+            for name in ("runtime-state.json", "fixture-verification.json"):
+                (fixture / name).write_text('{"passed":true}')
+            result = shell(
+                HOST, 'CI_EVIDENCE=$1; CI_FIXTURE=$1/private-fixture; '
+                      'ci_protocol_fixture() { return 39; }; ci_protocol_fixture_verify', root,
+            )
+            self.assertEqual(result.returncode, 39, result.stderr)
+            self.assertFalse((root / "runtime-state.json").exists())
+            self.assertFalse((root / "fixture-verification.json").exists())
+
+    def test_unpinned_python_is_rejected_before_executing_or_installing(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            python = root / "python"
+            python.write_text('#!/bin/sh\ntouch "${0%/*}/executed"\n')
+            python.chmod(0o700)
+            result = shell(
+                HOST, 'CI_BASE=$1; CI_PYTHON_BOOTSTRAP=$1/python; '
+                      'CI_FIXTURE_PYTHON=$1/ssh-venv/bin/python; ci_ssh_python', root,
+            )
+            self.assertEqual(result.returncode, 125, result.stderr)
+            self.assertFalse((root / "executed").exists())
+            self.assertFalse((root / "ssh-venv").exists())
+
+    def test_finish_preserves_core_or_fixture_cleanup_failure(self):
+        for status, cleanup in ((0, 0), (39, 0), (0, 23)):
+            with self.subTest(status=status, cleanup=cleanup), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                self.completed_evidence(root, "http")
+                stages = root / "stages.jsonl"
+                stages.write_text("".join(line + "\n" for line in stages.read_text().splitlines()
+                                          if json.loads(line)["name"] != "fixture_cleanup"))
+                (root / "logs").mkdir()
+                (root / "private-fixture").mkdir()
+                result = shell(
+                    HOST, 'CI_ROOT=$1; CI_EVIDENCE=$1; CI_FIXTURE=$1/private-fixture; '
+                          'CI_STAGE=""; CI_STAGE_STARTED=$SECONDS; CI_PROFILE=protocol-case; '
+                          'CI_PROTOCOL_CASE=http; CI_PROTOCOL=http; CI_SCENARIO=gateway-kill; '
+                          'CI_REPETITIONS=0; CI_REVISION=$4; CI_TEST_CLEANUP=$3; '
+                          'ci_snapshot() { :; }; python3() { '
+                          'if [[ $1 == "$CI_ROOT/tests/host_upstream_fixture.py" ]]; then '
+                          '[[ $2 == cleanup ]] || return 99; return "$CI_TEST_CLEANUP"; '
+                          'else command python3 "$@"; fi; }; ci_finish "$2"',
+                    root, status, cleanup, "a" * 40,
+                )
+                expected = status if cleanup == 0 else 1
+                self.assertEqual(result.returncode, expected, result.stderr)
+                manifest = json.loads((root / "manifest.json").read_text())
+                self.assertEqual(manifest["status"], "passed" if expected == 0 else "failed")
+                self.assertEqual(manifest["suites"]["lifecycle"]["status"], "not_requested")
+
+    def test_protocol_manifest_can_pass_only_complete_core_and_external_proofs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self.completed_evidence(root)
+            result = shell(HOST, 'ci_validate_results "$1" protocol-case ssh', root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = shell(
+                HOST, 'ci_write_manifest "$1" 0 ssh gateway-kill 0 "$2" protocol-case ssh',
+                root, "a" * 40,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads((root / "manifest.json").read_text())
+            self.assertEqual(data["status"], "passed")
+            self.assertEqual(data["acceptance_profile"], "protocol-case")
+            self.assertEqual(data["protocol_case"], "ssh")
+            self.assertEqual(data["suites"]["core"]["total"], 17)
+            self.assertEqual(data["suites"]["lifecycle"]["status"], "not_requested")
+            self.assertNotIn("passed", data["suites"]["lifecycle"])
+            self.assertEqual(data["proofs"]["socket_origin"], True)
+            self.assertEqual(data["proofs"]["packet_capture"], True)
+            self.assertEqual(data["proofs"]["exit_ip"], True)
+            self.assertEqual(data["proofs"]["fixture_verify"], True)
+
+    def test_protocol_evidence_omissions_and_false_claims_fail_closed(self):
+        mutations = (
+            "missing_core", "duplicate_core", "failed_core", "missing_exit_ip", "exit_mismatch",
+            "exit_check_missing", "missing_socket_birth", "same_socket_service", "missing_ss",
+            "capture_no_control", "capture_direct_packet", "missing_pcap", "missing_helper",
+            "wrong_helper_case", "helper_check_false", "kill_adopted_namespace", "missing_stage",
+            "failed_stage", "unexpected_lifecycle", "unknown_profile",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                rows = self.completed_evidence(root)
+                details = {row["name"]: row["detail"] for row in rows}
+                if mutation == "missing_core": rows.pop()
+                elif mutation == "duplicate_core": rows[-1] = rows[0]
+                elif mutation == "failed_core": rows[-1]["passed"] = False
+                elif mutation == "missing_socket_birth": details["two_session_credentials"][0]["socket_creation"] = None
+                elif mutation == "same_socket_service":
+                    details["two_session_credentials"][1]["socket_creation"]["cgroup"] = details["two_session_credentials"][0]["socket_creation"]["cgroup"]
+                elif mutation == "capture_no_control": details["packet_capture_evidence"]["positive_control_packets"] = 0
+                elif mutation == "capture_direct_packet": details["packet_capture_evidence"]["direct_workload_packets"] = 1
+                elif mutation == "kill_adopted_namespace": details["gateway-kill"]["init_exit"] = 0
+                (root / "core/results.json").write_text(json.dumps(rows))
+                if mutation == "missing_exit_ip": (root / "exit-ip/results.json").unlink()
+                if mutation in ("exit_mismatch", "exit_check_missing"):
+                    path = root / "exit-ip/results.json"
+                    value = json.loads(path.read_text())
+                    if mutation == "exit_mismatch": value["exit_ip"]["matches"] = False
+                    else: value["checks"].pop("fixture_bound_to_source")
+                    path.write_text(json.dumps(value))
+                if mutation == "missing_ss": (root / "core/session-A-socket-cgroups.log").unlink()
+                if mutation == "missing_pcap": (root / "core/gateway-outer.pcap").unlink()
+                if mutation == "missing_helper": (root / "fixture-verification.json").unlink()
+                if mutation in ("wrong_helper_case", "helper_check_false"):
+                    path = root / "fixture-verification.json"
+                    value = json.loads(path.read_text())
+                    if mutation == "wrong_helper_case": value["protocol_case"] = "http"
+                    else: value["checks"]["helper_evidence"] = False
+                    path.write_text(json.dumps(value))
+                if mutation in ("missing_stage", "failed_stage"):
+                    path = root / "stages.jsonl"
+                    stages = [json.loads(line) for line in path.read_text().splitlines()]
+                    if mutation == "missing_stage": stages = [stage for stage in stages if stage["name"] != "exit_ip"]
+                    else: stages[0]["exit_code"] = 23
+                    path.write_text("".join(json.dumps(stage) + "\n" for stage in stages))
+                if mutation == "unexpected_lifecycle":
+                    (root / "lifecycle").mkdir()
+                    (root / "lifecycle/results.json").write_text('[{"passed":true}]')
+                profile = "unknown" if mutation == "unknown_profile" else "protocol-case"
+                result = shell(HOST, 'ci_validate_results "$1" "$2" ssh', root, profile)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                result = shell(
+                    HOST, 'ci_write_manifest "$1" 0 ssh gateway-kill 0 "$2" "$3" ssh',
+                    root, "a" * 40, profile,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads((root / "manifest.json").read_text())["status"], "failed")
 
 
 class VMChecks(unittest.TestCase):
