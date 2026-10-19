@@ -1,0 +1,211 @@
+{
+  "format": 1,
+  "scope": "Frozen observed results for this run only. null means the suite or case-specific gate was not requested. An incomplete capture is not zero-direct acceptance.",
+  "run": {
+    "id": 39261938798,
+    "head_sha": "7bfe620948dc3c890e48ec8a093de03c349ae3af",
+    "run_attempt": 1,
+    "status": "completed",
+    "conclusion": "failure",
+    "created_at": "2026-10-19T13:38:55Z",
+    "updated_at": "2026-10-19T13:54:23Z",
+    "html_url": "https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39261938798"
+  },
+  "counts": {
+    "success": 54,
+    "failure": 1
+  },
+  "profiles": {
+    "representative": {
+      "success": 11,
+      "failure": 1
+    },
+    "protocol-case": {
+      "success": 43
+    }
+  },
+  "frozen_source_sha256": "369d0f90d3a46b21135d82fd0372785a841f37f071a21b036ed25319b745dc10",
+  "integrity": {
+    "artifacts": 55,
+    "all_api_zip_digest_size_and_origins_match": true,
+    "host_evidence_entries": 2754,
+    "vm_outer_evidence_entries": 144,
+    "all_evidence_hashes_match": true,
+    "all_revisions_match": true,
+    "all_hosts_pure_v2": true
+  },
+  "physical_captures": {
+    "canonical": 69,
+    "complete": 68,
+    "incomplete": 1,
+    "rejected_preflight_candidates": 0,
+    "signal_offset_scope": "Artifacts retain ordered complete USR1 and final SIGINT reports; separate signal byte offsets are enforced by the exact producer but not serialized."
+  },
+  "count_fields": {
+    "core": [
+      "passed",
+      "observed",
+      "expected"
+    ],
+    "lifecycle": [
+      "passed",
+      "observed",
+      "sessions"
+    ],
+    "offline": [
+      "passed",
+      "skipped",
+      "observed"
+    ],
+    "inline": [
+      "passed",
+      "observed"
+    ],
+    "captures": [
+      "complete",
+      "canonical"
+    ],
+    "ssh_fixture": [
+      "passed",
+      "observed"
+    ]
+  },
+  "gate_fields": {
+    "archive": "API ZIP digest, size, run and head",
+    "evidence": "Host and, where applicable, outer VM manifest entries",
+    "revision": "Host and outer VM revision",
+    "v2": "Observed pure unified cgroup hierarchy",
+    "core": "Every expected row passed in exact sequence",
+    "lifecycle": "Every row and 100-session stress passed; null for protocol jobs",
+    "exit_ip": "Owned fixture and workload IPv4 exit equality proof",
+    "socket": "Two managed services, four socket-origin inodes",
+    "pcap": "Complete physical controls and zero direct, authorized outer endpoints and redirected DNS",
+    "fixture": "Post-core protocol fixture proof; null for representative jobs",
+    "hopping": "One healthy TLS socket, at least 20 seconds and at least 2 declared window ports; null otherwise"
+  },
+  "failure": {
+    "stage": "core",
+    "check": "all_dns_destinations_redirected",
+    "duration_seconds": 4.081,
+    "error_type": "TimeoutError",
+    "source_file": "tests/host_acceptance.py",
+    "source_line": 1019,
+    "core_checks_passed_before_failure": 3,
+    "completed_dns_exchanges": 4,
+    "failed_dns_exchange_index": 5,
+    "failed_transport": "udp",
+    "failed_target_class": "public_resolver",
+    "request_order_evidence": "Exact harness source and serialized worker RESULT order, including the socket-release response.",
+    "core_fault_injection_started": false,
+    "fixture_passed": true,
+    "exit_ip_passed": true,
+    "lifecycle_checks_passed": 10,
+    "lifecycle_sessions": 100,
+    "core_physical_capture": {
+      "records": 1,
+      "start_present": true,
+      "end_present": false,
+      "preflight_captured": 1,
+      "preflight_received": 1,
+      "final_captured": 1,
+      "final_received": 1,
+      "kernel_dropped": 0,
+      "whole_capture_proof_passed": false
+    },
+    "lifecycle_wrapper_capture_proof_passed": true,
+    "root_cause": "not established by this artifact",
+    "whole_job_acceptance_passed": false,
+    "request_packet_bytes": 65,
+    "request_packet_matches_dnat_target": true,
+    "request_packet_fragmented": false,
+    "request_packet_truncated": false,
+    "dns_capture_scope": "Request side only; return-path delivery and loss location are not established."
+  },
+  "same_revision_vps": {
+    "source_summary_sha256": "b13767919cde8b4fde43cbae9ad9fb8e50e7a9b9efb35b1255a27c2aabc1a578",
+    "real_engine": true,
+    "private_ssh_venv": true,
+    "discover": {
+      "passed": 346,
+      "total": 346,
+      "skipped": 0
+    },
+    "inline": {
+      "passed": 25,
+      "total": 25
+    },
+    "public_examples": {
+      "passed": 23,
+      "total": 23
+    },
+    "production_files_and_container_unchanged": true,
+    "legacy_capture_format": {
+      "versions": [
+        "tcpdump version 4.9.3",
+        "libpcap version 1.9.1 (with TPACKET_V3)"
+      ],
+      "scope": "owned loopback collector; statistics format only",
+      "fresh_usr1_parsed": true,
+      "fresh_sigint_parsed": true,
+      "collector_exited_cleanly": true,
+      "versions_from_run_log": true
+    }
+  },
+  "jobs": [
+    {"job_id":118091562612,"name":"ubuntu-26.04 / hysteria2 / gateway-recreate","conclusion":"success","artifact_id":12191807563,"zip_bytes":78792,"zip_sha256":"ad196e056ff325d30b3acdb89c9f2d37e93f660c63ac7fb415a13bd2f1ca07b9","counts":{"core":[17,17,17],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091562972,"name":"ubuntu-26.04 / http / healthy","conclusion":"success","artifact_id":12190454139,"zip_bytes":65646,"zip_sha256":"2a8e6ee2f500ace3dd0a80339222eb191c163f84d6ca4f47a29cff2b9cdf201f","counts":{"core":[16,16,16],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091562994,"name":"debian-13-kvm / hysteria2 / healthy","conclusion":"success","artifact_id":12190229482,"zip_bytes":120836,"zip_sha256":"d82dbfb6093f5780257c087d8465ba6a9fabf70bf2aaa086b188bd2c359252e9","counts":{"core":[16,16,16],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563028,"name":"ubuntu-26.04 / hysteria2 / docker-restart","conclusion":"success","artifact_id":12191648202,"zip_bytes":81572,"zip_sha256":"490c8f03e06426b7d27f915ff07d17749f18c55771ba62a79031ae6c48b7ffdd","counts":{"core":[16,16,16],"lifecycle":[11,11,100],"offline":[343,3,346],"inline":[25,25],"captures":[3,3]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563154,"name":"ubuntu-26.04 / http / gateway-kill","conclusion":"success","artifact_id":12191518166,"zip_bytes":68686,"zip_sha256":"24282d9359470ef467a48c47ff273ee58540438e011c954e8c76188c13e6af71","counts":{"core":[17,17,17],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563168,"name":"ubuntu-26.04 / http / gateway-stop","conclusion":"success","artifact_id":12191937661,"zip_bytes":68602,"zip_sha256":"9f1c65e93bc23e091c4a4d47f23ea6eb971af92cfaa7bc38a5df0d2a7721e17d","counts":{"core":[17,17,17],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563296,"name":"ubuntu-26.04 / hysteria2 / healthy","conclusion":"success","artifact_id":12190049783,"zip_bytes":73967,"zip_sha256":"7fac6b890775c3afead3a8100d4c1af9950975b1fa2a7dbf6ac4112d3750c070","counts":{"core":[16,16,16],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563303,"name":"ubuntu-26.04 / hysteria2 / gateway-stop","conclusion":"success","artifact_id":12191483330,"zip_bytes":78698,"zip_sha256":"befae638a134b5f02a60cd85906847c852fe81629e3fd3de657082d74e896413","counts":{"core":[17,17,17],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563371,"name":"ubuntu-26.04 / hysteria2 / gateway-kill","conclusion":"failure","artifact_id":12190948369,"zip_bytes":54240,"zip_sha256":"80f6e655e9bf10713e234507d041c4312ad30d7c09e1e8c12b94b91e3b7b950b","counts":{"core":[3,4,17],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[1,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":false,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":false,"fixture":null,"hopping":null},"acceptance_verified":false},
+    {"job_id":118091563444,"name":"ubuntu-26.04 / http / docker-restart","conclusion":"success","artifact_id":12192640373,"zip_bytes":72327,"zip_sha256":"f1bbd3c422d1c57b5746a1bb547d8669f481d03ef547b13e75dfe8061c0cbf3a","counts":{"core":[16,16,16],"lifecycle":[11,11,100],"offline":[343,3,346],"inline":[25,25],"captures":[3,3]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563518,"name":"ubuntu-26.04 / http / gateway-recreate","conclusion":"success","artifact_id":12189939346,"zip_bytes":69092,"zip_sha256":"29d7ab188e4b71bc478472edba726d8cc70454ba72faa34423a2346266f4025d","counts":{"core":[17,17,17],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563524,"name":"ubuntu-26.04 / protocol-case / hysteria2 / gateway-kill","conclusion":"success","artifact_id":12192116097,"zip_bytes":65048,"zip_sha256":"7754267401815bf906dbeab6fd60357ce1062a97a78f4678205740a4f9449b22","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563574,"name":"ubuntu-26.04 / protocol-case / tuic-over-stream / gateway-kill","conclusion":"success","artifact_id":12192057983,"zip_bytes":60792,"zip_sha256":"f833b3069c73495ad82bb86e26e61228166a9d7c38ff07a7ba460e3e2e6684ee","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563576,"name":"debian-13-kvm / http / healthy","conclusion":"success","artifact_id":12191299155,"zip_bytes":113190,"zip_sha256":"9de7082b5a493ce6d4f34e9bd455bf16d0ab99922cfa7ba75734120579d076f9","counts":{"core":[16,16,16],"lifecycle":[10,10,100],"offline":[343,3,346],"inline":[25,25],"captures":[2,2]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":true,"exit_ip":true,"socket":true,"pcap":true,"fixture":null,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563634,"name":"ubuntu-26.04 / protocol-case / vless-ws / gateway-kill","conclusion":"success","artifact_id":12190408496,"zip_bytes":59332,"zip_sha256":"df7be0c20293f76deb26bd6c57cd8f098065fca3eebc792e730d529a1a72437e","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563661,"name":"ubuntu-26.04 / protocol-case / trojan / gateway-kill","conclusion":"success","artifact_id":12191397749,"zip_bytes":66220,"zip_sha256":"3806a7d834205e45d226939f715a9c34196a8fa71c86d70198d39221ecc25327","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563681,"name":"ubuntu-26.04 / protocol-case / detour / gateway-kill","conclusion":"success","artifact_id":12191088038,"zip_bytes":73152,"zip_sha256":"9dc6864b14dd64c627006a634cecbf05975b6d47dac6b30fd140cd9adb7a4c9d","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563682,"name":"ubuntu-26.04 / protocol-case / hysteria2-port-hopping / gateway-kill","conclusion":"success","artifact_id":12192116014,"zip_bytes":69095,"zip_sha256":"e9152b25cc31d02866e3c0e1c4c9385ffffc5d8611eeff4ef872603dc3613d0e","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":true},"acceptance_verified":true,"healthy_hopping":{"connections":1,"exchanges":12,"window_seconds":20.151153069999992,"observed_declared_ports":2}},
+    {"job_id":118091563686,"name":"ubuntu-26.04 / protocol-case / selector-trojan / gateway-kill","conclusion":"success","artifact_id":12190158839,"zip_bytes":66103,"zip_sha256":"c70f416bc98e9b00b0aa39264ac9d88cfa46d93d5db0f0bb00afb990f6d41ee9","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563712,"name":"ubuntu-26.04 / protocol-case / vmess-http / gateway-kill","conclusion":"success","artifact_id":12190853431,"zip_bytes":59764,"zip_sha256":"72112623a41da78ed02083b454a833e2d8dcf528d31990fb0227bdad8192508c","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563717,"name":"ubuntu-26.04 / protocol-case / trojan-http / gateway-kill","conclusion":"success","artifact_id":12191602877,"zip_bytes":60252,"zip_sha256":"d5207a051dcd20e71922b8b67fc83d0b02e8be44d2f0b4d87ac10308ec5023c2","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563723,"name":"ubuntu-26.04 / protocol-case / http / gateway-kill","conclusion":"success","artifact_id":12190922852,"zip_bytes":54749,"zip_sha256":"bb9a9c26bef04af0a8a85d16efdd5ffb25bf7a77ea3f74e1deb76493f9efe628","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563733,"name":"ubuntu-26.04 / protocol-case / hysteria / gateway-kill","conclusion":"success","artifact_id":12191838616,"zip_bytes":60567,"zip_sha256":"7112d3e4ea52ee052521e98ea31f5843703fb407ce8516ed0661e8c32b8550d2","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563752,"name":"ubuntu-26.04 / protocol-case / vless-http / gateway-kill","conclusion":"success","artifact_id":12189924065,"zip_bytes":53773,"zip_sha256":"28f6f4d17ab7e46d49716543d0a4e1b8d8a508c88cb91f527b21f90c7629c554","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563757,"name":"ubuntu-26.04 / protocol-case / tuic / gateway-kill","conclusion":"success","artifact_id":12191768092,"zip_bytes":60725,"zip_sha256":"d79f51ffccc74accb211aea6aea31bf0fe44890a05e28993481dc3bc09c22e76","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563760,"name":"ubuntu-26.04 / protocol-case / naive-uot / gateway-kill","conclusion":"success","artifact_id":12190862817,"zip_bytes":65294,"zip_sha256":"d8f63214c3427f5a714477b80ccef7ca9f5fa7a7e8263f3e09b8c14095e3d738","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563762,"name":"ubuntu-26.04 / protocol-case / trojan-quic / gateway-kill","conclusion":"success","artifact_id":12190963656,"zip_bytes":61411,"zip_sha256":"55502b70c611573e375c7672f16838836d4bd43bb8f72ed84dd9a62ed3bb5596","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563765,"name":"ubuntu-26.04 / protocol-case / vless-quic / gateway-kill","conclusion":"success","artifact_id":12191613381,"zip_bytes":61050,"zip_sha256":"051168bc3d118ec88609a342319c4966a75c7ab699ff371c12cc430957f24e83","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563770,"name":"ubuntu-26.04 / protocol-case / shadowsocks / gateway-kill","conclusion":"success","artifact_id":12191028553,"zip_bytes":58700,"zip_sha256":"e83015e2ce9abb526ffe1e7d08e6c0e04f8ed359da539133223f5f92d0be194c","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563803,"name":"ubuntu-26.04 / protocol-case / shadowsocks-uot / gateway-kill","conclusion":"success","artifact_id":12190979586,"zip_bytes":59217,"zip_sha256":"f293e7be6b2e9e92340066242a71c9c54dc67599a1535dfc815364a5152f29c0","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563831,"name":"ubuntu-26.04 / protocol-case / vless / gateway-kill","conclusion":"success","artifact_id":12191058665,"zip_bytes":53337,"zip_sha256":"12a316af291584228696b6bb4dd8abd89fc060bd711054ccf44f36d376f02304","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563843,"name":"ubuntu-26.04 / protocol-case / ssh / gateway-kill","conclusion":"success","artifact_id":12192057672,"zip_bytes":73256,"zip_sha256":"0e5fb9ef5f9e7f5c872933f6eb9bfb4af116f56e8f1fb916d4761013509a6cd2","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1],"ssh_fixture":[20,20]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563862,"name":"ubuntu-26.04 / protocol-case / vmess / gateway-kill","conclusion":"success","artifact_id":12191174265,"zip_bytes":59442,"zip_sha256":"f433ce330e93c49c4fe89d50092947a7c14df8ad7ad35097ce781a5e885b96f7","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563863,"name":"ubuntu-26.04 / protocol-case / shadowtls2 / gateway-kill","conclusion":"success","artifact_id":12190049992,"zip_bytes":66559,"zip_sha256":"1415209d661fcfa47a62b0e7f29cc131ca567f61223e38bc9af1fa3bbad130bc","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563873,"name":"ubuntu-26.04 / protocol-case / naive-quic / gateway-kill","conclusion":"success","artifact_id":12191518317,"zip_bytes":71691,"zip_sha256":"05b5dfbb788dec30415e792230c7da25eb08d7ad4db0b6f7a19e2ae82bfac787","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563895,"name":"ubuntu-26.04 / protocol-case / selector-hysteria2 / gateway-kill","conclusion":"success","artifact_id":12192260307,"zip_bytes":65163,"zip_sha256":"3e43a648fd400fbc362947020ddad492cead49865c4e9bf26b5f7d5aefbe5afa","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563921,"name":"ubuntu-26.04 / protocol-case / shadowtls1 / gateway-kill","conclusion":"success","artifact_id":12191214016,"zip_bytes":66253,"zip_sha256":"59fcc17e9fdadb219aac75b7b2b15d3e1c2ff7e7b80262f50cb82be1ab1874ef","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563922,"name":"ubuntu-26.04 / protocol-case / hysteria-port-hopping / gateway-kill","conclusion":"success","artifact_id":12191944074,"zip_bytes":64672,"zip_sha256":"7ffdadfa35cdb29f1001226396af63c5288ea41bd388a139ff4f50b57f2d18d5","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":true},"acceptance_verified":true,"healthy_hopping":{"connections":1,"exchanges":12,"window_seconds":20.315188929999977,"observed_declared_ports":3}},
+    {"job_id":118091563924,"name":"ubuntu-26.04 / protocol-case / shadowsocks-mux / gateway-kill","conclusion":"success","artifact_id":12190958692,"zip_bytes":62177,"zip_sha256":"fe738627389e5fd5279d24f91d53d7a7790cf985dc5051a48d6ba731d425dee7","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563930,"name":"ubuntu-26.04 / protocol-case / urltest / gateway-kill","conclusion":"success","artifact_id":12190424575,"zip_bytes":74164,"zip_sha256":"d4056deac484bf6487d0e5780b6daeb48163bfdc014306dd011c51920eb63cdb","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563939,"name":"ubuntu-26.04 / protocol-case / snell6 / gateway-kill","conclusion":"success","artifact_id":12192022845,"zip_bytes":65626,"zip_sha256":"3b9ad8b51a621ec2d94569c898729ad729e338660379195033bddb799efe1c79","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563945,"name":"ubuntu-26.04 / protocol-case / https / gateway-kill","conclusion":"success","artifact_id":12191588254,"zip_bytes":67347,"zip_sha256":"0bc174c2c10211b8f093594c884aad2631335d8ee2a44602de889a4e13111630","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563951,"name":"ubuntu-26.04 / protocol-case / socks5-tcp / gateway-kill","conclusion":"success","artifact_id":12190254469,"zip_bytes":54948,"zip_sha256":"c2f08b360a1930c5936b0b330f1180406014dbf8ca5a725802f96afbd5f9bfc5","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091563954,"name":"ubuntu-26.04 / protocol-case / vless-grpc / gateway-kill","conclusion":"success","artifact_id":12191563958,"zip_bytes":53760,"zip_sha256":"f91215d252530c435dcc004b5554a61708913693daf9b019959fe65238b57531","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564011,"name":"ubuntu-26.04 / protocol-case / trojan-ws / gateway-kill","conclusion":"success","artifact_id":12191114305,"zip_bytes":72486,"zip_sha256":"c14c2650a94dfaf5049175b147ddbd0ccc7bfec2c85a9e6c4d87921c1e7d5cd3","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564029,"name":"ubuntu-26.04 / protocol-case / naive / gateway-kill","conclusion":"success","artifact_id":12191388726,"zip_bytes":65520,"zip_sha256":"2229d89e59474a6a638b3b324f3fab267d6abfa857e2c088234ccb4ed60ee97e","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564032,"name":"ubuntu-26.04 / protocol-case / vmess-ws / gateway-kill","conclusion":"success","artifact_id":12191668496,"zip_bytes":61934,"zip_sha256":"5793d8d84d72e72b169e0bc6a522cc6d4f5fd7b9f191cf4fae1a0abba4fc8260","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564046,"name":"ubuntu-26.04 / protocol-case / socks4a-tcp / gateway-kill","conclusion":"success","artifact_id":12192820800,"zip_bytes":54573,"zip_sha256":"ab7518c2248deafe342ab21679fd41e28e23510878e304113ab9eca7835f8c8e","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564155,"name":"ubuntu-26.04 / protocol-case / vmess-quic / gateway-kill","conclusion":"success","artifact_id":12191434453,"zip_bytes":62780,"zip_sha256":"c09d7c609f5741d545cf9ec7bb988dfecb10c683c13d14232614600218f60718","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564157,"name":"ubuntu-26.04 / protocol-case / shadowtls3 / gateway-kill","conclusion":"success","artifact_id":12192425074,"zip_bytes":68908,"zip_sha256":"8e7b086e2402307a2a233fd2825ac33b658be06e816972b00c877c6154588b28","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564195,"name":"ubuntu-26.04 / protocol-case / vmess-grpc / gateway-kill","conclusion":"success","artifact_id":12192475327,"zip_bytes":58894,"zip_sha256":"d8c807de5f5ab4bebe685b8ab56130672577900d2dd794466263ac60060efa30","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564218,"name":"ubuntu-26.04 / protocol-case / snell4 / gateway-kill","conclusion":"success","artifact_id":12191454206,"zip_bytes":65694,"zip_sha256":"22b07c940412be467f88e471aea221af69486c5959e8bbea9d09a0893f818590","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564281,"name":"ubuntu-26.04 / protocol-case / socks4-tcp / gateway-kill","conclusion":"success","artifact_id":12192710182,"zip_bytes":54443,"zip_sha256":"4d48062afaa16501fda89851fecff2107cc0d03be8af96eb140c6e25c370d2f4","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564331,"name":"ubuntu-26.04 / protocol-case / trojan-grpc / gateway-kill","conclusion":"success","artifact_id":12192755084,"zip_bytes":60295,"zip_sha256":"213bae0bf2380695525ce927c8459231dd8fd2f3999edd867ecb02ba52851aa9","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true},
+    {"job_id":118091564501,"name":"ubuntu-26.04 / protocol-case / socks5-uot / gateway-kill","conclusion":"success","artifact_id":12192345412,"zip_bytes":54570,"zip_sha256":"0ae89b1158fb2b61aec25ef7a36d596799dd716b16175757bed4705e0f111373","counts":{"core":[17,17,17],"lifecycle":null,"offline":[343,3,346],"inline":[25,25],"captures":[1,1]},"gates":{"archive":true,"evidence":true,"revision":true,"v2":true,"core":true,"lifecycle":null,"exit_ip":true,"socket":true,"pcap":true,"fixture":true,"hopping":null},"acceptance_verified":true}
+  ]
+}

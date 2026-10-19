@@ -20,12 +20,14 @@ import socket
 import subprocess
 import tempfile
 import time
+from host_acceptance import Binding, INSTALL_ROOT, RUNTIME
 
 
 INFO = """import json,os,pathlib
 s=dict(line.split(':',1) for line in pathlib.Path('/proc/self/status').read_text().splitlines() if ':' in line)
 print('CLI_RESULT '+json.dumps({'uid':os.getuid(),'groups':os.getgroups(),
  'cwd':os.getcwd(),'home':os.environ['HOME'],'user':os.environ['USER'],
+ 'cgroup':pathlib.Path('/proc/self/cgroup').read_text(),
  'caps':{k:s[k].strip() for k in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb')},
  'nnp':s['NoNewPrivs'].strip(),'seccomp':s['Seccomp'].strip()}),flush=True)
 """
@@ -39,8 +41,13 @@ class Acceptance:
         assert self.caller.pw_uid != self.target.pw_uid
         self.output = Path(args.output)
         self.output.mkdir(parents=True, mode=0o700, exist_ok=True)
+        assert not self.output.is_symlink() and self.output.stat().st_uid==0 and self.output.stat().st_mode&0o077==0,'output must be root private'
         self.records, self.sids, self.projects = [], set(), []
-        self.command = ['/usr/bin/sudo', '-n', '/usr/local/bin/session']
+        self.launcher=str(Path(args.launcher))
+        assert os.path.isabs(args.launcher),'launcher must be absolute'
+        self.command = ['/usr/bin/sudo', '-n', self.launcher]
+        self.binding=Binding.load()
+        (self.output/'binding.json').write_text(json.dumps(self.binding.data,indent=2)+'\n')
 
     def drop_caller(self):
         os.setgroups([])
@@ -99,6 +106,10 @@ class Acceptance:
         assert all(int(info['caps'][k],16) == 0
                    for k in ('CapInh','CapPrm','CapEff','CapAmb')), info
         assert info['nnp'] == '1' and info['seccomp'] == '2', info
+        sids=set(re.findall(r'Session ([0-9a-f]{32});',output))
+        assert len(sids)==1,'missing unique session identity'
+        self.binding.verify_membership(info['cgroup'],next(iter(sids)))
+        self.binding.verify_parent()
         return info
 
     def record(self, name, fn):
@@ -121,7 +132,7 @@ class Acceptance:
     def success(self, name, args, cwd, account, expected_cwd=None):
         p = self.run(name, args+['--','/usr/bin/python3','-c',INFO], cwd)
         assert p.returncode == 0, p.stdout+p.stderr
-        return self.verify(p.stdout, account, expected_cwd or cwd)
+        return self.verify(p.stdout+p.stderr, account, expected_cwd or cwd)
 
     def terminal(self, cwd):
         child, fd = pty.fork()
@@ -198,8 +209,8 @@ class Acceptance:
 
         def private_install():
             p = self.run('private_install', ['-u',self.target.pw_name,'--','/usr/bin/python3','-c',
-                "import os; assert not os.access('/opt/session/network.json',os.R_OK); "
-                "assert not os.access('/opt/session',os.X_OK); print('PRIVATE_INSTALL_OK')"], shared)
+                "import os; assert not os.access({!r},os.R_OK); assert not os.access({!r},os.X_OK); print('PRIVATE_INSTALL_OK')".format(
+                    str(INSTALL_ROOT/'network.json'),str(INSTALL_ROOT))], shared)
             assert p.returncode == 0 and 'PRIVATE_INSTALL_OK' in p.stdout, p.stdout+p.stderr
             return {'target_cannot_read_configuration':True}
         self.record('configuration_private_to_root', private_install)
@@ -221,13 +232,13 @@ class Acceptance:
         errors=[]
         for sid in self.sids:
             try:
-                subprocess.run(['/usr/local/bin/session','close',sid], stdin=subprocess.DEVNULL,
+                subprocess.run([self.launcher,'close',sid], stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=25)
-                assert not (Path('/run/dev-session-v8/requests')/sid).exists(),sid
-                assert not (Path('/sys/fs/cgroup/net_cls,net_prio/dev-session-v8')/sid).exists(),sid
-                active = subprocess.run(['systemctl','is-active','dev-session-'+sid+'.service'],
+                assert not (RUNTIME/'requests'/sid).exists(),sid
+                assert not self.binding.session_path(sid).exists(),sid
+                active = subprocess.run(['systemctl','show','--property=LoadState','--value','dev-session-'+sid+'.service'],
                                         capture_output=True,text=True,timeout=10)
-                assert active.returncode != 0,sid
+                assert active.stdout.strip()=='not-found',sid
             except Exception as error:
                 errors.append(sid+': '+repr(error))
         for project in self.projects:
@@ -235,6 +246,8 @@ class Acceptance:
                 shutil.rmtree(project)
             except Exception as error:
                 errors.append(str(project)+': '+repr(error))
+        try:self.binding.verify_parent()
+        except Exception as error:errors.append('retained binding: '+repr(error))
         assert not errors,'Cleanup incomplete: '+ '; '.join(errors)
 
 
@@ -243,6 +256,7 @@ def main():
     parser.add_argument('--caller', default='ubuntu')
     parser.add_argument('--target', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--launcher',default='/usr/local/bin/session',help='absolute public launcher used through sudo')
     args = parser.parse_args()
     assert os.geteuid() == 0, 'root required on a disposable test host'
     os.umask(0o077)

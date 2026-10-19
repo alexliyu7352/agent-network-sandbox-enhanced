@@ -2,6 +2,7 @@
 """Root-only capability acceptance on an installed, working VPS fixture."""
 import argparse, errno, json, os, platform, pwd, re, shutil, stat, subprocess, tempfile
 from pathlib import Path
+from host_acceptance import Binding, RUNTIME
 
 INSTALL_ROOT = Path(__file__).resolve().parents[1]
 DEV = str(INSTALL_ROOT / 'dev-session')
@@ -28,6 +29,7 @@ try:
 except OSError as e:
     raw_errno = e.errno
 print('CAPABILITIES ' + json.dumps({'status': own, 'capprobe': child, 'raw_errno': raw_errno,
+      'cgroup':open('/proc/self/cgroup').read(),
       'ping': command(['/bin/ping', '-V']), 'sysctl': command(['sysctl', '-n', 'kernel.ostype'])}, sort_keys=True))
 '''
 
@@ -52,9 +54,11 @@ def main():
         parser.error('must run as root')
     os.umask(0o077)
     output, temporary, probe, stderr, launched, timed_out = Path(args.output), None, None, '', False, False
+    binding=None
     output_ready = False
     names = ('fixture', 'zero_bounding_exec_eperm', 'launcher', 'credentials', 'capprobe_exec',
-             'capprobe_credentials', 'raw_socket_eperm', 'ping_version', 'sysctl_linux', 'session_cleanup', 'fixture_cleanup')
+             'capprobe_credentials', 'cgroup_membership', 'binding_retained', 'raw_socket_eperm',
+             'ping_version', 'sysctl_linux', 'session_cleanup', 'fixture_cleanup')
     result = {'passed': False, 'checks': dict.fromkeys(names, False), 'metadata': {}, 'errors': []}
     checks = result['checks']
     try:
@@ -62,6 +66,8 @@ def main():
         if output.is_symlink() or output.stat().st_uid != 0 or output.stat().st_mode & 0o077:
             raise RuntimeError('output must be a root-private directory')
         output_ready = True
+        binding=Binding.load()
+        result['binding']=binding.data
         account = pwd.getpwnam(args.user)
         if account.pw_uid == 0:
             raise RuntimeError('target user must be nonroot')
@@ -108,6 +114,10 @@ def main():
         rows = [line[13:] for line in p.stdout.splitlines() if line.startswith('CAPABILITIES ')]
         if len(rows) != 1: raise RuntimeError('launcher did not return exactly one payload result')
         info = result['payload'] = json.loads(rows[0])
+        sids=set(re.findall(r'^Session ([0-9a-f]{32});',stderr,re.M))
+        assert len(sids)==1,'missing unique session identity'
+        binding.verify_membership(info['cgroup'],next(iter(sids)))
+        checks['cgroup_membership']=True
         bounding = info['status'].get('CapBnd', '')
         def restricted(s):
             return (s.get('Uid', '').split() == [str(account.pw_uid)] * 4 and s.get('CapBnd') == bounding
@@ -126,7 +136,8 @@ def main():
             sids = set(re.findall(r'^Session ([0-9a-f]{32});', stderr, re.M))
             if len(sids) == 1:
                 sid = sids.pop(); result['session_id'] = sid
-                paths = [Path('/sys/fs/cgroup/net_cls,net_prio/dev-session-v8') / sid, Path('/run/dev-session-v8/requests') / sid]
+                assert binding is not None,'binding was not validated before launch'
+                paths = [binding.session_path(sid), RUNTIME/'requests'/sid]
                 show = ['systemctl', 'show', '--property=LoadState', '--value', 'dev-session-' + sid + '.service']
                 state = command(show).stdout.strip()
                 if timed_out or any(p.exists() for p in paths) or state != 'not-found':
@@ -134,6 +145,8 @@ def main():
                     state = command(show).stdout.strip()
                 checks['session_cleanup'] = not any(p.exists() for p in paths) and state == 'not-found'
             else: checks['session_cleanup'] = not launched
+            if binding is not None:
+                binding.verify_parent();checks['binding_retained']=True
         except Exception as e: result['errors'].append('session cleanup: ' + str(e))
         try:
             try:

@@ -7,11 +7,14 @@ is not part of the runtime launcher or gateway. No global firewall flushes.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import errno
 import fcntl
+import hashlib
 import http.client
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -21,16 +24,20 @@ import select
 import signal
 import socket
 import socketserver
+import stat
 import struct
 import subprocess
 import termios
 import threading
 import time
+import tempfile
+from types import SimpleNamespace
 import uuid
+import unittest
+from unittest import mock
 
 INSTALL_ROOT = Path(__file__).resolve().parents[1]
 DEV = str(INSTALL_ROOT / 'dev-session')
-CGROOT = Path('/sys/fs/cgroup/net_cls,net_prio/dev-session-v8')
 RUNTIME = Path('/run/dev-session-v8')
 WORKER = r'''
 import json, os, sys
@@ -50,11 +57,228 @@ for line in sys.stdin:
     print('RESULT ' + json.dumps(response), flush=True)
 '''
 INFO = '''
-import os
+import os, socket
+before=open('/proc/self/cgroup').read()
+probes=[]
+for kind in (socket.SOCK_STREAM,socket.SOCK_DGRAM):
+    sock=socket.socket(socket.AF_INET,kind);probes.append(sock)
+    sock.bind(('127.0.0.1',0))
+    if kind==socket.SOCK_STREAM:sock.listen(1)
+state['membership_sockets']=probes
 result={'uid':os.getuid(),'gid':os.getgid(),'groups':os.getgroups(),
         'status':open('/proc/self/status').read(),
         'cgroup':open('/proc/self/cgroup').read(),
+        'cgroup_before_sockets':before,'pid':os.getpid(),
+        'socket_inodes':[int(os.readlink('/proc/self/fd/'+str(s.fileno()))[8:-1]) for s in probes],
         'proxy_env':[k for k in os.environ if k.lower().endswith('_proxy')]}
+'''
+
+DNS_ERRORS = frozenset(('socket_error', 'connect_error', 'send_error', 'receive_error',
+    'receive_timeout', 'deadline_exceeded', 'identity_changed', 'invalid_query',
+    'invalid_header', 'invalid_tid', 'invalid_question', 'truncated_response',
+    'invalid_rcode', 'invalid_name', 'invalid_rr', 'trailing_data', 'tcp_eof',
+    'internal_error', 'worker_rpc_failed', 'worker_execution_failed', 'invalid_worker_report'))
+
+# This code runs inside the ordinary managed workload, not in the root harness.
+# The caller supplies one immutable message and returns the complete report even
+# on failure. Only a first UDP receive timeout can start one retransmission.
+DNS_PROBE = r'''
+import hashlib, socket, struct, time
+
+class DNSFailure(Exception):
+    pass
+
+def dns_name(data, offset):
+    labels, visited, end, size = [], set(), None, 1
+    while True:
+        if offset >= len(data) or offset in visited:
+            raise DNSFailure('invalid_name')
+        visited.add(offset)
+        length = data[offset]
+        if length & 0xc0 == 0xc0:
+            if offset + 2 > len(data):
+                raise DNSFailure('invalid_name')
+            pointer = ((length & 0x3f) << 8) | data[offset + 1]
+            if pointer < 12 or pointer >= offset:
+                raise DNSFailure('invalid_name')
+            if end is None:
+                end = offset + 2
+            offset = pointer
+            continue
+        if length & 0xc0:
+            raise DNSFailure('invalid_name')
+        offset += 1
+        if not length:
+            return tuple(labels), offset if end is None else end
+        if offset + length > len(data):
+            raise DNSFailure('invalid_name')
+        size += length + 1
+        if size > 255:
+            raise DNSFailure('invalid_name')
+        labels.append(data[offset:offset + length].lower())
+        offset += length
+
+def dns_response(data):
+    if len(data) < 12:
+        raise DNSFailure('invalid_header')
+    tid, flags, qd, an, ns, ar = struct.unpack('!6H', data[:12])
+    if not flags & 0x8000 or flags & 0x7840 or qd != 1:
+        raise DNSFailure('invalid_header')
+    if tid != 0x4d38:
+        raise DNSFailure('invalid_tid')
+    if flags & 0x0200:
+        raise DNSFailure('truncated_response')
+    if flags & 15 not in (0, 3):
+        raise DNSFailure('invalid_rcode')
+    wanted, wanted_end = dns_name(message, 12)
+    actual, offset = dns_name(data, 12)
+    if offset + 4 > len(data) or actual != wanted or data[offset:offset + 4] != message[wanted_end:wanted_end + 4]:
+        raise DNSFailure('invalid_question')
+    offset += 4
+    for unused in range(an + ns + ar):
+        owner, offset = dns_name(data, offset)
+        if offset + 10 > len(data):
+            raise DNSFailure('invalid_rr')
+        kind, klass, ttl, length = struct.unpack('!HHIH', data[offset:offset + 10])
+        begin, end = offset + 10, offset + 10 + length
+        if kind == 0 or end > len(data):
+            raise DNSFailure('invalid_rr')
+        if (kind == 1 and length != 4) or (kind == 28 and length != 16):
+            raise DNSFailure('invalid_rr')
+        if kind in (2, 5, 12, 39, 6, 15, 33):
+            position = begin + (2 if kind == 15 else 6 if kind == 33 else 0)
+            if position >= end:
+                raise DNSFailure('invalid_rr')
+            unused, position = dns_name(data, position)
+            if kind == 6:
+                unused, position = dns_name(data, position)
+                position += 20
+            if position != end:
+                raise DNSFailure('invalid_rr')
+        if kind in (16, 41):
+            position = begin
+            if kind == 41 and (owner or ttl >> 24):
+                raise DNSFailure('invalid_rr' if owner else 'invalid_rcode')
+            while position < end:
+                if kind == 16:
+                    position += 1 + data[position]
+                else:
+                    if position + 4 > end:
+                        raise DNSFailure('invalid_rr')
+                    position += 4 + struct.unpack('!H', data[position + 2:position + 4])[0]
+                if position > end:
+                    raise DNSFailure('invalid_rr')
+        offset = end
+    if offset != len(data):
+        raise DNSFailure('trailing_data')
+    return {'rcode': flags & 15, 'answers': an}
+
+started = time.monotonic()
+deadline = started + (4.0 if tcp else 10.0)
+phase = 'socket'
+attempt = {'number': 1, 'sent': False, 'outcome': 'error', 'elapsed_seconds': 0.0, 'error': None}
+report['attempts'].append(attempt)
+
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM) as sock:
+        original_socket, original_fd = sock, sock.fileno()
+
+        def before(until):
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise DNSFailure('deadline_exceeded')
+            sock.settimeout(remaining)
+
+        phase = 'connect'
+        before(deadline)
+        sock.connect((address, 53))
+        peer, local = sock.getpeername(), sock.getsockname()
+        report['checks'].update(same_socket=True, same_peer=True, same_source_port=True, same_query=True)
+
+        def identity():
+            checks = report['checks']
+            try:
+                checks['same_socket'] &= sock is original_socket and sock.fileno() == original_fd
+                checks['same_peer'] &= sock.getpeername() == peer == (address, 53)
+                checks['same_source_port'] &= sock.getsockname() == local and local[1] > 0
+                checks['same_query'] &= hashlib.sha256(message).hexdigest() == report['query_sha256']
+            except Exception:
+                raise DNSFailure('identity_changed')
+            if not all(checks[key] for key in ('same_socket', 'same_peer', 'same_source_port', 'same_query')):
+                raise DNSFailure('identity_changed')
+
+        def receive(length, until):
+            before(until)
+            data = sock.recv(length)
+            if time.monotonic() >= until:
+                raise DNSFailure('deadline_exceeded')
+            return data
+
+        def exact(length):
+            data = b''
+            while len(data) < length:
+                part = receive(length - len(data), deadline)
+                if not part:
+                    raise DNSFailure('tcp_eof')
+                data += part
+            return data
+
+        for number in range(1, 2 if tcp else 3):
+            if number == 2:
+                attempt = {'number': 2, 'sent': False, 'outcome': 'error', 'elapsed_seconds': 0.0, 'error': None}
+                report['attempts'].append(attempt)
+            identity()
+            phase = 'send'
+            before(deadline)
+            if tcp:
+                sock.sendall(struct.pack('!H', len(message)) + message)
+            elif sock.send(message) != len(message):
+                raise DNSFailure('send_error')
+            attempt['sent'] = True
+            report['transmissions'] += 1
+            phase = 'receive'
+            receiving = time.monotonic()
+            receive_deadline = deadline if tcp else min(deadline, receiving + 5.0)
+            try:
+                try:
+                    if tcp:
+                        length = struct.unpack('!H', exact(2))[0]
+                        if length < 12:
+                            raise DNSFailure('invalid_header')
+                        data = exact(length)
+                    else:
+                        data = receive(65535, receive_deadline)
+                finally:
+                    # Elapsed receive-window time; never label this as the RTT
+                    # of a particular transmission after retransmission.
+                    attempt['elapsed_seconds'] = time.monotonic() - receiving
+            except socket.timeout:
+                attempt.update(outcome='timeout', error='receive_timeout')
+                identity()
+                now = time.monotonic()
+                if not tcp and number == 1 and now >= receive_deadline and now < deadline:
+                    continue
+                raise DNSFailure('receive_timeout')
+            identity()
+            response = dns_response(data)
+            if time.monotonic() >= deadline:
+                raise DNSFailure('deadline_exceeded')
+            report['checks']['reply_validated'] = True
+            report.update(ok=True, response=response)
+            attempt.update(outcome='response', error=None)
+            break
+except Exception as error:
+    if isinstance(error, DNSFailure):
+        code = str(error)
+    elif isinstance(error, OSError):
+        code = phase + '_error'
+    else:
+        code = 'internal_error'
+    report.update(ok=False, error=code, response=None)
+    if attempt['outcome'] != 'timeout':
+        attempt.update(outcome='error', error=code)
+report['elapsed_seconds'] = time.monotonic() - started
+result = report
 '''
 
 
@@ -64,6 +288,137 @@ def command(*args, check=True, timeout=40):
     if check and p.returncode:
         raise AssertionError('command failed {}: {}'.format(args, (p.stdout+p.stderr)[-2000:]))
     return p
+
+
+class Binding:
+    """Independent strict reader for the installed format-2 runtime contract."""
+
+    @classmethod
+    def from_text(cls, text):
+        def unique(pairs):
+            result={}
+            for key,value in pairs:
+                if key in result:raise ValueError('duplicate JSON binding key')
+                result[key]=value
+            return result
+        value=json.loads(text,object_pairs_hook=unique)
+        def keys(obj,expected):
+            assert isinstance(obj,dict) and set(obj)==set(expected.split()),'unexpected binding schema'
+        def match(value,pattern):
+            return isinstance(value,str) and re.fullmatch(pattern,value) is not None
+        def version(obj,number):
+            assert type(obj['format']) is int and obj['format']==number,'unexpected binding version'
+        def ipv4(value):
+            assert isinstance(value,str) and str(ipaddress.IPv4Address(value))==value,'noncanonical IPv4 address'
+        keys(value,'format cgroup gateway proxy_policy source_sha256 effective_sha256 policy_parser_sha256')
+        version(value,2)
+        for key in ('source_sha256','effective_sha256','policy_parser_sha256'):
+            assert match(value[key],r'[0-9a-f]{64}'),'invalid binding hash'
+        group=value['cgroup']
+        keys(group,'format mode mount mount_identity manager_hierarchy path identity boot_id');version(group,1)
+        assert group['mode'] in ('v1','v2'),'unsupported cgroup mode'
+        assert match(group['mount'],r'(?:/[A-Za-z0-9_.,-]+)+'),'unsafe cgroup mount'
+        assert all(part not in ('.','..') for part in group['mount'].split('/')),'unsafe cgroup mount'
+        for key in ('mount_identity','identity'):
+            assert match(group[key],r'[0-9]+:[1-9][0-9]*'),'invalid cgroup identity'
+        assert match(group['boot_id'],r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'),'invalid boot identity'
+        assert ((group['mode']=='v1' and group['path']=='dev-session-v8' and group['manager_hierarchy'] in ('0','name=systemd'))
+                or (group['mode']=='v2' and group['path']=='devsession.slice' and group['manager_hierarchy']=='0')),'invalid cgroup parent'
+        gateway=value['gateway']
+        keys(gateway,'bridge address container_id network_id namespace_identity')
+        assert match(gateway['bridge'],r'[A-Za-z0-9_-]{1,15}'),'invalid bridge'
+        ipv4(gateway['address'])
+        for key in ('container_id','network_id'):
+            assert match(gateway[key],r'[0-9a-f]{64}'),'invalid Docker identity'
+        assert match(gateway['namespace_identity'],r'[0-9]+:[1-9][0-9]*'),'invalid namespace identity'
+        policy=value['proxy_policy']
+        keys(policy,'format proxy_tag outer_endpoints payload_networks dns_transport');version(policy,1)
+        assert policy['proxy_tag']=='proxy' and policy['payload_networks'] in (['tcp'],['tcp','udp']),'invalid payload policy'
+        assert policy['dns_transport']==('udp' if 'udp' in policy['payload_networks'] else 'https'),'inconsistent DNS transport'
+        endpoints=policy['outer_endpoints']
+        assert isinstance(endpoints,list) and endpoints,'missing outer endpoints'
+        previous=None
+        for endpoint in endpoints:
+            keys(endpoint,'family address protocol port_start port_end')
+            assert type(endpoint['family']) is int and endpoint['family']==4,'invalid endpoint family'
+            ipv4(endpoint['address'])
+            assert endpoint['protocol'] in ('tcp','udp'),'invalid outer protocol'
+            assert all(type(endpoint[key]) is int for key in ('port_start','port_end')),'invalid outer port'
+            assert 1<=endpoint['port_start']<=endpoint['port_end']<=65535,'invalid outer range'
+            order=(int(ipaddress.IPv4Address(endpoint['address'])),endpoint['protocol'],endpoint['port_start'],endpoint['port_end'])
+            if previous:
+                assert previous<order,'noncanonical endpoint ordering'
+                if previous[:2]==order[:2]:assert previous[3]+1<order[2],'unmerged endpoint ranges'
+            previous=order
+        result=cls();result.data=value;result.raw=text;result.cgroup=group;result.gateway=gateway;result.policy=policy
+        result.cgroup_root=Path(group['mount'])/group['path']
+        return result
+
+    @classmethod
+    def load(cls,path=RUNTIME/'binding'):
+        path=Path(path)
+        assert not path.is_symlink() and path.is_file(),'binding must be a regular file'
+        metadata=path.stat()
+        assert metadata.st_uid==0 and metadata.st_mode&0o077==0,'binding must be root private'
+        binding=cls.from_text(path.read_text());binding.file=path;binding.verify_parent()
+        return binding
+
+    def session_path(self,sid):
+        assert re.fullmatch(r'[0-9a-f]{32}',sid),'invalid session ID'
+        return self.cgroup_root/(sid if self.cgroup['mode']=='v1' else 'dev-session-'+sid+'.service')
+
+    def service_path(self,sid):
+        self.session_path(sid)
+        parent='/system.slice' if self.cgroup['mode']=='v1' else '/'+self.cgroup['path']
+        return parent+'/dev-session-'+sid+'.service'
+
+    def verify_parent(self):
+        assert Path('/proc/sys/kernel/random/boot_id').read_text().strip()==self.cgroup['boot_id'],'boot identity changed'
+        for path,key in ((Path(self.cgroup['mount']),'mount_identity'),(self.cgroup_root,'identity')):
+            assert path.resolve()==path and path.is_dir(),'cgroup path changed'
+            metadata=path.stat()
+            assert metadata.st_uid==0 and metadata.st_mode&0o022==0,'cgroup parent is writable by nonroot'
+            assert '{}:{}'.format(metadata.st_dev,metadata.st_ino)==self.cgroup[key],'cgroup identity changed'
+        if hasattr(self,'file'):
+            assert not self.file.is_symlink() and self.file.read_text()==self.raw,'binding changed during acceptance'
+
+    def verify_membership(self,text,sid):
+        entries=[line.split(':',2) for line in text.splitlines()]
+        assert entries and all(len(entry)==3 for entry in entries),'invalid process cgroup evidence'
+        service=self.service_path(sid)
+        hierarchy=self.cgroup['manager_hierarchy']
+        manager=([entry for entry in entries if entry[0]=='0' and entry[1]==''] if hierarchy=='0' else
+                 [entry for entry in entries if 'name=systemd' in entry[1].split(',')])
+        assert len(manager)==1 and manager[0][2]==service,'process outside bound systemd service'
+        if self.cgroup['mode']=='v1':
+            controller=[entry for entry in entries if 'net_cls' in entry[1].split(',')]
+            assert len(controller)==1 and controller[0][2]=='/'+self.cgroup['path']+'/'+sid,'process outside bound net_cls group'
+
+    @staticmethod
+    def verify_socket_rows(text,inodes,service):
+        assert len(inodes)==2 and len(set(inodes))==2,'missing independently created TCP/UDP socket evidence'
+        for inode in inodes:
+            rows=[line for line in text.splitlines() if re.search(r'(?:^|\s)ino:'+str(inode)+r'(?:\s|$)',line)]
+            assert len(rows)==1,'created socket missing or ambiguous in ss evidence'
+            groups=re.findall(r'(?:^|\s)cgroup:([^\s]+)',rows[0])
+            assert groups and set(groups)=={service},'socket was created outside the bound service'
+
+    @staticmethod
+    def endpoint_bpf(endpoint):
+        port=('dst port '+str(endpoint['port_start']) if endpoint['port_start']==endpoint['port_end'] else
+              'dst portrange '+str(endpoint['port_start'])+'-'+str(endpoint['port_end']))
+        return '(dst host '+endpoint['address']+' and '+endpoint['protocol']+' and '+port+')'
+
+    def outer_bpf(self):
+        return '(ip and src host '+self.gateway['address']+' and ('+' or '.join(self.endpoint_bpf(e) for e in self.policy['outer_endpoints'])+'))'
+
+
+def udp_target(value):
+    try:
+        address,port=value.rsplit(':',1);address=str(ipaddress.IPv4Address(address));port=int(port)
+        assert 1<=port<=65535 and port!=53
+    except (ValueError,AssertionError):raise argparse.ArgumentTypeError('expected IPv4:non-DNS-port')
+    return address,port
 
 
 class Session:
@@ -155,14 +510,22 @@ class Suite:
     def __init__(self, args):
         self.output, self.user, self.repetitions = Path(args.output), args.user, args.repetitions
         self.output.mkdir(mode=0o700, parents=True, exist_ok=True)
+        assert not self.output.is_symlink() and self.output.stat().st_uid==0 and self.output.stat().st_mode&0o077==0,'output must be root private'
         self.sessions, self.servers, self.captures, self.results = [], [], [], []
+        self.namespace_fault=getattr(args,'namespace_fault','none')
+        self.compose_project=getattr(args,'compose_project',None)
+        self.udp_echo=getattr(args,'udp_echo',None)
+        self.payload_marker_policy=getattr(args,'payload_marker_policy','absent')
+        self.anytls_reuse_check=getattr(args,'anytls_reuse_check',False)
+        self.binding=Binding.load()
+        (self.output/'binding.json').write_text(json.dumps(self.binding.data,indent=2)+'\n')
         self.next_probe_port=21000
         assert int(Path('/proc/sys/net/ipv4/ip_local_port_range').read_text().split()[0])>21199
         self.uid = int(command('id','-u',self.user).stdout)
         self.gid = int(command('id','-g',self.user).stdout)
         self.host_ip = json.loads(command('ip','-j','-4','route','get','1.1.1.1').stdout)[0]['prefsrc']
         self.interface = json.loads(command('ip','-j','-4','route','get','1.1.1.1').stdout)[0]['dev']
-        self.bridge, self.gateway, self.node, self.node_port = (RUNTIME/'binding').read_text().splitlines()
+        self.bridge=self.binding.gateway['bridge'];self.gateway=self.binding.gateway['address']
         address=json.loads(command('ip','-j','-4','addr','show','dev',self.bridge).stdout)[0]['addr_info'][0]
         self.bridge_network=str(ipaddress.ip_network(address['local']+'/'+str(address['prefixlen']),strict=False))
         local_addresses=[a['local'] for link in json.loads(command('ip','-j','-4','addr','show').stdout)
@@ -200,7 +563,8 @@ class Suite:
         end=time.monotonic()+16
         while time.monotonic()<end:
             unit=command('systemctl','show','--property=LoadState','--value','dev-session-'+sid+'.service',check=False).stdout.strip()
-            if not (CGROOT/sid).exists() and not (RUNTIME/'requests'/sid).exists() and unit=='not-found':
+            if not self.binding.session_path(sid).exists() and not (RUNTIME/'requests'/sid).exists() and unit=='not-found':
+                self.binding.verify_parent()
                 return
             time.sleep(0.1)
         raise AssertionError('session not reclaimed: '+sid)
@@ -223,48 +587,140 @@ class Suite:
         assert p.poll() is None, 'capture failed'
         return path
 
+    @staticmethod
+    def capture_statistics(text,final=False):
+        # Linux tcpdump prints SIGUSR1 statistics on one line; the SIGINT
+        # report is multiline. Require the complete report, including newline.
+        if final:
+            pattern=(r'^(\d+) packets? captured\n(\d+) packets? received by filter\n'
+                     r'(\d+) packets? dropped by kernel(?:\n(\d+) packets? dropped by interface)?\n')
+        else:
+            pattern=(r'^tcpdump: (\d+) packets? captured, (\d+) packets? received by filter, '
+                     r'(\d+) packets? dropped by kernel(?:, (\d+) packets? dropped by interface)?\n')
+        matches=list(re.finditer(pattern,text,re.M))
+        if not matches:return None
+        # Do not silently use the preceding complete report when a newer
+        # report or an interface-drop suffix has only been partially written.
+        if text[matches[-1].end():].strip():return None
+        return dict(zip(('captured','received','dropped','interface_dropped'),
+                        (int(value or 0) for value in matches[-1].groups())))
+
+    def stop_capture(self,capture,strict=True,deadline=None):
+        if capture['stopped']:return []
+        errors=[]
+        p,log,path=(capture[key] for key in ('process','log','path'))
+        log_path=Path(log.name);final_offset=None
+        def budget(limit):
+            return limit if deadline is None else max(0,min(limit,deadline-time.monotonic()))
+        if p.poll() is not None:
+            errors.append(str(path)+': collector exited before observation ended')
+        else:
+            if strict and capture.get('physical'):
+                # This chosen collector remains alive for the whole workload.
+                # A missing end marker or late counter mismatch still fails.
+                marker=('D8-END-'+uuid.uuid4().hex).encode()
+                self.physical_canary(marker)
+                end=time.monotonic()+3
+                while marker not in path.read_bytes() and time.monotonic()<end:
+                    time.sleep(min(0.02,max(0,end-time.monotonic())))
+                if marker not in path.read_bytes():errors.append(str(path)+': trailing canary missing')
+            # Never reuse a clean SIGUSR1 snapshot if SIGINT emits no new
+            # complete final report. Read only bytes appended after this point.
+            final_offset=log_path.stat().st_size
+            p.send_signal(signal.SIGINT)
+            try:p.wait(timeout=budget(5))
+            except subprocess.TimeoutExpired:
+                p.kill()
+                try:p.wait(timeout=budget(1))
+                except subprocess.TimeoutExpired:pass
+                errors.append(str(path)+': collector would not stop')
+        log.close();capture['stopped']=p.poll() is not None
+        if p.returncode!=0:errors.append(str(path)+': collector exit '+str(p.returncode))
+        text=log_path.read_bytes()[final_offset:].decode('utf-8','replace') if final_offset is not None else ''
+        stats=self.capture_statistics(text,final=True)
+        capture['final_statistics']=stats
+        if stats is None:
+            errors.append(str(path)+': missing fresh final capture statistics')
+        else:
+            if stats['dropped']!=0 or stats['interface_dropped']!=0:
+                errors.append(str(path)+': dropped packets')
+            if capture.get('physical') and stats['captured']!=stats['received']:
+                errors.append(str(path)+': physical capture did not process every received packet')
+        return errors
+
     def stop_captures(self,strict=True):
         errors=[]
         for capture in self.captures:
-            if capture['stopped']:continue
-            p,log,path=(capture[key] for key in ('process','log','path'))
-            if p.poll() is not None:
-                errors.append(str(path)+': collector exited before observation ended')
-            else:
-                if strict and capture.get('physical'):
-                    # Observe a trailing packet in the savefile before stopping;
-                    # -U alone flushes userspace output, not capture buffers.
-                    marker=('D8-END-'+uuid.uuid4().hex).encode()
-                    self.physical_canary(marker)
-                    end=time.monotonic()+3
-                    while marker not in path.read_bytes() and time.monotonic()<end:
-                        time.sleep(0.02)
-                    if marker not in path.read_bytes():errors.append(str(path)+': trailing canary missing')
-                p.send_signal(signal.SIGINT)
-                try:p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill();p.wait();errors.append(str(path)+': collector would not stop')
-            log.close();capture['stopped']=True
-            if p.returncode!=0:errors.append(str(path)+': collector exit '+str(p.returncode))
-            stats=Path(log.name).read_text()
-            dropped=re.search(r'^(\d+) packets dropped by kernel$',stats,re.M)
-            if not dropped or int(dropped.group(1))!=0:
-                errors.append(str(path)+': missing statistics or dropped packets')
-            if capture.get('physical'):
-                captured=re.search(r'^(\d+) packets? captured$',stats,re.M)
-                received=re.search(r'^(\d+) packets? received by filter$',stats,re.M)
-                if not captured or not received or captured.group(1)!=received.group(1):
-                    errors.append(str(path)+': physical capture did not process every received packet')
+            errors.extend(self.stop_capture(capture,strict=strict))
         if strict:assert not errors,errors
 
+    def reject_physical_preflight(self,capture,name,attempt,deadline):
+        # Only an unadmitted candidate reaches this method. Stop it before
+        # moving its evidence; a replacement must keep the canonical filename.
+        self.stop_capture(capture,strict=False,deadline=deadline)
+        assert capture['stopped'] and capture['process'].returncode==0,'preflight collector did not stop cleanly'
+        old_log=Path(capture['log'].name)
+        stem=name+'-preflight-rejected-'+str(attempt)+'-'+uuid.uuid4().hex
+        rejected=self.output/(stem+'.pcap');rejected_log=self.output/(stem+'-tcpdump.log')
+        assert not rejected.exists() and not rejected_log.exists(),'preflight evidence already exists'
+        if capture['path'].exists():capture['path'].rename(rejected)
+        old_log.rename(rejected_log)
+        capture['path']=rejected;capture['rejected_log']=rejected_log
+
+    def physical_preflight_statistics(self,capture,deadline):
+        p=capture['process'];log_path=Path(capture['log'].name)
+        end=min(deadline,time.monotonic()+3)
+        offset=log_path.stat().st_size
+        assert p.poll() is None,'physical collector exited before statistics snapshot'
+        p.send_signal(signal.SIGUSR1)
+        while True:
+            remaining=end-time.monotonic()
+            assert remaining>=0,'physical preflight statistics deadline exceeded'
+            assert p.poll() is None,'physical collector exited during statistics snapshot'
+            stats=self.capture_statistics(log_path.read_bytes()[offset:].decode('utf-8','replace'))
+            if stats is not None:
+                assert p.poll() is None,'physical collector exited after statistics snapshot'
+                return stats
+            assert remaining>0,'physical preflight statistics snapshot missing or incomplete'
+            time.sleep(min(0.02,remaining))
+
     def physical_capture(self,name):
-        path=self.capture(name,self.interface,
-                          'src portrange 21000-21199 and dst host 9.9.9.9 and dst port 44443')
-        self.captures[-1]['physical']=True
-        # Positive control proves the exact capture can see a direct host flow.
-        # Workload attempts use 21001..21199; this root-only canary uses 21000.
-        self.physical_canary(b'D8-CAPTURE-POSITIVE-CONTROL')
-        return path
+        destinations=['(dst host 9.9.9.9 and dst port 44443)']
+        if self.udp_echo:destinations.append('(dst host '+self.udp_echo[0]+' and dst port '+str(self.udp_echo[1])+')')
+        deadline=time.monotonic()+10
+        for attempt in range(1,4):
+            assert time.monotonic()<deadline,'physical capture preflight deadline exhausted'
+            path=self.output/(name+'.pcap');log_path=self.output/(name+'-tcpdump.log')
+            assert not path.exists() and not log_path.exists(),'physical capture evidence already exists'
+            path=self.capture(name,self.interface,
+                              'src portrange 21000-21199 and ('+' or '.join(destinations)+')')
+            capture=self.captures[-1];capture['physical']=True
+            marker=('D8-START-'+uuid.uuid4().hex).encode();capture['initial_marker']=marker
+            end=min(deadline,time.monotonic()+3)
+            try:
+                while True:
+                    assert capture['process'].poll() is None,'physical collector exited before readiness'
+                    try:content=path.read_bytes()
+                    except FileNotFoundError:content=b''
+                    remaining=end-time.monotonic()
+                    assert remaining>=0,'physical capture did not observe its initial canary'
+                    if marker in content:
+                        assert capture['process'].poll() is None,'physical collector exited before readiness'
+                        break
+                    assert remaining>0,'physical capture did not observe its initial canary'
+                    self.physical_canary(marker)
+                    time.sleep(min(0.05,remaining))
+                stats=self.physical_preflight_statistics(capture,deadline)
+            except BaseException:
+                self.stop_capture(capture,strict=False,deadline=deadline)
+                raise
+            capture['preflight_statistics']=stats
+            if stats['captured']>0 and stats['captured']==stats['received'] and stats['dropped']==stats['interface_dropped']==0:
+                return path
+            # No workload has started. Preserve this rejected collector and
+            # try at most three whole new captures, never subtract a baseline.
+            self.reject_physical_preflight(capture,name,attempt,deadline)
+        raise AssertionError('physical capture preflight statistics failed after three candidates')
 
     def physical_canary(self,payload):
         with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
@@ -273,6 +729,14 @@ class Suite:
             sock.sendto(payload,('9.9.9.9',44443))
 
     def verify_physical_capture(self,path):
+        captures=[capture for capture in self.captures if capture['path']==path and capture.get('physical')]
+        assert len(captures)==1,'physical capture ownership missing'
+        marker=captures[0].get('initial_marker')
+        content=path.read_bytes()
+        assert isinstance(marker,bytes) and marker in content,'physical capture lost its initial canary'
+        # stop_captures has already required its freshly generated end marker
+        # before SIGINT. A repeated start packet cannot stand in for that end.
+        assert re.search(rb'D8-END-[0-9a-f]{32}',content),'physical capture missing its trailing canary'
         canary=command('tcpdump','-nn','-r',str(path),'src port 21000').stdout.splitlines()
         direct=command('tcpdump','-nn','-r',str(path),'src portrange 21001-21199').stdout.splitlines()
         assert len(canary)>=2,'physical capture did not observe both positive controls'
@@ -289,12 +753,27 @@ class Suite:
         for key in ('CapInh','CapPrm','CapEff','CapAmb'):
             assert int(status[key].strip(),16)==0,(key,status[key])
         assert status['NoNewPrivs'].strip()=='1' and status['Seccomp'].strip()=='2'
-        assert ':net_cls,net_prio:/dev-session-v8/'+session.sid in info['cgroup']
-        assert ':name=systemd:/system.slice/dev-session-'+session.sid+'.service' in info['cgroup']
+        self.binding.verify_membership(info['cgroup_before_sockets'],session.sid)
+        self.binding.verify_membership(info['cgroup'],session.sid)
+        socket_evidence=None
+        try:
+            if self.binding.cgroup['mode']=='v2':
+                rows=command('ss','-H','-t','-u','-a','-n','-p','-e','--cgroup').stdout
+                (self.output/(session.name+'-socket-cgroups.log')).write_text(rows)
+                service=self.binding.service_path(session.sid)
+                self.binding.verify_socket_rows(rows,info['socket_inodes'],service)
+                socket_evidence={'inodes':info['socket_inodes'],'cgroup':service,'created_inside_service':True}
+            else:
+                classid=int((self.binding.session_path(session.sid)/'net_cls.classid').read_text().strip(),0)
+                assert classid==0x6d730001,'incorrect session net_cls classid'
+        finally:
+            session.value("[s.close() for s in state.pop('membership_sockets',[])];result=True")
+        self.binding.verify_parent()
         assert info['proxy_env']==[]
         return {'uid':info['uid'],'uids':uids,'groups':info['groups'],
                 'privilege_caps_zero':True,'cap_bnd':status['CapBnd'].strip(),
-                'no_new_privs':1,'seccomp':2}
+                'no_new_privs':1,'seccomp':2,'cgroup_mode':self.binding.cgroup['mode'],
+                'cgroup_mount':self.binding.cgroup['mount'],'socket_creation':socket_evidence}
 
     def echo(self, session, address, port, udp=False):
         code="""
@@ -306,24 +785,98 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM if {udp} else socket.SOCK_S
         assert session.value(code)=='d8-loopback-proof'
 
     def dns(self, session, address, tcp, name):
-        code=r"""
-import socket,struct
-name={name!r}
-question=b''.join(bytes([len(x)])+x.encode() for x in name.split('.'))+b'\x00\x00\x01\x00\x01'
-message=struct.pack('!6H',0x4d38,0x0100,1,0,0,0)+question
-with socket.socket(socket.AF_INET,socket.SOCK_STREAM if {tcp} else socket.SOCK_DGRAM) as sock:
-    sock.settimeout(4);sock.connect(({address!r},53))
-    if {tcp}:
-        sock.sendall(struct.pack('!H',len(message))+message)
-        header=sock.recv(2);length=struct.unpack('!H',header)[0];reply=b''
-        while len(reply)<length: reply+=sock.recv(length-len(reply))
-    else:
-        sock.send(message);reply=sock.recv(4096)
-    tid,flags,qd,an,_,_=struct.unpack('!6H',reply[:12])
-    assert tid==0x4d38 and flags&0x8000 and flags&15 in (0,3)
-    result={{'rcode':flags&15,'answers':an}}
-""".format(name=name,tcp=tcp,address=address)
-        return session.value(code)
+        message=b'';query_error=False
+        try:
+            labels=[part.encode('ascii') for part in name.split('.')]
+            assert labels and all(0<len(label)<=63 for label in labels)
+            question=b''.join(bytes([len(label)])+label for label in labels)+b'\x00'
+            assert len(question)<=255 and str(ipaddress.IPv4Address(address))==address and type(tcp) is bool
+            message=struct.pack('!6H',0x4d38,0x0100,1,0,0,0)+question+b'\x00\x01\x00\x01'
+        except (ValueError,UnicodeError,AssertionError):
+            query_error=True
+        report={'format':1,'transport':'tcp' if tcp else 'udp','ok':False,
+                'query_sha256':hashlib.sha256(message).hexdigest(),
+                'target_sha256':hashlib.sha256((address+':53').encode('utf-8')).hexdigest(),
+                'elapsed_seconds':0.0,'transmissions':0,'attempts':[],
+                'checks':{key:False for key in ('same_socket','same_peer','same_source_port','same_query','reply_validated')},
+                'response':None,'error':None}
+
+        def valid(value):
+            def elapsed(number):
+                return type(number) in (int,float) and 0<=number<=20 and math.isfinite(number)
+            try:
+                if not isinstance(value,dict) or set(value)!=set(report):return False
+                if type(value['format']) is not int or value['format']!=1:return False
+                if any(value[key]!=report[key] for key in ('transport','query_sha256','target_sha256')):return False
+                if type(value['ok']) is not bool or not elapsed(value['elapsed_seconds']):return False
+                if type(value['transmissions']) is not int or not 0<=value['transmissions']<=2:return False
+                if value['error'] is not None and value['error'] not in DNS_ERRORS:return False
+                checks=value['checks']
+                if not isinstance(checks,dict) or set(checks)!=set(report['checks']) or any(type(flag) is not bool for flag in checks.values()):return False
+                attempts=value['attempts']
+                if not isinstance(attempts,list) or len(attempts)>2:return False
+                for number,attempt in enumerate(attempts,1):
+                    if not isinstance(attempt,dict) or set(attempt)!={'number','sent','outcome','elapsed_seconds','error'}:return False
+                    if type(attempt['number']) is not int or attempt['number']!=number or type(attempt['sent']) is not bool:return False
+                    if attempt['outcome'] not in ('response','timeout','error') or not elapsed(attempt['elapsed_seconds']):return False
+                    if attempt['error'] is not None and attempt['error'] not in DNS_ERRORS:return False
+                if value['transmissions']!=sum(attempt['sent'] for attempt in attempts):return False
+                response=value['response']
+                if response is not None:
+                    if not isinstance(response,dict) or set(response)!={'rcode','answers'}:return False
+                    if type(response['rcode']) is not int or response['rcode'] not in (0,3):return False
+                    if type(response['answers']) is not int or not 0<=response['answers']<=65535:return False
+                if not value['ok']:return value['error'] is not None and response is None
+                return all(checks.values()) and response is not None and value['error'] is None and bool(attempts) and attempts[-1]['outcome']=='response'
+            except (KeyError,TypeError,ValueError):
+                return False
+
+        if query_error:
+            report['error']='invalid_query'
+        else:
+            code='address={0!r}\ntcp={1!r}\nmessage={2!r}\nreport={3!r}\n'.format(address,tcp,message,report)+DNS_PROBE
+            started=time.monotonic()
+            try:
+                response=session.call(code,timeout=20)  # Explicitly exceeds the 10-second UDP budget.
+            except Exception:
+                report.update(error='worker_rpc_failed',elapsed_seconds=time.monotonic()-started)
+            else:
+                if isinstance(response,dict) and response.get('ok') is False:
+                    report.update(error='worker_execution_failed',elapsed_seconds=time.monotonic()-started)
+                elif isinstance(response,dict) and response.get('ok') is True and valid(response.get('result')):
+                    report=response['result']
+                else:
+                    report.update(error='invalid_worker_report',elapsed_seconds=time.monotonic()-started)
+        path=self.output/'dns-attempts.jsonl'
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_APPEND|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'a',encoding='utf-8') as evidence:
+            metadata=os.fstat(evidence.fileno())
+            assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid==os.geteuid() and metadata.st_mode&0o077==0,'DNS evidence must be a private regular file'
+            evidence.write(json.dumps(report,sort_keys=True,allow_nan=False)+'\n')
+            evidence.flush();os.fsync(evidence.fileno())
+        assert report['ok'],'DNS probe failed: '+report['error']
+        return report
+
+    def ordinary_udp(self,session):
+        assert self.udp_echo,'full network acceptance requires a controlled --udp-echo IPv4:port'
+        address,port=self.udp_echo
+        assert address not in {entry['address'] for entry in self.binding.policy['outer_endpoints']},'UDP echo must be separate from outer nodes'
+        self.next_probe_port+=1;source_port=self.next_probe_port;assert source_port<=21199
+        token='D8-UDP-'+uuid.uuid4().hex
+        self.udp_token=token.encode()
+        result=session.value('''
+import socket
+with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+    sock.settimeout(3);sock.bind(('0.0.0.0',{source_port}))
+    try:
+        sock.connect(({address!r},{port}));sock.send({token!r}.encode())
+        data=sock.recv(2048);result={{'echo':data=={token!r}.encode(),'received':True}}
+    except OSError as error:result={{'echo':False,'received':False,'errno':error.errno}}
+'''.format(source_port=source_port,address=address,port=port,token=token))
+        supported='udp' in self.binding.policy['payload_networks']
+        assert result['echo'] if supported else not result['received'],result
+        return dict(result,payload_udp=supported,source_port=source_port,target=[address,port],
+                    expected='echo through proxy' if supported else 'ordinary UDP fails closed')
 
     def https(self, session, keep=False):
         code="""
@@ -355,6 +908,87 @@ if not data: raise ConnectionError('established TLS socket closed')
 result={'response':data[:100].decode('ascii','replace')}
 ''',10)
 
+    def anytls_hold_https(self):
+        result=self.https(self.a,keep=True)
+        assert result['ok'] and result['result']['status']==200 and result['result']['tls'],result
+        self.a.value(r'''
+import os
+original=state['kept_socket']
+assert original is state['https'].sock
+state['anytls_warm_identity']=(original,original.fileno(),os.fstat(original.fileno()).st_ino,original.getpeername())
+result=True
+''')
+        return result
+
+    def anytls_warm_https(self):
+        # Use the retained TLS socket directly. HTTPConnection.request() may
+        # silently reconnect, which would not prove another stream survived.
+        return self.a.value(r'''
+import http.client,os
+original,fd,inode,peer=state['anytls_warm_identity']
+def unchanged():
+    assert original is state['kept_socket'] and original is state['https'].sock
+    assert original.fileno()==fd and os.fstat(original.fileno()).st_ino==inode and original.getpeername()==peer
+unchanged()
+original.sendall(b'GET /cdn-cgi/trace HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: keep-alive\r\n\r\n')
+response=http.client.HTTPResponse(original)
+try:
+    response.begin();body=response.read(65537)
+    assert response.status==200 and not response.will_close and len(body)<=65536 and response.length in (None,0)
+finally:response.close()
+unchanged()
+result={'status':200,'tls':True,'same_socket':True}
+''')
+
+    def anytls_new_https(self):
+        # An 8s application budget observes the pinned core's own 3s SYNACK
+        # watchdog. Generic HTTPS probes and every fault retain their budgets.
+        return self.b.call(r'''
+import http.client
+connection=http.client.HTTPSConnection('1.1.1.1',timeout=8)
+try:
+    connection.request('GET','/cdn-cgi/trace')
+    response=connection.getresponse();body=response.read(65537)
+    assert len(body)<=65536 and response.length in (None,0)
+    result={'status':response.status,'tls':connection.sock is not None,'body_length':len(body)}
+finally:connection.close()
+''',10)
+
+    def anytls_cancelled_dial_recovery(self):
+        """Record one known cancelled-dial limitation before independent faults.
+
+        This is deliberately outside https(), fault(), and the product probe.
+        It is not a general promise that one retry handles every idle pool.
+        """
+        assert self.anytls_reuse_check is True,'requires the explicit AnyTLS fixture check'
+        def healthy(value):
+            assert value['ok'] is True and value['result']['status']==200 and value['result']['tls'] is True,value
+        def retained():
+            value=self.anytls_warm_https()
+            assert value['status']==200 and value['tls'] is True and value['same_socket'] is True,value
+        self.assert_rules();retained()
+        started=time.monotonic();first=self.anytls_new_https();elapsed=time.monotonic()-started
+        assert 0<=elapsed<8,'new HTTPS observation exceeded its diagnostic budget'
+        first_evidence={'status':'passed','seconds':round(elapsed,6),'error_type':None}
+        second_evidence={'status':'not_needed'};attempts=1
+        if first['ok'] is True:
+            healthy(first)
+        else:
+            kind=first.get('error','').split(':',1)[0]
+            assert kind in ('SSLEOFError','ConnectionResetError','EOFError') and 2.5<=elapsed<=4.0,first
+            first_evidence.update(status='known_watchdog_failure',error_type=kind)
+        retained()
+        if first_evidence['status']=='known_watchdog_failure':
+            # Exactly one subsequent new connection, with the first failure
+            # retained in evidence. No sleep, pool reset or core restart.
+            started=time.monotonic();second=self.anytls_new_https();elapsed=time.monotonic()-started
+            healthy(second);assert 0<=elapsed<8,'second HTTPS exceeded its diagnostic budget'
+            second_evidence={'status':'passed','seconds':round(elapsed,6)};attempts=2
+        retained();self.assert_rules()
+        return {'format':1,'first_new_connection':first_evidence,'second_new_connection':second_evidence,
+                'new_connection_attempts':attempts,'existing_tls_socket_preserved':True,
+                'policy_and_binding_unchanged':True,'no_core_restart_or_pool_reset':True,'recovered':True}
+
     def gateway_ready(self):
         end=time.monotonic()+18
         while time.monotonic()<end:
@@ -363,6 +997,144 @@ result={'response':data[:100].decode('ascii','replace')}
                 return
             time.sleep(0.2)
         raise AssertionError('gateway did not recover: '+p.stderr)
+
+    def after_namespace_fault(self,label):
+        """Inspect recovery without deleting bindings or repairing live guards."""
+        deadline=time.monotonic()+25
+        while True:
+            inspected=command('docker','inspect','worker',check=False)
+            try:
+                container=json.loads(inspected.stdout)[0];pid=container['State']['Pid']
+                assert pid>0 and container['State']['Running']
+                metadata=Path('/proc/'+str(pid)+'/ns/net').stat()
+                identity='{}:{}'.format(metadata.st_dev,metadata.st_ino)
+                break
+            except (ValueError,KeyError,IndexError,AssertionError,OSError):
+                if time.monotonic()>=deadline:raise AssertionError('gateway did not restart for namespace identity check')
+                time.sleep(0.2)
+        namespace_changed=identity!=self.binding.gateway['namespace_identity']
+        container_changed=container['Id']!=self.binding.gateway['container_id']
+        changed=namespace_changed or container_changed
+        check=command(DEV,'check',check=False)
+        (self.output/(label+'-check.log')).write_text(check.stdout+check.stderr)
+        init_exit=None;rejection=None
+        if changed:
+            assert check.returncode!=0,'changed gateway namespace was admitted'
+            self.assert_rules()
+            init=command(DEV,'init',check=False)
+            (self.output/(label+'-init.log')).write_text(init.stdout+init.stderr)
+            init_exit=init.returncode
+            assert init.returncode!=0,'init rebound the gateway while prior binding remained'
+            self.assert_rules()
+            rejection=self.rejected_start(label+'-offline-rebind')
+        elif check.returncode:
+            rejection=self.rejected_start(label+'-policy-drift')
+        else:
+            self.gateway_ready()
+        self.assert_rules()
+        return {'namespace_before':self.binding.gateway['namespace_identity'],'namespace_after':identity,
+                'namespace_changed':namespace_changed,'container_changed':container_changed,
+                'container_id_before':self.binding.gateway['container_id'],'container_id_after':container['Id'],
+                'check_exit':check.returncode,'init_exit':init_exit,
+                'rejected_start':rejection,'binding_and_guards_retained':True,
+                'offline_rebind_required':changed,'offline_maintenance_required':bool(check.returncode)}
+
+    def gateway_namespace_fault(self,action):
+        if action=='gateway-recreate':return self.gateway_recreate_fault()
+        assert action in ('gateway-stop','gateway-kill'),'unsupported gateway fault'
+        before=self.https(self.a,keep=True);assert before['ok'],before
+        try:
+            if action=='gateway-stop':command('docker','stop','--time','1','worker')
+            else:command('docker','kill','--signal=KILL','worker')
+            old=self.existing_https(self.a);new=self.https(self.a)
+            assert not old['ok'] and not new['ok'],{'old':old,'new':new}
+            self.rejected_start(action)
+            self.echo(self.b,'127.0.0.1',self.tcp.server_address[1])
+            self.forced_egress(self.a)
+        finally:command('docker','start','worker')
+        result=self.after_namespace_fault(action)
+        result.update(existing_connection_blocked_during_fault=True,new_connection_blocked_during_fault=True,
+                      other_session_loopback_alive=True)
+        return result
+
+    def compose_target(self,bound):
+        """Authorize only the explicitly selected, single-worker test project."""
+        project=self.compose_project
+        assert isinstance(project,str) and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}',project),\
+            'gateway recreation requires an explicit Compose project'
+        root=INSTALL_ROOT;source=root/'network.json';compose=root/'docker-compose.yml'
+        for path in (root,*root.parents):
+            metadata=path.stat()
+            assert not path.is_symlink() and metadata.st_uid==0 and metadata.st_mode&0o022==0,\
+                'untrusted Compose project directory'
+        assert root.stat().st_mode&0o077==0,'Compose test project must be root private'
+        hashes={}
+        for path in (source,compose):
+            metadata=path.stat()
+            assert not path.is_symlink() and path.is_file() and metadata.st_uid==0 and \
+                metadata.st_mode&0o077==0 and metadata.st_nlink==1,'untrusted Compose project file'
+            hashes[path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
+        assert hashes['network.json']==self.binding.data['source_sha256'],'Compose source differs from the retained binding'
+        rows=json.loads(command('docker','inspect','worker').stdout)
+        assert isinstance(rows,list) and len(rows)==1 and isinstance(rows[0],dict),'ambiguous Compose gateway'
+        container=rows[0];labels=container.get('Config',{}).get('Labels',{})
+        expected={'com.docker.compose.project':project,'com.docker.compose.service':'worker',
+                  'com.docker.compose.project.working_dir':str(root),
+                  'com.docker.compose.project.config_files':str(compose),'com.docker.compose.oneoff':'False'}
+        assert isinstance(labels,dict) and all(labels.get(key)==value for key,value in expected.items()),\
+            'gateway does not belong to the selected Compose source and project'
+        assert container.get('Name')=='/worker' and re.fullmatch(r'[0-9a-f]{64}',container.get('Id','')),\
+            'unexpected Compose gateway identity'
+        assert re.fullmatch(r'sha256:[0-9a-f]{64}',container.get('Image','')),'invalid Compose image identity'
+        state=container.get('State',{});pid=state.get('Pid')
+        assert state.get('Running') is True and type(pid) is int and pid>0,'Compose gateway is not running'
+        metadata=Path('/proc/'+str(pid)+'/ns/net').stat();namespace='{}:{}'.format(metadata.st_dev,metadata.st_ino)
+        if bound:
+            assert container['Id']==self.binding.gateway['container_id'] and namespace==self.binding.gateway['namespace_identity'],\
+                'refusing recreation of an unbound gateway'
+        mounts=container.get('Mounts',[]);binds=[mount for mount in mounts if mount.get('Type')=='bind']
+        assert len(binds)==1 and binds[0].get('Source')==str(source) and \
+            binds[0].get('Destination')=='/etc/worker/network.json' and binds[0].get('RW') is False,\
+            'Compose gateway source is not the exact read-only bound file'
+        members=command('docker','ps','--all','--quiet','--no-trunc','--filter',
+                        'label=com.docker.compose.project='+project).stdout.splitlines()
+        assert members==[container['Id']],'Compose test project contains another container'
+        return {'container_id':container['Id'],'namespace_identity':namespace,'image_id':container['Image'],
+                'file_hashes':hashes,'command':('docker','compose','--project-directory',str(root),
+                    '--project-name',project,'-f',str(compose))}
+
+    def gateway_recreate_fault(self):
+        target=self.compose_target(bound=True)
+        try:
+            before=self.https(self.a,keep=True)
+            assert before['ok'] and before['result']['status']==200 and before['result']['tls'],before
+            command(*target['command'],'up','-d','--no-deps','--no-build','--pull','never','--force-recreate','worker',timeout=90)
+            replacement=self.compose_target(bound=False)
+            assert replacement['container_id']!=target['container_id'],'Compose did not recreate the gateway container'
+            assert replacement['image_id']==target['image_id'] and replacement['file_hashes']==target['file_hashes'],\
+                'Compose source or image changed during recreation'
+            deadline=time.monotonic()+30
+            while True:
+                ready=command('docker','exec',replacement['container_id'],'cat','/run/worker/policy-ready',check=False,timeout=10)
+                if ready.returncode==0:break
+                assert time.monotonic()<deadline,'replacement gateway did not publish readiness'
+                time.sleep(0.2)
+            expected={'format':2,'policy':self.binding.policy}
+            expected.update({key:self.binding.data[key] for key in ('source_sha256','effective_sha256','policy_parser_sha256')})
+            assert json.loads(ready.stdout)==expected,'replacement gateway readiness differs from the bound policy'
+            old=self.existing_https(self.a);new=self.https(self.a)
+            assert not old['ok'] and not new['ok'],{'old':old,'new':new}
+            self.rejected_start('gateway-recreate')
+            self.echo(self.b,'127.0.0.1',self.tcp.server_address[1]);self.forced_egress(self.a)
+            result=self.after_namespace_fault('gateway-recreate')
+            assert result['container_changed'] and result['container_id_after']==replacement['container_id'] and \
+                result['namespace_after']==replacement['namespace_identity'],'replacement identity changed during verification'
+            return dict(result,existing_connection_blocked_during_fault=True,new_connection_blocked_during_fault=True,
+                        other_session_loopback_alive=True,replacement_readiness_verified=True,compose_project=self.compose_project)
+        finally:
+            # A failed recreate may already have replaced the container. Keep
+            # the old binding and guards; never blindly start, repair or rebind.
+            self.assert_rules()
 
     def rejected_start(self, label):
         marker=Path('/tmp/d8-should-not-run-'+uuid.uuid4().hex)
@@ -384,11 +1156,79 @@ result={'response':data[:100].decode('ascii','replace')}
             self.echo(self.b,'127.0.0.1',self.tcp.server_address[1])
             self.forced_egress(self.a)
         finally:
-            restore();self.gateway_ready()
+            restore();self.gateway_ready();self.assert_rules()
         assert self.https(self.a)['ok']
         self.a.value("state.pop('https').close();state.pop('kept_socket',None);result=True")
         return {'existing_socket':before['result']['socket'],'existing_connection_blocked':True,
-                'new_connection_blocked':True,'other_session_loopback_alive':True}
+                'new_connection_blocked':True,'other_session_loopback_alive':True,
+                'gateway_readback_verified_after_restore':True,'binding_and_guards_retained':True}
+
+    def gateway_command(self,*args):
+        pid=command('docker','inspect','-f','{{.State.Pid}}','worker').stdout.strip()
+        assert re.fullmatch(r'[1-9][0-9]*',pid),'gateway is not running'
+        namespace=Path('/proc/'+pid+'/ns/net');metadata=namespace.stat()
+        assert '{}:{}'.format(metadata.st_dev,metadata.st_ino)==self.binding.gateway['namespace_identity'],\
+            'refusing fault injection into an unbound gateway namespace'
+        return command('nsenter','--net='+str(namespace),'--',*args)
+
+    def tun_link_fault(self):
+        prefixes=('0.0.0.0/1','128.0.0.0/1')
+        def read_routes():
+            rows=json.loads(self.gateway_command('ip','-j','-4','route','show','table','main').stdout)
+            assert isinstance(rows,list) and all(isinstance(row,dict) and isinstance(row.get('dst'),str)
+                                                for row in rows),'unexpected gateway route JSON'
+            return rows
+        def canonical(rows):return sorted(json.dumps(row,sort_keys=True) for row in rows)
+        def unrelated(rows):return canonical([row for row in rows if row['dst'] not in prefixes])
+        before=read_routes();saved={}
+        for prefix in prefixes:
+            rows=[row for row in before if row['dst']==prefix]
+            # These are the exact host iproute2 rows created by the gateway.
+            # Refuse other attributes before injecting a fault we cannot undo.
+            assert rows==[{'dst':prefix,'dev':'tun0','scope':'link','flags':[]}],\
+                'TUN fault requires exactly reproducible preexisting half routes'
+            saved[prefix]=rows[0]
+        restored=[]
+        def restore():
+            self.gateway_command('ip','link','set','dev','tun0','up')
+            current=read_routes();missing=[]
+            assert unrelated(current)==unrelated(before),'unrelated gateway routes changed during TUN fault'
+            # Link down removes the /1 routes on Linux; link up retains the
+            # connected subnet but does not recreate these explicit routes.
+            # Preflight BOTH destinations before adding any missing entry.
+            for prefix in prefixes:
+                rows=[row for row in current if row['dst']==prefix]
+                assert not rows or rows==[saved[prefix]],'gateway half route changed during TUN fault'
+                if not rows:missing.append(saved[prefix])
+            for row in missing:
+                self.gateway_command('ip','-4','route','add',row['dst'],'dev',row['dev'],
+                                     'scope',row['scope'],'table','main')
+                restored.append(row['dst'])
+            assert canonical(read_routes())==canonical(before),'gateway routes were not restored exactly'
+        result=self.fault('gateway-tun-down',
+            lambda:self.gateway_command('ip','link','set','dev','tun0','down'),restore)
+        return dict(result,missing_half_routes_restored=len(restored),gateway_route_snapshot_restored=True)
+
+    def node_outage(self):
+        addresses=sorted({endpoint['address'] for endpoint in self.binding.policy['outer_endpoints']},
+                         key=ipaddress.IPv4Address)
+        comment='d8-acceptance-node-outage-'+uuid.uuid4().hex
+        installed=[]
+        def apply():
+            for address in addresses:
+                rule=('-o','eth0','-d',address+'/32','-m','comment','--comment',comment,'-j','DROP')
+                self.gateway_command('iptables-legacy','-w','5','-I','OUTPUT','1',*rule)
+                installed.append(rule)
+        def restore():
+            failures=[]
+            # Track successful inserts; never flush or delete another rule.
+            # Continue restoring other nodes if one delete fails, then fail.
+            for rule in reversed(installed):
+                try:self.gateway_command('iptables-legacy','-w','5','-D','OUTPUT',*rule)
+                except Exception as error:failures.append(error)
+            if failures:raise AssertionError('could not restore every owned node-outage rule') from failures[0]
+        result=self.fault('controlled-node-outage',apply,restore)
+        return dict(result,blocked_outer_addresses=addresses,owned_drop_rules_removed=len(installed))
 
     def forced_egress(self, session):
         outcomes=[]
@@ -413,6 +1253,7 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
         return outcomes
 
     def run_core(self):
+        assert self.udp_echo,'--udp-echo is required for full TCP/UDP acceptance; use the separate fake upstream fixture'
         self.tcp=self.server(TCP,'0.0.0.0',0,TCPHandler)
         # Bind each UDP address so replies preserve the destination address;
         # a wildcard UDP listener would answer 127.0.0.2 from 127.0.0.1.
@@ -431,7 +1272,7 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
                 self.echo(self.a,address,self.tcp.server_address[1]);self.echo(self.a,address,udps[address].server_address[1],True)
             return 'TCP/UDP on both loopback addresses'
         self.record('host_loopback',loopback)
-        self.record('public_https',lambda:self.assert_https())
+        self.record('public_https',self.anytls_hold_https if self.anytls_reuse_check else self.assert_https)
         def dns_checks():
             results=[]
             self.query_names=[]
@@ -442,6 +1283,7 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
             assert local_dns_tcp.received==0 and local_dns_udp.received==0
             return results
         self.record('all_dns_destinations_redirected',dns_checks)
+        self.record('ordinary_udp_capability',lambda:self.ordinary_udp(self.a))
         self.record('forced_physical_interface',lambda:self.forced_egress(self.a))
         def blocked():
             evidence=[]
@@ -463,21 +1305,16 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
             assert response['exit']!=0;evidence.append(response)
             return evidence
         self.record('private_ipv6_privilege_denials',blocked)
-        self.record('gateway_stop',lambda:self.fault('gateway-stop',
-            lambda:command('docker','stop','--time','1','worker'),
-            lambda:command('docker','start','worker')))
-        self.record('gateway_core_kill',lambda:self.fault('gateway-kill',
-            lambda:command('docker','kill','--signal=KILL','worker'),
-            lambda:command('docker','start','worker')))
+        if self.anytls_reuse_check:
+            self.record('anytls_cancelled_dial_recovery',self.anytls_cancelled_dial_recovery)
+        self.record('controlled_upstream_node_outage',self.node_outage)
+        self.record('gateway_TUN_link_down',self.tun_link_fault)
         self.record('host_default_route_removed',lambda:self.fault('host-route',
             lambda:command('ip','-4','route','del','default','via',self.gateway,'dev',self.bridge,'table','32190'),
             lambda:command('ip','-4','route','add','default','via',self.gateway,'dev',self.bridge,'table','32190')))
-        def ns_command(*args):
-            pid=command('docker','inspect','-f','{{.State.Pid}}','worker').stdout.strip()
-            return command('nsenter','--net=/proc/'+pid+'/ns/net','--',*args)
         self.record('gateway_half_route_removed',lambda:self.fault('gateway-half-route',
-            lambda:ns_command('ip','-4','route','del','0.0.0.0/1','dev','tun0'),
-            lambda:ns_command('ip','-4','route','add','0.0.0.0/1','dev','tun0')))
+            lambda:self.gateway_command('ip','-4','route','del','0.0.0.0/1','dev','tun0'),
+            lambda:self.gateway_command('ip','-4','route','add','0.0.0.0/1','dev','tun0')))
         def bad_probe():
             policy=INSTALL_ROOT/'policy.json';original=policy.read_bytes()
             try:
@@ -497,21 +1334,47 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
             try:return self.rejected_start('bad-permissions')
             finally:path.chmod(mode)
         self.record('writable_policy_rejected',bad_permissions)
+        if self.namespace_fault!='none':
+            self.record(self.namespace_fault,lambda:self.gateway_namespace_fault(self.namespace_fault))
         self.stop_captures()
-        def captures():
-            physical=self.verify_physical_capture(self.wire)
-            outer=command('tcpdump','-nn','-r',str(self.outer)).stdout.splitlines()
-            assert len(outer)>0 and all(' > '+self.node+'.'+self.node_port+': UDP' in x for x in outer),outer[:5]
-            content=self.outer.read_bytes()
-            qnames=[b''.join(bytes([len(label)])+label.encode() for label in name.split('.'))+b'\0'
-                    for name in self.query_names]
-            assert all(name not in content for name in qnames)
-            dns=command('tcpdump','-nn','-r',str(self.dns_pcap)).stdout.splitlines()
-            assert len(dns)>0 and all(' > 1.1.1.1.53:' in x for x in dns),dns[:5]
-            return dict(physical,outer_udp_packets=len(outer),redirected_dns_packets=len(dns),plaintext_dns_on_outer=False)
-        self.record('packet_capture_evidence',captures)
+        self.record('packet_capture_evidence',self.packet_capture_evidence)
         self.a.close();self.b.close()
         self.record('shared_rules_unchanged',lambda:self.assert_rules())
+
+    def packet_capture_evidence(self):
+        marker_policy=self.payload_marker_policy
+        assert marker_policy in ('absent','encapsulated'),'unknown payload marker policy'
+        physical=self.verify_physical_capture(self.wire)
+        outer=command('tcpdump','-nn','-r',str(self.outer)).stdout.splitlines()
+        assert outer,'no outer packets observed'
+        unexpected=command('tcpdump','-nn','-r',str(self.outer),'not '+self.binding.outer_bpf()).stdout.splitlines()
+        assert not unexpected,unexpected[:20]
+        endpoint_counts=[]
+        for endpoint in self.binding.policy['outer_endpoints']:
+            packets=command('tcpdump','-nn','-r',str(self.outer),self.binding.endpoint_bpf(endpoint)).stdout.splitlines()
+            endpoint_counts.append(dict(endpoint,packets=len(packets)))
+        content=self.outer.read_bytes()
+        qnames=[b''.join(bytes([len(label)])+label.encode() for label in name.split('.'))+b'\0'
+                for name in self.query_names]
+        plaintext_dns=any(name in content for name in qnames)
+        plaintext_udp=self.udp_token in content
+        # Plain SOCKS/VLESS can expose application bytes inside an authorized
+        # proxy flow. Only the explicit test recipe selects that expectation;
+        # it never relaxes the endpoint, physical-interface or DNS-target gate.
+        # Byte absence alone is not a cryptographic confidentiality proof.
+        if marker_policy=='absent' or self.binding.policy['dns_transport']=='https':
+            assert not plaintext_dns,'DNS query marker appeared on outer link'
+        if marker_policy=='absent' or 'udp' not in self.binding.policy['payload_networks']:
+            assert not plaintext_udp,'ordinary UDP appeared in plaintext on outer link'
+        dns=command('tcpdump','-nn','-r',str(self.dns_pcap)).stdout.splitlines()
+        unexpected_dns=command('tcpdump','-nn','-r',str(self.dns_pcap),
+                               'not (ip and dst host 1.1.1.1 and (tcp or udp) and dst port 53)').stdout.splitlines()
+        assert dns and not unexpected_dns,unexpected_dns[:5]
+        return dict(physical,outer_packets=len(outer),outer_endpoints=endpoint_counts,
+                    unexpected_outer_packets=len(unexpected),redirected_dns_packets=len(dns),
+                    payload_marker_policy=marker_policy,plaintext_dns_on_outer=plaintext_dns,
+                    plaintext_udp_on_outer=plaintext_udp,
+                    dns_transport=self.binding.policy['dns_transport'],payload_networks=self.binding.policy['payload_networks'])
 
     def assert_https(self):
         result=self.https(self.a);assert result['ok'] and result['result']['status']==200,result
@@ -519,7 +1382,8 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
 
     def assert_rules(self):
         assert self.policy_snapshot()==self.baseline
-        return {'owned_rule_lines':len(self.baseline)}
+        self.binding.verify_parent()
+        return {'owned_rule_lines':len(self.baseline),'binding_retained':True,'cgroup_parent_identity':self.binding.cgroup['identity']}
 
     def cleanup(self):
         self.stop_captures(strict=False)
@@ -535,13 +1399,432 @@ def main():
     parser.add_argument('--user',default='ubuntu')
     parser.add_argument('--output',default='/root/dev-session-acceptance-20261009/core')
     parser.add_argument('--repetitions',type=int,default=100)
+    parser.add_argument('--udp-echo',type=udp_target,required=True,help='controlled non-DNS echo target, reachable only through the upstream fixture')
+    parser.add_argument('--payload-marker-policy',choices=('absent','encapsulated'),default='absent',
+                        help='test recipe expectation: unencrypted proxies may expose markers only inside exact allowed outer flows')
+    parser.add_argument('--anytls-reuse-check',action='store_true',
+                        help='record the pinned AnyTLS cancelled-dial limitation before independent core faults')
+    parser.add_argument('--namespace-fault',choices=('none','gateway-stop','gateway-kill','gateway-recreate'),default='none',
+                        help='last scenario; changed namespace leaves guards and binding in place for offline rebind')
+    parser.add_argument('--compose-project',help='explicit owned project; required only for gateway-recreate on a fresh Compose test host')
     args=parser.parse_args()
+    if bool(args.compose_project)!=(args.namespace_fault=='gateway-recreate'):
+        parser.error('--compose-project is required only with --namespace-fault gateway-recreate')
     assert os.geteuid()==0,'requires root on a disposable test host'
     os.umask(0o077)
     suite=Suite(args)
     try:suite.run_core()
     finally:suite.cleanup()
     print('HOST_CORE_ACCEPTANCE_PASSED',flush=True)
+
+
+class BindingTests(unittest.TestCase):
+    """Pure regression tests: no root, network, cgroup or firewall changes."""
+
+    @staticmethod
+    def document(mode='v2'):
+        return {'format':2, 'source_sha256':'a'*64, 'effective_sha256':'b'*64,
+                'policy_parser_sha256':'c'*64,
+                'cgroup':{'format':1, 'mode':mode, 'mount':'/sys/fs/cgroup' if mode=='v2' else '/sys/fs/cgroup/net_cls',
+                          'mount_identity':'25:1', 'manager_hierarchy':'0',
+                          'path':'devsession.slice' if mode=='v2' else 'dev-session-v8',
+                          'identity':'25:123', 'boot_id':'11111111-2222-3333-4444-555555555555'},
+                'gateway':{'bridge':'br-fixture', 'address':'172.19.0.2', 'container_id':'d'*64,
+                           'network_id':'e'*64, 'namespace_identity':'4:555'},
+                'proxy_policy':{'format':1, 'proxy_tag':'proxy', 'dns_transport':'udp',
+                                'payload_networks':['tcp','udp'], 'outer_endpoints':[
+                                    {'family':4,'address':'192.0.2.8','protocol':'tcp','port_start':443,'port_end':443},
+                                    {'family':4,'address':'198.51.100.9','protocol':'udp','port_start':8443,'port_end':8445}]}}
+
+    def test_version_two_dynamic_paths_and_membership(self):
+        sid='1'*32
+        for mode in ('v1','v2'):
+            with self.subTest(mode=mode):
+                binding=Binding.from_text(json.dumps(self.document(mode)))
+                leaf=sid if mode=='v1' else 'dev-session-'+sid+'.service'
+                self.assertEqual(binding.session_path(sid),binding.cgroup_root/leaf)
+                text=('7:net_prio,net_cls:/dev-session-v8/'+sid+'\n0::/system.slice/dev-session-'+sid+'.service\n'
+                      if mode=='v1' else '0::/devsession.slice/dev-session-'+sid+'.service\n')
+                binding.verify_membership(text,sid)
+                with self.assertRaises(AssertionError):
+                    binding.verify_membership(text.replace(sid,'2'*32),sid)
+                with self.assertRaises(AssertionError):
+                    binding.verify_membership(text.replace('.service','.service/child'),sid)
+
+    def test_binding_rejects_legacy_duplicate_keys_and_noncanonical_policy(self):
+        value=self.document()
+        bad=[ 'br-test\n172.19.0.2\n192.0.2.8\n443\n',
+              json.dumps(value)+'\n'+json.dumps(value),
+              json.dumps(value).replace('"format": 2','"format": 2, "format": 2',1)]
+        for section,key,replacement in [(None,'format',True),('cgroup','mount','/sys/fs/cgroup/../tmp'),
+                 ('cgroup','identity','25:0'),('gateway','container_id','bad'),
+                 ('proxy_policy','payload_networks',['udp']),('proxy_policy','dns_transport','https')]:
+            altered=json.loads(json.dumps(value));target=altered[section] if section else altered
+            target[key]=replacement;bad.append(json.dumps(altered))
+        altered=json.loads(json.dumps(value));altered['proxy_policy']['outer_endpoints'].reverse();bad.append(json.dumps(altered))
+        altered=json.loads(json.dumps(value));altered['proxy_policy']['outer_endpoints'][0]['extra']=1;bad.append(json.dumps(altered))
+        for document in bad:
+            with self.subTest(document=document[:80]), self.assertRaises((ValueError,AssertionError)):
+                Binding.from_text(document)
+
+    def test_outer_capture_filter_preserves_all_protocols_and_ranges(self):
+        binding=Binding.from_text(json.dumps(self.document()))
+        self.assertEqual(binding.outer_bpf(),
+            '(ip and src host 172.19.0.2 and ((dst host 192.0.2.8 and tcp and dst port 443) or '
+            '(dst host 198.51.100.9 and udp and dst portrange 8443-8445)))')
+
+    def test_socket_evidence_requires_each_created_inode_in_exact_service(self):
+        path='/devsession.slice/dev-session-'+'1'*32+'.service'
+        rows='tcp LISTEN 0 1 127.0.0.1:1234 0.0.0.0:* ino:101 cgroup:'+path+'\n'
+        rows+='udp UNCONN 0 0 127.0.0.1:1235 0.0.0.0:* ino:102 cgroup:'+path+'\n'
+        Binding.verify_socket_rows(rows,[101,102],path)
+        # iproute2 may print the same field from both -e and --cgroup.
+        Binding.verify_socket_rows(rows.replace('cgroup:'+path,'cgroup:'+path+' cgroup:'+path),[101,102],path)
+        for bad in (rows.replace('ino:102','ino:103'),rows.replace(path,path+'/child'),
+                    rows.replace('cgroup:'+path,'cgroup:/system.slice/unrelated.service'),rows+rows,
+                    rows.replace('cgroup:'+path,'cgroup:'+path+' cgroup:/system.slice/unrelated.service')):
+            with self.subTest(rows=bad), self.assertRaises(AssertionError):
+                Binding.verify_socket_rows(bad,[101,102],path)
+
+    def test_namespace_change_demands_check_and_init_refusal(self):
+        for check_exit,init_exit,accepted in ((1,1,True),(0,1,False),(1,0,False)):
+            with self.subTest(check=check_exit,init=init_exit),tempfile.TemporaryDirectory() as directory:
+                suite=object.__new__(Suite);suite.output=Path(directory)
+                suite.binding=Binding.from_text(json.dumps(self.document()))
+                suite.assert_rules=mock.Mock(return_value={'binding_retained':True})
+                suite.rejected_start=mock.Mock(return_value={'payload_executed':False})
+                suite.gateway_ready=mock.Mock(side_effect=AssertionError('changed namespace must not be admitted'))
+                calls=[]
+                def fake_command(*args,**kwargs):
+                    calls.append(args)
+                    if args==('docker','inspect','worker'):
+                        return subprocess.CompletedProcess(args,0,json.dumps([{'Id':'d'*64,'State':{'Pid':123,'Running':True}}]),'')
+                    assert args in ((DEV,'check'),(DEV,'init')),'unexpected external operation'
+                    return subprocess.CompletedProcess(args,check_exit if args[-1]=='check' else init_exit,'','refused')
+                original_stat=Path.stat
+                def fake_stat(path,*args,**kwargs):
+                    if str(path)=='/proc/123/ns/net':return SimpleNamespace(st_dev=4,st_ino=999)
+                    return original_stat(path,*args,**kwargs)
+                with mock.patch(__name__+'.command',side_effect=fake_command),mock.patch.object(Path,'stat',fake_stat):
+                    if accepted:
+                        result=suite.after_namespace_fault('test-namespace')
+                        self.assertTrue(result['offline_rebind_required'])
+                        self.assertTrue(result['binding_and_guards_retained'])
+                        self.assertIn((DEV,'init'),calls)
+                        suite.rejected_start.assert_called_once()
+                        self.assertGreaterEqual(suite.assert_rules.call_count,3)
+                    else:
+                        with self.assertRaises(AssertionError):suite.after_namespace_fault('test-namespace')
+                suite.gateway_ready.assert_not_called()
+
+    def test_tcp_only_udp_rejection_may_happen_during_send(self):
+        suite=object.__new__(Suite);suite.udp_echo=('192.0.2.254',40123);suite.next_probe_port=21000
+        document=self.document();document['proxy_policy'].update(payload_networks=['tcp'],dns_transport='https')
+        suite.binding=Binding.from_text(json.dumps(document))
+        sock=mock.MagicMock();sock.__enter__.return_value=sock
+        sock.send.side_effect=OSError(errno.ENETUNREACH,'test UDP rejection')
+        fake_socket=SimpleNamespace(AF_INET=2,SOCK_DGRAM=2,socket=mock.Mock(return_value=sock))
+        def evaluate(code):
+            scope={}
+            with mock.patch.dict('sys.modules',{'socket':fake_socket}):exec(code,scope)
+            return scope['result']
+        result=suite.ordinary_udp(SimpleNamespace(value=evaluate))
+        self.assertFalse(result['received'])
+        self.assertFalse(result['payload_udp'])
+        self.assertEqual(result['errno'],errno.ENETUNREACH)
+        suite.binding=Binding.from_text(json.dumps(self.document()))
+        with self.assertRaises(AssertionError):suite.ordinary_udp(SimpleNamespace(value=evaluate))
+
+
+class FaultTests(unittest.TestCase):
+    """Exercise restoration through fake command boundaries, never a firewall."""
+
+    def suite(self):
+        suite=object.__new__(Suite)
+        document=BindingTests.document()
+        # The first IP has two transport entries but needs exactly one DROP.
+        document['proxy_policy']['outer_endpoints'].insert(1,
+            {'family':4,'address':'192.0.2.8','protocol':'udp','port_start':443,'port_end':443})
+        suite.binding=Binding.from_text(json.dumps(document))
+        suite.a=SimpleNamespace(value=mock.Mock(return_value=True));suite.b=object()
+        suite.tcp=SimpleNamespace(server_address=('127.0.0.1',23456))
+        healthy={'ok':True,'result':{'status':200,'tls':True,'socket':['fake-kept-socket']}}
+        suite.https=mock.Mock(side_effect=[healthy,{'ok':False},healthy])
+        suite.existing_https=mock.Mock(return_value={'ok':False})
+        suite.rejected_start=mock.Mock();suite.echo=mock.Mock();suite.forced_egress=mock.Mock()
+        suite.gateway_ready=mock.Mock();suite.assert_rules=mock.Mock()
+        suite.gateway_command=mock.Mock(return_value=subprocess.CompletedProcess([],0,'',''))
+        return suite
+
+    def test_node_outage_blocks_every_unique_ip_and_deletes_only_exact_owned_rules(self):
+        suite=self.suite();result=suite.node_outage()
+        calls=[call.args for call in suite.gateway_command.call_args_list]
+        inserted=[args for args in calls if '-I' in args];deleted=[args for args in calls if '-D' in args]
+        self.assertEqual([args[args.index('-d')+1] for args in inserted],['192.0.2.8/32','198.51.100.9/32'])
+        self.assertEqual([args[6:] for args in inserted],[args[5:] for args in reversed(deleted)])
+        for args in inserted:
+            self.assertEqual(args[:6],('iptables-legacy','-w','5','-I','OUTPUT','1'))
+            self.assertEqual(args[-2:],('-j','DROP'))
+            self.assertIn('--comment',args)
+        self.assertEqual(result['blocked_outer_addresses'],['192.0.2.8','198.51.100.9'])
+        suite.gateway_ready.assert_called_once();suite.assert_rules.assert_called_once()
+        suite.forced_egress.assert_called_once_with(suite.a)
+
+    def test_partial_node_outage_insertion_is_rolled_back_on_exception(self):
+        suite=self.suite();calls=[]
+        def boundary(*args):
+            calls.append(args)
+            if '-I' in args and '198.51.100.9/32' in args:raise RuntimeError('insertion failed')
+        suite.gateway_command.side_effect=boundary
+        with self.assertRaisesRegex(RuntimeError,'insertion failed'):suite.node_outage()
+        deleted=[args for args in calls if '-D' in args]
+        self.assertEqual(len(deleted),1);self.assertIn('192.0.2.8/32',deleted[0])
+        suite.gateway_ready.assert_called_once();suite.assert_rules.assert_called_once()
+
+    def test_cleanup_attempts_every_inserted_node_when_one_delete_fails(self):
+        suite=self.suite();calls=[]
+        def boundary(*args):
+            calls.append(args)
+            if '-D' in args and '198.51.100.9/32' in args:raise RuntimeError('deletion failed')
+        suite.gateway_command.side_effect=boundary
+        with self.assertRaises(AssertionError):suite.node_outage()
+        self.assertEqual([args[args.index('-d')+1] for args in calls if '-D' in args],
+                         ['198.51.100.9/32','192.0.2.8/32'])
+        suite.gateway_ready.assert_not_called()
+
+    def tun_boundary(self,suite,after_up=None,retain_first=False,discard_add=False):
+        halves=[{'dst':prefix,'dev':'tun0','scope':'link','flags':[]}
+                for prefix in ('0.0.0.0/1','128.0.0.0/1')]
+        before=[{'dst':'default','gateway':'172.19.0.1','dev':'eth0','flags':[]},
+                {'dst':'172.19.0.0/16','dev':'eth0','protocol':'kernel','scope':'link','prefsrc':'172.19.0.2','flags':[]},
+                {'dst':'192.0.2.8','gateway':'172.19.0.1','dev':'eth0','flags':[]},
+                {'dst':'198.18.0.0/15','dev':'tun0','protocol':'kernel','scope':'link','prefsrc':'198.18.0.1','flags':[]}]+halves
+        state={'routes':json.loads(json.dumps(before)),'up':True}
+        def boundary(*args):
+            if args==('ip','-j','-4','route','show','table','main'):
+                return subprocess.CompletedProcess(args,0,json.dumps(state['routes']),'')
+            if args==('ip','link','set','dev','tun0','down'):
+                state['up']=False
+                state['routes']=[row for row in state['routes'] if row['dst'] not in ('0.0.0.0/1','128.0.0.0/1')]
+            elif args==('ip','link','set','dev','tun0','up'):
+                state['up']=True
+                if retain_first:state['routes'].append(dict(halves[0]))
+                if after_up:after_up(state['routes'])
+            elif args[:4]==('ip','-4','route','add'):
+                self.assertTrue(state['up'])
+                self.assertIn(args[4],('0.0.0.0/1','128.0.0.0/1'))
+                self.assertFalse(any(row['dst']==args[4] for row in state['routes']))
+                self.assertEqual(dict(zip(args[5::2],args[6::2])),{'dev':'tun0','scope':'link','table':'main'})
+                if not discard_add:state['routes'].append(next(dict(row) for row in halves if row['dst']==args[4]))
+            else:raise AssertionError('unexpected route fault command')
+            return subprocess.CompletedProcess(args,0,'','')
+        suite.gateway_command.side_effect=boundary
+        def ready():
+            self.assertTrue(state['up'])
+            self.assertCountEqual(state['routes'],before)
+        suite.gateway_ready.side_effect=ready
+        return state,before
+
+    def test_tun_restores_lost_half_routes_even_if_fault_observation_raises(self):
+        for fail in (False,True):
+            for retain_first in (False,True):
+                with self.subTest(fail=fail,retain_first=retain_first):
+                    suite=self.suite();state,before=self.tun_boundary(suite,retain_first=retain_first)
+                    if fail:suite.existing_https.side_effect=RuntimeError('observation failed')
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError,'observation failed'):suite.tun_link_fault()
+                    else:suite.tun_link_fault()
+                    self.assertCountEqual(state['routes'],before)
+                    calls=[call.args for call in suite.gateway_command.call_args_list]
+                    self.assertEqual(calls[0],('ip','-j','-4','route','show','table','main'))
+                    self.assertEqual([args[4] for args in calls if args[:4]==('ip','-4','route','add')],
+                                     ['128.0.0.0/1'] if retain_first else ['0.0.0.0/1','128.0.0.0/1'])
+                    suite.gateway_ready.assert_called_once();suite.assert_rules.assert_called_once()
+
+    def test_tun_refuses_changed_or_duplicate_halves_before_adding_any_routes(self):
+        alterations=[
+            [{'dst':'128.0.0.0/1','dev':'eth0','scope':'link','flags':[]}],
+            [{'dst':'128.0.0.0/1','dev':'tun0','scope':'link','metric':9,'flags':[]}],
+            [{'dst':'128.0.0.0/1','dev':'tun0','scope':'link','flags':[]}]*2,
+            [{'dst':'203.0.113.0/24','dev':'eth0','scope':'link','flags':[]}]]
+        for rows in alterations:
+            with self.subTest(rows=rows):
+                suite=self.suite();state,before=self.tun_boundary(suite,after_up=lambda routes:routes.extend(rows))
+                with self.assertRaises(AssertionError):suite.tun_link_fault()
+                self.assertTrue(state['up'])
+                calls=[call.args for call in suite.gateway_command.call_args_list]
+                self.assertFalse(any(args[:4]==('ip','-4','route','add') for args in calls))
+                for row in rows:self.assertIn(row,state['routes'])
+                suite.gateway_ready.assert_not_called();suite.assert_rules.assert_not_called()
+
+    def test_tun_requires_reproducible_preexisting_routes_before_injection(self):
+        for alteration in ('missing','duplicate','metric'):
+            with self.subTest(alteration=alteration):
+                suite=self.suite();state,before=self.tun_boundary(suite)
+                if alteration=='missing':state['routes'].pop()
+                elif alteration=='duplicate':state['routes'].append(dict(state['routes'][-1]))
+                else:state['routes'][-1]['metric']=9
+                original=json.loads(json.dumps(state['routes']))
+                with self.assertRaises(AssertionError):suite.tun_link_fault()
+                self.assertEqual(state['routes'],original)
+                self.assertTrue(state['up'])
+                self.assertTrue(all(call.args==('ip','-j','-4','route','show','table','main')
+                                    for call in suite.gateway_command.call_args_list))
+                suite.https.assert_not_called();suite.gateway_ready.assert_not_called()
+
+    def test_tun_route_restoration_requires_exact_readback(self):
+        suite=self.suite();state,before=self.tun_boundary(suite,discard_add=True)
+        with self.assertRaises(AssertionError):suite.tun_link_fault()
+        calls=[call.args for call in suite.gateway_command.call_args_list]
+        self.assertEqual(len([args for args in calls if args[:4]==('ip','-4','route','add')]),2)
+        self.assertNotEqual(state['routes'],before)
+        suite.gateway_ready.assert_not_called();suite.assert_rules.assert_not_called()
+
+    def test_gateway_command_mutates_only_the_bound_namespace(self):
+        for inode in (555,999):
+            with self.subTest(inode=inode):
+                suite=self.suite();calls=[]
+                def boundary(*args,**kwargs):
+                    calls.append(args)
+                    return subprocess.CompletedProcess(args,0,'123\n' if args[0]=='docker' else '','')
+                original_stat=Path.stat
+                def namespace_stat(path,*args,**kwargs):
+                    if str(path)=='/proc/123/ns/net':return SimpleNamespace(st_dev=4,st_ino=inode)
+                    return original_stat(path,*args,**kwargs)
+                with mock.patch(__name__+'.command',side_effect=boundary),mock.patch.object(Path,'stat',namespace_stat):
+                    if inode==555:
+                        Suite.gateway_command(suite,'ip','link','set','dev','tun0','down')
+                        self.assertEqual(calls[-1],('nsenter','--net=/proc/123/ns/net','--',
+                                                   'ip','link','set','dev','tun0','down'))
+                    else:
+                        with self.assertRaises(AssertionError):Suite.gateway_command(suite,'ip','link','set','dev','tun0','down')
+                        self.assertEqual(len(calls),1)
+
+
+class RecreateTests(unittest.TestCase):
+    """Fake Docker/Compose ownership and replacement boundaries only."""
+
+    @contextlib.contextmanager
+    def fixture(self,alter=None,recreate=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'network.json';compose=root/'docker-compose.yml'
+            source.write_text('{"fixture_password":"d8-fixture-only-password"}\n')
+            compose.write_text('services:\n  worker:\n    image: worker:1.14.2-v8\n')
+            source.chmod(0o600);compose.chmod(0o600)
+            suite=FaultTests().suite();suite.compose_project='repo';suite.output=root
+            suite.binding.data['source_sha256']=hashlib.sha256(source.read_bytes()).hexdigest()
+            labels={'com.docker.compose.project':'repo','com.docker.compose.service':'worker',
+                    'com.docker.compose.project.working_dir':str(root),
+                    'com.docker.compose.project.config_files':str(compose),
+                    'com.docker.compose.oneoff':'False'}
+            container={'Id':'d'*64,'Name':'/worker','Image':'sha256:'+'1'*64,
+                       'State':{'Running':True,'Pid':123},'Config':{'Labels':labels},
+                       'Mounts':[{'Type':'bind','Source':str(source),'Destination':'/etc/worker/network.json','RW':False}]}
+            state={'container':container,'extra_containers':[],'calls':[],'source':source,'compose':compose,
+                   'namespace_inode':555,'ready':{'format':2,'source_sha256':suite.binding.data['source_sha256'],
+                     'effective_sha256':suite.binding.data['effective_sha256'],
+                     'policy_parser_sha256':suite.binding.data['policy_parser_sha256'],'policy':suite.binding.policy}}
+            if alter:alter(state)
+            def boundary(*args,**kwargs):
+                state['calls'].append(args)
+                if args==('docker','inspect','worker'):output=json.dumps([state['container']])
+                elif args[:2]==('docker','ps'):
+                    output='\n'.join([state['container']['Id']]+state['extra_containers'])+'\n'
+                elif args[:2]==('docker','compose'):
+                    if recreate:recreate(state)
+                    else:
+                        state['container']['Id']='f'*64;state['container']['State']['Pid']=124
+                        state['namespace_inode']=556
+                    output=''
+                elif args[:2]==('docker','exec'):
+                    self.assertEqual(args[2:],('f'*64,'cat','/run/worker/policy-ready'))
+                    output=json.dumps(state['ready'])
+                elif args in ((DEV,'check'),(DEV,'init')):
+                    return subprocess.CompletedProcess(args,1,'','binding rejected')
+                else:raise AssertionError('unexpected external operation')
+                return subprocess.CompletedProcess(args,0,output,'')
+            original_stat=Path.stat
+            def stat(path,*args,**kwargs):
+                if str(path) in ('/proc/123/ns/net','/proc/124/ns/net'):
+                    return SimpleNamespace(st_dev=4,st_ino=state['namespace_inode'])
+                # Model the trusted root directory ancestry of the CI checkout.
+                if path in root.parents:return SimpleNamespace(st_uid=0,st_mode=0o40755)
+                return original_stat(path,*args,**kwargs)
+            with mock.patch(__name__+'.INSTALL_ROOT',root),mock.patch(__name__+'.command',side_effect=boundary),\
+                 mock.patch.object(Path,'stat',stat):
+                yield suite,state
+
+    def test_recreate_targets_only_owned_project_and_requires_binding_refusal(self):
+        with self.fixture() as (suite,state):
+            result=suite.gateway_namespace_fault('gateway-recreate')
+            mutations=[args for args in state['calls'] if args[:2]==('docker','compose')]
+            self.assertEqual(mutations,[('docker','compose','--project-directory',str(suite.output),
+                '--project-name','repo','-f',str(suite.output/'docker-compose.yml'),
+                'up','-d','--no-deps','--no-build','--pull','never','--force-recreate','worker')])
+            self.assertTrue(result['container_changed']);self.assertTrue(result['offline_rebind_required'])
+            self.assertEqual(result['container_id_before'],'d'*64);self.assertEqual(result['container_id_after'],'f'*64)
+            self.assertTrue(result['replacement_readiness_verified'])
+            self.assertIn((DEV,'check'),state['calls']);self.assertIn((DEV,'init'),state['calls'])
+            suite.gateway_ready.assert_not_called();suite.forced_egress.assert_called_once_with(suite.a)
+            self.assertGreaterEqual(suite.assert_rules.call_count,3)
+
+    def test_recreate_rejects_unowned_container_project_and_source_before_mutating(self):
+        alterations=[
+            lambda s:s['container'].update(Id='a'*64),
+            lambda s:s['container'].update(Name='/unrelated'),
+            lambda s:s.update(namespace_inode=999),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.project':'production'}),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.service':'database'}),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.project.working_dir':'/other'}),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.project.config_files':'/other/compose.yml'}),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.oneoff':'True'}),
+            lambda s:s['container']['Mounts'][0].update(RW=True),
+            lambda s:s['container']['Mounts'][0].update(Source='/unrelated/network.json'),
+            lambda s:s['extra_containers'].append('a'*64),
+            lambda s:s['source'].write_text('changed fake source'),
+            lambda s:s['source'].chmod(0o666)]
+        for index,alter in enumerate(alterations):
+            with self.subTest(alteration=index),self.fixture(alter=alter) as (suite,state):
+                with self.assertRaises(AssertionError):suite.gateway_namespace_fault('gateway-recreate')
+                self.assertFalse(any(args[:2] in (('docker','compose'),('docker','kill'),('docker','start'),('docker','stop'))
+                                     for args in state['calls']))
+                suite.https.assert_not_called()
+
+    def test_recreate_requires_a_different_container_id(self):
+        with self.fixture(recreate=lambda state:None) as (suite,state):
+            with self.assertRaises(AssertionError):suite.gateway_namespace_fault('gateway-recreate')
+            suite.existing_https.assert_not_called();suite.assert_rules.assert_called()
+            self.assertNotIn((DEV,'init'),state['calls'])
+
+    def test_new_container_id_requires_refusal_even_if_namespace_inode_is_reused(self):
+        def recreate(state):
+            state['container']['Id']='f'*64;state['container']['State']['Pid']=124
+        with self.fixture(recreate=recreate) as (suite,state):
+            result=suite.gateway_namespace_fault('gateway-recreate')
+            self.assertTrue(result['container_changed']);self.assertFalse(result['namespace_changed'])
+            self.assertTrue(result['offline_rebind_required'])
+            self.assertIn((DEV,'check'),state['calls']);self.assertIn((DEV,'init'),state['calls'])
+            suite.gateway_ready.assert_not_called()
+
+    def test_recreate_refuses_source_image_or_ready_drift(self):
+        for alteration in ('source','compose','image','ready'):
+            def recreate(state):
+                state['container']['Id']='f'*64;state['container']['State']['Pid']=124;state['namespace_inode']=556
+                if alteration in ('source','compose'):state[alteration].write_text('changed fixture')
+                elif alteration=='image':state['container']['Image']='sha256:'+'2'*64
+                else:state['ready']['effective_sha256']='0'*64
+            with self.subTest(alteration=alteration),self.fixture(recreate=recreate) as (suite,state):
+                with self.assertRaises(AssertionError):suite.gateway_namespace_fault('gateway-recreate')
+                suite.existing_https.assert_not_called();suite.gateway_ready.assert_not_called()
+                suite.assert_rules.assert_called()
+
+    def test_recreate_failure_never_blindly_starts_or_repairs_a_container(self):
+        def fail(state):raise RuntimeError('controlled Compose failure')
+        with self.fixture(recreate=fail) as (suite,state):
+            with self.assertRaisesRegex(RuntimeError,'controlled Compose failure'):
+                suite.gateway_namespace_fault('gateway-recreate')
+            self.assertFalse(any(args[:2] in (('docker','start'),('docker','kill'),('docker','stop')) for args in state['calls']))
+            self.assertNotIn((DEV,'init'),state['calls']);suite.assert_rules.assert_called()
 
 
 if __name__=='__main__':main()

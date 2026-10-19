@@ -6,7 +6,9 @@
 
 這是原 SOCKS 簡易版的加強版本，**在 Docker 容器內置 sing-box 代理核心**，不再需要你另外開一個本地 SOCKS 入口；同時加入更嚴格的權限限制、啟動前檢查，以及代理或網絡故障時阻止直連的措施。
 
-隨附的 `network.json` 使用 Hysteria2 作為配置範例。sing-box 本身支援多種代理協議，可以依你的伺服器選擇配置；本專案目前的啟動檢查與防火牆仍配合這份範例，使用其他協議時還要相應調整，詳見下方代理設定說明。
+隨附的 `network.json` 使用 Hysteria2 作為配置範例。本版會依固定 sing-box 1.14.2 核心的受支援配置，自動推導代理的外層 TCP／UDP、跳埠、候選出口及 detour，配套主機和容器的路由、防火牆與 DNS。更換受支援協議不需要手改兩套規則；完整邊界見 [協議與功能矩陣](docs/protocol-matrix.md)。
+
+本版也會自動選擇可用的 cgroup v1／v2，**優先 v1**。Ubuntu 20.04.6 hybrid／v1、Ubuntu 26.04.1 純 v2，以及 Debian 13.7 KVM 純 v2 已有 Hysteria2 與 HTTP CONNECT 的受控實機結果；各系統實際涵蓋的故障與限制見 [驗證紀錄](docs/VERIFICATION.md)。
 
 Agent 仍然在你的電腦上運行，可以使用原本有權存取的檔案、開發工具和本機服務，也可以啟動 GUI 應用。這個專案的重點，是減少一般遙測容易看到的代理設定與 TUN 網卡線索，降低網絡環境被誤判為異常的機會。維護者已使用本方案運行 Claude Code 數月，日常運行穩定。
 
@@ -43,10 +45,10 @@ Agent 仍然在你的電腦上運行，可以使用原本有權存取的檔案�
 
 ## 使用前需要準備什麼
 
-- **符合條件的 Linux 電腦。** 目前以 Ubuntu 20.04、systemd 245、cgroup v1 的 `net_cls,net_prio` 為主要環境；只有 cgroup v2 的系統不能直接使用。
+- **符合條件的 Linux／systemd 電腦。** 自動優先選擇可寫入且通過核心匹配探測的 cgroup v1 `net_cls`；否則嘗試 systemd cgroup v2 與 legacy `xt_cgroup --path`。IPv4、IPv6 兩套匹配都要可用，兩種模式皆不符合就拒絕啟動。已測環境包括 Ubuntu 20.04.6／systemd 245 的 hybrid 主機，以及 Ubuntu 26.04.1／systemd 259、Debian 13.7／systemd 257 的純 v2 主機；其他版本仍須通過本機能力探測與相應驗收。
 - **一般的 Docker 安裝與 Docker Compose。** 需要由系統管理員管理的 Docker，不能直接換成 rootless Docker 或把網關放進另一層普通容器。
 - **legacy 版防火牆工具。** 系統需有 `iptables-legacy`、`ip6tables-legacy` 及對應的 restore 命令；不要求你把整台電腦的預設工具切換成 legacy。
-- **可供 sing-box 使用的代理節點。** 隨附範例使用 Hysteria2、固定 IPv4 地址與固定埠。其他協議的配置依你的伺服器決定，同時須符合下方說明的腳本校驗與防火牆條件。
+- **可供固定核心使用的代理節點。** 節點目前必須是固定 IPv4，最終代理至少保證 TCP。可用協議、明確跳埠區間及代理鏈見下方說明；網域／IPv6 節點與動態發現尚未適配。
 - **可以使用 sudo 的管理帳戶。** 用來安裝、準備網絡和啟動會話；實際執行 Agent 的帳戶可以是另一個沒有 sudo 權限的普通帳戶。
 
 系統還需要 Bash、curl、jq、iproute2、util-linux、procps，以及 Docker CLI 和 systemd 的命令。Python 3 供測試工具使用，日常啟動 Agent 不依賴 Python。
@@ -58,7 +60,8 @@ docker compose version
 systemctl --version
 iptables-legacy --version
 ip6tables-legacy --version
-test -f /sys/fs/cgroup/net_cls,net_prio/net_cls.classid && echo "net_cls 可用"
+findmnt -t cgroup,cgroup2
+cat /proc/1/cgroup
 test -c /dev/net/tun && echo "TUN 可用"
 ```
 
@@ -118,7 +121,7 @@ locale
 
 以下以安裝在 `/opt/session` 為例。安裝目錄會只允許 root 存取，**不要把它當成 Agent 的工作目錄**；你的專案應放在普通帳戶有權讀寫的位置。
 
-如果舊版沙盒仍在運行，先結束舊版會話，再按舊版方式停止它的網關。不要讓兩套規則同時接管，也不要清空整台電腦的防火牆來處理衝突。
+如果舊版沙盒仍在運行，先用舊版入口結束全部會話，再按 [離線升級與重新綁定程序](docs/offline-upgrade.md) 處理。舊版四行 binding 或簡單 ready marker 不能直接沿用；不要讓兩套規則同時接管，也不要清空整台電腦的防火牆來處理衝突。
 
 ### 1. 將專案放到最終安裝目錄
 
@@ -149,15 +152,23 @@ sudoedit /opt/session/network.json
 
 **公開版中的地址和密碼都是範例，不能直接使用。請勿把填好真實資料的設定檔提交到公開倉庫。**
 
-sing-box 支援 Hysteria2、Shadowsocks、Trojan、VLESS、SOCKS 等多種出口配置，協議和認證欄位應依你的伺服器調整，詳見 [sing-box 官方出口配置文件](https://sing-box.sagernet.org/configuration/outbound/)。
+**本版已實作以下配置的靜態政策適配：** Hysteria 1／2、TUIC、Shadowsocks、Trojan、VMess、VLESS、Snell 4／6、HTTP／HTTPS CONNECT、SOCKS4／4a／5 的 TCP、SOCKS5 UoT、SSH、Naive，以及作 detour 包裝的 ShadowTLS 1／2／3。另支援 selector、urltest、相容的 detour、明確的 Hysteria 跳埠區間，以及矩陣列出的 V2Ray transport、UoT 和 multiplex 組合。Naive 需要映像包含對應建置標籤；已核對的 amd64 測試映像具備此標籤。
 
-**目前這份專案的配套腳本仍按範例設有限制：** [主機端檢查](lib/network.sh) 和 [容器啟動檢查](entrypoint-gateway.sh) 都明確要求 Hysteria2，並只放行固定節點的外層 UDP 通信。因此，單改 `network.json` 的協議名稱會被拒絕；使用其他 sing-box 協議時，還需要相應調整這兩份腳本的校驗、路由與放行規則，再驗證 TCP、UDP、DNS 和斷線阻斷。不要只取消檢查或全面放行來切換協議。
+**HTTPUpgrade 與 AnyTLS 本版明確拒絕。** 固定核心配對的 HTTPUpgrade 重複驗收在 Trojan／VMess／VLESS 上出現間歇失敗；可依服務端改用原生 TCP、HTTP、WebSocket、gRPC 或 QUIC。AnyTLS 雖通過一次有限的重用連線恢復對照，仍未通過後續節點故障解除後的 HTTPS 恢復，請改用另一個已驗收的代理協議。這些是固定核心下的具體驗收邊界；完整成功與失敗證據見[追加驗證紀錄](docs/validation-20261019-followup.md)。
+
+未加密的 SOCKS5 UoT 或 VLESS 可能讓代理流內的 DNS／UDP 內容在鏈路上可見。端點限制與 DNS 攔截控制流量路徑，內容保密仍取決於原始代理及 TLS 設定。程式不會自動修改這些設定。
+
+[公開配置範例](examples/proxies/) 和 [固定核心協議矩陣](docs/protocol-matrix.md) 說明每種配置的外層連線、內層能力及拒絕原因。服務端的協議、認證和憑證仍由你正確填寫；程式不探測節點、不猜密碼。官方文件會更新，欄位必須符合本專案固定的 1.14.2 核心。
+
+[共用解析器](gateway-policy.jq) 供主機與容器一起使用。它沿全部候選和 detour 推導真正的外層端點，只放行必要的 IP／協議／埠或區間。例如 Hysteria2 的 `network:"tcp"` 只限制內層，外層仍是 UDP；TCP CONNECT 代理則使用外層 TCP。SOCKS 原生 UDP 的 relay 是動態協商，尚未適配，必須明確使用 TCP 或相容的 UoT。未知選項、direct 出口、額外服務、remote rule set、未管理的 DNS／路由等會明確拒絕。
 
 目前範例沿用 `tls.insecure: true`，這表示略過代理伺服器的憑證驗證；連線有加密，也不能因此保證節點身分已經核實。若節點提供可驗證的憑證，請按服務端要求調整 TLS 設定，不要把略過驗證當作必要條件。
 
-其餘設定請先保留。尤其是 DNS 的 `1.1.1.1`、經 `proxy` 送出，以及開啟快取的設定，目前都會被程式核對，並非可以任意更換的選項。
+程式不修改你的原始 `network.json`，也不自動改動 TLS、認證或 log。日誌等級以原始配置中的 `log.level` 為準，Compose 不再透過 `LOG_LEVEL` 覆寫；修改這些內容也屬於配置變更，需要離線重新綁定。
 
-**請確保所用協議和節點支援 Agent 所需的 TCP 與 UDP 轉發。** 一些 Agent 會使用基於 UDP 的協議。以隨附 Hysteria2 範例而言，代理通道本身也使用 UDP；公司網絡或防火牆若擋住節點的 UDP 埠，整條通道都可能無法建立。其他協議的外層通信方式依其配置而定，網頁能開啟也不能代替對 UDP 功能的確認。
+請保留範例的受管 TUN、DNS 與 route 形狀。DNS 始終經 `proxy`，保持 IPv4 策略及開啟快取：所有候選都保證 UDP 時使用 `1.1.1.1:53`；只保證 TCP 時，自動生成經代理的 HTTPS DNS，向 `1.1.1.1:443` 的 `/dns-query` 查詢並驗證 `cloudflare-dns.com` 的 TLS 名稱。DNS 地址不會加入外層直連放行清單。
+
+**最終代理必須保證 TCP，UDP 則依配置與服務端能力而定。** 只有 TCP 的出口可以正常使用 HTTPS DNS，但普通 UDP 應用會失敗；混合候選群組只在所有候選都能承載 UDP 時才把它列為保證能力。啟動時會提示 UDP 不受保證，不能把提示視為 UDP 已驗收。Hysteria2 等 QUIC 協議的外層仍需網絡允許節點 UDP；網頁能開啟不能代替 UDP、DNS 和故障阻斷的確認。
 
 ### 3. 安裝 `session` 命令
 
@@ -193,6 +204,8 @@ session init
 這一步才會建立本工具使用的網絡規則和轉發路徑。它不更換電腦原本的預設網關，也不全機關閉 IPv6。
 
 `init` 只能在所有本工具的會話都已結束時執行。若容器還沒準備好，命令會失敗並保留已建立的限制；請查看容器日誌，待問題處理好後再試。
+
+首次初始化會選定 cgroup 模式並保存版本 2 的 binding，綁定該模式、cgroup 身分、容器／Docker 網絡／網絡 namespace、正規化政策，以及原始設定、有效設定和解析器三份 SHA-256。後續入場會重新核對；即使只改密碼、TLS 或 log，或只是重啟容器但 namespace 已變，也不會沿用舊綁定。`init` 不會自動接受這類變更，請先關閉全部會話並按 [離線程序](docs/offline-upgrade.md) 重新綁定。
 
 **`init` 或 `check` 顯示成功，只代表本機規則檢查通過，沒有替你測試代理是否真的能連上外網。**
 
@@ -312,6 +325,8 @@ flowchart TD
 
 系統會記住「哪些程式是從這個會話啟動的」，再把這些程式的外部 IPv4 連線送進指定的 Docker 容器。容器內的 sing-box 使用 TUN 接收連線，再經配置的代理出口送出；隨附範例使用 Hysteria2。一般使用時，Agent 不需要知道代理地址。
 
+cgroup v1 使用 `net_cls` classid；v2 使用常駐的 systemd `devsession.slice` 父群組，各會話 service 在其下面建立，legacy 防火牆以父路徑匹配子孫。選定後不會在運行中自動換模式；掛載、父群組身分或開機身分不符時保留限制並拒絕新會話。v2 父 slice 不隨最後一個會話退出而刪除，以保留現有 socket 與規則所依賴的身分。
+
 幾個加強措施分別負責：
 
 - **不讓 Agent 接手管理權限。** 設定網絡需要的 root 權限留在管理程式；Agent 啟動前會降為普通帳戶、清除附加群組和可用的管理能力，並禁止透過一般提權方式重新取得管理權限。
@@ -343,7 +358,7 @@ Agent 仍然使用電腦原本的檔案系統和工具，可以查看本地 IP�
 
 | 連線種類 | 本版行為 |
 | --- | --- |
-| 公網 IPv4 的 TCP／UDP | 經 Docker 網關，由 sing-box 交給配置的代理節點。 |
+| 公網 IPv4 的 TCP／UDP | 經 Docker 網關及代理圖轉發；普通 UDP 需要相容出口與服務端，只有 TCP 的出口不會改用直連補足 UDP。 |
 | 電腦本機 `127.0.0.0/8` 的 TCP／UDP | 可以使用任意埠，但目的埠 53 另行攔截。 |
 | 任意 IPv4 地址的 TCP／UDP 埠 53 | 交給容器，經代理向 `1.1.1.1` 查詢。 |
 | 內網、區域網、link-local、組播等地址 | 拒絕，不能直接連到路由器或其他區域網設備。 |
@@ -362,10 +377,11 @@ HTTPS 檢查只在啟動時做一次，不是持續健康監控，也不會自�
 
 | 情況 | 建議怎麼處理 |
 | --- | --- |
-| 系統只有 cgroup v2 | 請選用符合前述條件、提供 cgroup v1 `net_cls,net_prio` 的主機；不要為了啟動本工具就直接改動日常主機的開機設定。 |
-| 更換 sing-box 協議或節點形式 | 核心支援多種配置，但目前配套檢查仍按單一 IPv4、固定埠的 Hysteria2 範例編寫；更換協議、域名、IPv6 或跳埠需要同步適配腳本。 |
-| 第一次初始化後，更換節點 IP／埠或重建 Docker 網絡 | 管理程式會記住原本的綁定，發現改變就拒絕啟動。`init` 不會自動接受新綁定；目前需管理員在所有會話結束後離線處理，沒有一鍵遷移功能。 |
-| Docker 服務重新啟動 | 可能改變防火牆規則順序。請先關閉全部會話，再執行 `session init` 修復並重新開啟；不是無縫自動恢復。 |
+| 系統只有 cgroup v2 | 自動嘗試 systemd v2 與 IPv4／IPv6 legacy path 匹配；條件不足就拒絕。Ubuntu 26.04.1 與 Debian 13.7 KVM 已通過下列純 v2 測試範圍；不要因此跳過本機探測或盲目改開機設定。 |
+| 更換協議、transport、跳埠或 detour | 按 [協議矩陣](docs/protocol-matrix.md) 填寫配置，規則自動推導；固定 IPv4 以外的發現方式及未列入的能力明確拒絕。 |
+| 已初始化後修改任何原始設定或解析器 | 原始、有效設定及解析器的雜湊均須一致；先關閉全部會話，再 [離線重新綁定](docs/offline-upgrade.md)。僅密碼、TLS、log 或 JSON 格式改變也包括在內。 |
+| 容器 restart／recreate／rebuild 或 Docker 網絡重建 | container ID、network ID 或網絡 namespace 身分改變就不能沿用 binding；同名容器也一樣，需要離線重新綁定。 |
+| Docker daemon 重新啟動 | 身分不變但規則順序改變時，全部會話關閉後可執行 `session init` 修復；若 namespace 或其他綁定身分已變，則走離線程序。沒有無縫恢復承諾。 |
 | 入口被 `SIGKILL` 等方式強制殺掉 | 會話可能仍在運行，但限制會保留。請用 `session status` 和 `session close ID` 處理。 |
 | 使用遠端工具直接傳入 socket 作為標準輸入輸出 | 會拒絕啟動；需要使用一般終端、PTY 或 pipe。 |
 | 從 root 終端直接啟動 | 沒有有效的原普通帳戶資訊時，必須明確指定 `-u 普通帳戶`；不允許 root 工作負載。 |
@@ -401,6 +417,7 @@ bash -n install-dev-session.sh
 bash -n lib/main.sh
 bash -n lib/host.sh
 bash -n lib/network.sh
+bash -n lib/cgroup.sh
 bash -n lib/session.sh
 bash -n lib/cli.sh
 bash -n lib/context.sh
@@ -425,17 +442,29 @@ sha256sum -c MANIFEST.sha256
 
 ### 已有驗證紀錄
 
-專案保留的歷史紀錄包括 Ubuntu 20.04 的實機網絡與會話測試，以及後續的安裝、權限和啟動器回歸。最新一輪啟動器紀錄為 **127 項測試：125 通過、2 項因環境限制跳過、零失敗**。
+截至 **2026-10-19**，證據按實際執行層次分開記錄：
 
-這些是先前的測試結果，**不是整理本公開版時重新執行的測試**。實機測試曾使用同一測試機內的臨時 Hysteria2 節點；不能因此推定你的真實遠端節點、其他系統版本或桌面環境已驗收。實際 X11／Wayland 視窗的完整驗收也尚未完成。
+| 層次與環境 | 已通過的範圍 |
+| --- | --- |
+| 配置檢查 | 初輪 24／24 份範例通過共用解析器及真實 sing-box 1.14.2 核心檢查；後續撤下 AnyTLS，現行保留 23 份公開範例。假節點不因此變成可用節點。 |
+| 真實協議 loopback | 初輪 47 組各至少一次通過；後續驗收使三個 HTTPUpgrade 案例及 AnyTLS 被明確拒絕，現行預設為 43 組。TCP、UDP 或按能力拒絕、DNS 快取／TTL 和停止 server 後的阻斷紀錄保留。這一層不代替主機 cgroup／TUN／防火牆驗收。 |
+| Ubuntu 20.04.6 hybrid／v1 | Hysteria2 與 HTTP CONNECT 的核心／故障套件各 17／17，兩者的代理出口 IP 比對通過。另完成 v1 生命週期 10／10（含 100 個短會話）、能力 13／13、CLI 9／9。 |
+| Ubuntu 26.04.1 原生純 v2 | Hysteria2／HTTP 各執行 healthy、gateway-stop、gateway-kill、gateway-recreate、docker-restart，共 10／10 CI jobs 通過；包括真實會話、封包、出口 IP 與生命週期驗收。 |
+| Debian 13.7 KVM 純 v2 | Hysteria2／HTTP 的 healthy jobs 共 2／2 通過；各含核心 16／16、生命週期 10／10、100 個短會話及出口 IP 比對。Debian 的容器／Docker namespace 故障不在這兩個 job 範圍內。 |
 
-為避免公開主機資料，原始日誌、封包擷取和私人部署資料不隨公開版提供；保留的技術摘要見 [驗證紀錄](docs/VERIFICATION.md)。
+逐協議主機初輪 [CI 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481) 為 **50／59**，第二輪 [CI 39206996173](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39206996173) 為 **54／56**，第三輪 [CI 39261938798](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39261938798) 為 **54／55**，三輪均保留為失敗。第三輪唯一失敗為健康階段的 UDP DNS 查詢逾時，後續有界查詢與完整嘗試證據仍須重新驗收。HTTPUpgrade／AnyTLS 的明確拒絕、抓包完整性修正及 43＋12 組關卡見[追加驗證紀錄](docs/validation-20261019-followup.md)。
+
+純 v2 結果來自 [CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891)（`58dcfad596856fc3696d138f84d1c0f37e6e0ebd`），**12／12 jobs 通過**。v2 證據另核對會話建立的實際 socket inode 與所屬 service cgroup。容器重建確實更換 container ID 與 namespace；舊 binding／共同規則保留，`check`、`init` 及新工作負載入場拒絕，必須離線重新綁定，沒有自動沿用新 namespace。
+
+受控 DNS 測試包括跨 TCP／UDP 查詢共用快取、TTL 到期重新查詢，以及停用快取、移除 HTTPS DNS detour 的預期失敗負對照。SSH 使用固定核心 client 與獨立 Paramiko 3.5.1 server；ShadowTLS 使用內層 Shadowsocks／UoT 與不發送 session ticket 的私有 TLS cover，憑證驗證保持啟用。這些結果限於[協議矩陣](docs/protocol-matrix.md)列出的具體配置。逐協議完整主機出口矩陣與真實 X11／Wayland 視窗驗收尚待相應結果；其他未列出的協議選項和主機環境不能沿用上述通過狀態。
+
+主機 fixture 使用同機隔離的假認證代理；出口 IP 比對證明受管請求與指定 fixture 的獨立觀測一致，不能證明遠端匿名性或使用者實際節點的品質。版本、命令、CI artifacts、跳過原因與歷史結果見 [驗證紀錄](docs/VERIFICATION.md)。公開摘要不包含私人節點、憑證、實際出口 IP 或原始封包。本次改動仍在工作分支，尚未合併 `main`；合併須另行審閱與明確批准。
 
 ## 常見問題
 
 **容器已經啟動，為什麼 `session` 仍然失敗？**
 
-先確認已將範例地址和密碼改成有效節點，再檢查節點的 UDP 埠是否可達，以及是否執行過 `session init`。查看網關日誌：
+先確認已按服務端填寫協議、地址、認證與 TLS，所需外層 TCP／UDP 埠可達，並已執行 `session init`。若曾修改配置或重啟／重建容器，先檢查是否需要離線重新綁定。查看網關日誌：
 
 ```bash
 sudo docker compose -p worker -f /opt/session/docker-compose.yml logs --tail=50 worker
@@ -471,6 +500,9 @@ ping 使用的通信方式不同，本版不按一般 VPN 的方式轉發 ICMP�
 | --- | --- |
 | [README.md](README.md) | 安裝、使用方式與限制。 |
 | [network.json](network.json) | sing-box 代理與 DNS 設定；公開版以 Hysteria2 提供範例資料。 |
+| [gateway-policy.jq](gateway-policy.jq) | 主機／容器共用的政策及有效配置解析器。 |
+| [examples/proxies/](examples/proxies/) 與 [協議矩陣](docs/protocol-matrix.md) | 固定核心的多協議範例、傳輸能力與拒絕原因。 |
+| [離線升級程序](docs/offline-upgrade.md) | 關閉會話後更新版本、修改配置或重新綁定網關。 |
 | [policy.json](policy.json) | 啟動檢查網址與政策版本。 |
 | [docker-compose.yml](docker-compose.yml) | Docker 轉發容器設定。 |
 | [Dockerfile.gateway](Dockerfile.gateway) | 建立包含 sing-box 和網關工具的映像。 |

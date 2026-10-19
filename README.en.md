@@ -6,7 +6,9 @@ Let your AI agent access the internet through a proxy you choose, reducing the c
 
 This is an enhanced version of the original simple SOCKS edition. It **includes the sing-box proxy core inside a Docker container**, so you no longer need to run a separate local SOCKS endpoint. It also adds stricter permission limits, checks before startup, and protection against direct connections when the proxy or network fails.
 
-The included `network.json` uses Hysteria2 as an example configuration. sing-box itself supports multiple proxy protocols, and you can choose a configuration to suit your server. This project's current startup checks and firewall rules still match the included example, so other protocols require corresponding changes, as explained in the proxy configuration section below.
+The included `network.json` uses Hysteria2 as an example. This edition reads supported configurations for the pinned sing-box 1.14.2 core and derives the required outer TCP/UDP connections, port hopping, outbound candidates and detours. It configures the host and container routes, firewall and DNS automatically. Changing a supported protocol does not require editing two sets of rules; see the [protocol and feature matrix](docs/protocol-matrix.md) for the complete boundary.
+
+The program also selects a usable cgroup v1 or v2 mode automatically, **preferring v1**. Controlled host tests with Hysteria2 and HTTP CONNECT have passed on Ubuntu 20.04.6 hybrid/v1, Ubuntu 26.04.1 pure v2, and Debian 13.7 KVM pure v2. See the [verification records](docs/VERIFICATION.md) for each environment's tested failure scenarios and limits.
 
 The agent still runs on your computer and can use files, development tools, and local services that its account can normally access. It can also launch GUI applications. This project focuses on reducing the obvious proxy settings and TUN interface clues available to ordinary telemetry, making the network environment less likely to be mistakenly flagged as unusual. The maintainer has used this setup with Claude Code for several months, with stable everyday operation.
 
@@ -43,10 +45,10 @@ This project also uses TUN internally. The difference is that it places TUN insi
 
 ## What you need before starting
 
-- **A compatible Linux computer.** The primary environment is currently Ubuntu 20.04, systemd 245, and cgroup v1 with `net_cls,net_prio`. Systems with only cgroup v2 cannot use this project as provided.
+- **A compatible Linux/systemd computer.** The program first tries writable cgroup v1 `net_cls` with a working kernel match, then systemd cgroup v2 with legacy `xt_cgroup --path`. Both IPv4 and IPv6 matches must work; startup is refused if neither mode qualifies. Tested environments include Ubuntu 20.04.6/systemd 245 hybrid, Ubuntu 26.04.1/systemd 259 pure v2, and Debian 13.7/systemd 257 pure v2. Other versions still require local capability checks and the corresponding acceptance tests.
 - **A standard Docker installation and Docker Compose.** Docker must be managed by the system administrator. Rootless Docker, or placing the gateway inside another ordinary container, is not a direct substitute.
 - **Legacy firewall tools.** The system needs `iptables-legacy`, `ip6tables-legacy`, and their corresponding restore commands. You do not need to switch the computer's default firewall tools to legacy.
-- **A proxy node usable with sing-box.** The included example uses Hysteria2 with a fixed IPv4 address and port. Configuration for other protocols depends on your server and must also meet the script validation and firewall requirements explained below.
+- **A proxy node usable with the pinned core.** Nodes currently need fixed IPv4 addresses, and the final proxy must guarantee TCP. Supported protocols, explicit port ranges and proxy chains are described below; domain/IPv6 nodes and dynamic discovery have not been adapted.
 - **An administrator account with sudo access.** This is used for installation, network preparation, and starting sessions. The agent itself can run under a separate normal account without sudo access.
 
 The system also needs Bash, curl, jq, iproute2, util-linux, procps, the Docker CLI, and systemd commands. Python 3 is used by the test tools; everyday agent startup does not depend on Python.
@@ -58,7 +60,8 @@ docker compose version
 systemctl --version
 iptables-legacy --version
 ip6tables-legacy --version
-test -f /sys/fs/cgroup/net_cls,net_prio/net_cls.classid && echo "net_cls available"
+findmnt -t cgroup,cgroup2
+cat /proc/1/cgroup
 test -c /dev/net/tun && echo "TUN available"
 ```
 
@@ -118,7 +121,7 @@ These changes only reduce direct reporting of the original timezone and language
 
 The following examples install the project in `/opt/session`. Only root will be allowed to access the installation directory. **Do not use it as the agent's working directory**; keep your projects somewhere the normal account can read and write.
 
-If an older sandbox is still running, end its sessions first, then stop its gateway using that version's procedure. Do not let both sets of rules manage the same traffic, or clear the computer's entire firewall to resolve conflicts.
+If an older sandbox is still running, use its existing launcher to close every session, then follow the [offline upgrade and rebinding procedure](docs/offline-upgrade.md). A legacy four-line binding or simple ready marker cannot be reused. Do not let both sets of rules manage the same traffic, or clear the computer's entire firewall to resolve conflicts.
 
 ### 1. Put the project in its final installation directory
 
@@ -149,15 +152,23 @@ The instructions below start with the included Hysteria2 example. In `outbounds`
 
 **The address and password in the public edition are examples and cannot be used as supplied. Do not commit a configuration containing real connection details to a public repository.**
 
-sing-box supports outbound configurations for Hysteria2, Shadowsocks, Trojan, VLESS, SOCKS, and other protocols. Adjust the protocol and authentication fields to match your server; see the [official sing-box outbound configuration documentation](https://sing-box.sagernet.org/configuration/outbound/).
+**Static policy adaptation is implemented for:** Hysteria 1/2, TUIC, Shadowsocks, Trojan, VMess, VLESS, Snell 4/6, HTTP/HTTPS CONNECT, TCP through SOCKS4/4a/5, SOCKS5 UoT, SSH, Naive, and ShadowTLS 1/2/3 as a detour wrapper. It also covers selector, urltest, compatible detours, explicit Hysteria port-hopping ranges, and the V2Ray transport, UoT and multiplex combinations listed in the matrix. Naive requires the corresponding image build tag, which is present in the inspected amd64 test image.
 
-**This project's supporting scripts currently retain restrictions based on the example:** Both the [host-side checks](lib/network.sh) and [container startup checks](entrypoint-gateway.sh) explicitly require Hysteria2 and allow outer UDP traffic only to the fixed node. Changing only the protocol name in `network.json` will therefore be rejected. To use another sing-box protocol, you must also adapt validation, routing, and allow rules in both scripts, then verify TCP, UDP, DNS, and blocking on disconnection. Do not switch protocols by simply removing checks or allowing all traffic.
+**HTTPUpgrade and AnyTLS are explicitly rejected in this release.** Repeated HTTPUpgrade tests of the pinned client/server pair produced intermittent failures with Trojan, VMess and VLESS. Depending on the server, use native TCP, HTTP, WebSocket, gRPC or QUIC. AnyTLS passed one bounded connection-reuse recovery check, but a later HTTPS connection still failed after a controlled node outage was removed; use another validated proxy protocol. These are acceptance limits for the pinned core. The [follow-up validation record](docs/validation-20261019-followup.md) preserves both successful and failed observations.
+
+Unencrypted SOCKS5 UoT or VLESS can expose DNS or UDP contents inside the proxy flow. Endpoint enforcement and DNS interception control the traffic path; content confidentiality depends on the original proxy and TLS configuration. The program does not automatically change those settings.
+
+The [public configuration examples](examples/proxies/) and [pinned-core protocol matrix](docs/protocol-matrix.md) describe each configuration's outer transport, payload capabilities and rejection reasons. You still supply the correct protocol, authentication and certificates for your server. The program does not scan nodes or guess credentials. Official documentation changes over time; fields must match this project's pinned 1.14.2 core.
+
+The host and container use the same [policy compiler](gateway-policy.jq). It follows every candidate and detour to determine the actual outer endpoints and allows only the required IP/protocol/port or range. For example, Hysteria2 `network:"tcp"` limits the payload while its outer connection remains UDP; a TCP CONNECT proxy uses outer TCP. Native SOCKS UDP negotiates a relay dynamically and is not adapted: explicitly choose TCP or compatible UoT. Unknown options, direct exits, additional services, remote rule sets and unmanaged DNS/routing are rejected.
 
 The current example retains `tls.insecure: true`, which skips certificate verification for the proxy server. An encrypted connection alone does not establish that the node's identity has been verified. If the node provides a verifiable certificate, adjust the TLS settings to match the server's requirements; do not treat skipping verification as necessary.
 
-Leave the remaining settings unchanged for now. In particular, the program currently verifies the DNS address `1.1.1.1`, forwarding through `proxy`, and enabled caching. These are not freely interchangeable options.
+The program leaves your source `network.json` untouched and does not automatically change TLS, authentication or logging. The source `log.level` controls logging; Compose no longer overrides it through `LOG_LEVEL`. Changing these fields also counts as a configuration change and requires offline rebinding.
 
-**Make sure the protocol and node support the TCP and UDP forwarding your agent needs.** Some agents use UDP-based protocols. In the included Hysteria2 example, the proxy tunnel itself also uses UDP; if a company network or firewall blocks the node's UDP port, the entire tunnel may fail to connect. Other protocols use outer transports determined by their configuration. Being able to open a webpage does not establish that UDP works.
+Keep the examples' managed TUN, DNS and route structure. DNS always uses `proxy`, retains the IPv4 strategy and enabled cache, and selects `1.1.1.1:53` when every candidate guarantees UDP. When only TCP is guaranteed, the effective configuration uses HTTPS DNS through the proxy, querying `/dns-query` at `1.1.1.1:443` with TLS verification for `cloudflare-dns.com`. The resolver is never added to the direct outer-endpoint allowlist.
+
+**The final proxy must guarantee TCP; UDP depends on the configuration and server.** An exit that supports only TCP can use HTTPS DNS, but ordinary UDP applications fail. A mixed candidate group guarantees UDP only if every candidate can carry it. Startup warns when UDP is not guaranteed; that warning is not evidence that UDP was tested. QUIC protocols such as Hysteria2 still require access to the node's outer UDP ports. A working webpage does not replace UDP, DNS and failure-blocking tests.
 
 ### 3. Install the `session` command
 
@@ -193,6 +204,8 @@ session init
 This step creates the network rules and forwarding path used by this tool. It does not replace the computer's original default gateway or disable IPv6 across the whole system.
 
 Run `init` only after all sessions managed by this tool have ended. If the container is not ready, the command fails and retains any restrictions already created. Check the container logs, resolve the problem, and try again.
+
+The first initialization selects a cgroup mode and writes a version 2 binding covering that mode, cgroup identity, the container/Docker network/network namespace, the normalized policy, and SHA-256 hashes of the source configuration, effective configuration and compiler. Admission rechecks these values. A password, TLS or log change counts, as does a container restart that changes its network namespace. `init` does not automatically accept a new identity: close every session and follow the [offline procedure](docs/offline-upgrade.md).
 
 **Success from `init` or `check` only means local rule checks passed. It does not test whether the proxy can actually reach the internet.**
 
@@ -312,6 +325,8 @@ flowchart TD
 
 The system tracks which programs were started from this session and sends their external IPv4 connections into the designated Docker container. Inside the container, sing-box receives connections through TUN and sends them through the configured proxy exit; the included example uses Hysteria2. In normal use, the agent does not need to know the proxy address.
 
+cgroup v1 uses a `net_cls` classid. v2 keeps a systemd `devsession.slice` parent active, creates session services beneath it, and matches descendants using the parent's path in legacy netfilter. The selected mode does not change automatically while the policy is bound. A changed mount, parent identity or boot identity retains restrictions and refuses new sessions. The v2 parent remains after the last session exits so existing sockets and rules retain the identity they rely on.
+
 The additional protections have several roles:
 
 - **Keep management privileges away from the agent.** Root access needed to configure networking stays with the management program. Before the agent starts, it drops to a normal account, clears supplementary groups and available administrative capabilities, and blocks ordinary ways of regaining administrator privileges.
@@ -343,7 +358,7 @@ The proxy provider may also observe or record connections. This tool does not gu
 
 | Connection type | Behavior in this edition |
 | --- | --- |
-| TCP/UDP to public IPv4 addresses | Sent through the Docker gateway and passed by sing-box to the configured proxy node. |
+| TCP/UDP to public IPv4 addresses | Forwarded through the Docker gateway and proxy graph. Ordinary UDP requires a compatible exit and server; an exit supporting only TCP does not fall back to direct UDP. |
 | TCP/UDP to the local computer at `127.0.0.0/8` | Any port is allowed, except that destination port 53 is intercepted separately. |
 | TCP/UDP port 53 at any IPv4 address | Sent to the container, then through the proxy to `1.1.1.1`. |
 | Private, LAN, link-local, multicast, and similar addresses | Rejected; direct connections to routers or other LAN devices are not allowed. |
@@ -362,10 +377,11 @@ You can open multiple sessions at once, but they share one exit configuration. E
 
 | Situation | Recommended action |
 | --- | --- |
-| The system has only cgroup v2 | Use a host meeting the requirements above, with cgroup v1 `net_cls,net_prio`. Do not directly change your everyday computer's boot configuration just to start this tool. |
-| Changing the sing-box protocol or node format | The core supports multiple configurations, but the supporting checks currently follow the Hysteria2 example with one IPv4 address and a fixed port. Switching protocols, using domain names or IPv6, or enabling port hopping requires corresponding script changes. |
-| Changing the node IP/port or recreating the Docker network after the first initialization | The management program remembers the original binding and refuses startup if it changes. `init` does not automatically accept a new binding. An administrator currently needs to handle this offline after all sessions have ended; there is no one-step migration feature. |
-| The Docker service restarts | Firewall rule order may change. Close all sessions first, run `session init` to repair the rules, and reopen the sessions. Recovery is not seamless or automatic. |
+| The system has only cgroup v2 | The program tries systemd v2 and both IPv4/IPv6 legacy path matches, refusing startup if requirements are missing. Ubuntu 26.04.1 and Debian 13.7 KVM passed the pure-v2 scope listed below; this does not remove local capability checks or justify blindly changing boot settings. |
+| Changing protocol, transport, port hopping or detours | Configure a supported combination from the [protocol matrix](docs/protocol-matrix.md); rules are derived automatically. Discovery beyond fixed IPv4 and unlisted capabilities are rejected. |
+| Changing any source configuration or the compiler after initialization | Source, effective and compiler hashes must match. Close every session and [rebind offline](docs/offline-upgrade.md). Password, TLS, logging and JSON-format-only changes also count. |
+| Container restart/recreation/rebuild or Docker network recreation | A changed container ID, network ID or network namespace requires offline rebinding, even if the container name stays the same. |
+| Docker daemon restart | If identities match and only rule order changed, close every session before repairing with `session init`. A changed namespace or other binding identity requires the offline procedure. Recovery is not seamless. |
 | The launcher is forcibly killed, for example with `SIGKILL` | The session may keep running, but restrictions remain in place. Use `session status` and `session close ID` to manage it. |
 | A remote tool passes sockets directly as standard input/output | Startup is refused. Use a regular terminal, PTY, or pipe. |
 | Starting directly from a root terminal | If the original caller's normal account cannot be determined, use `-u ACCOUNT` to select a normal account explicitly. Root workloads are not allowed. |
@@ -401,6 +417,7 @@ bash -n install-dev-session.sh
 bash -n lib/main.sh
 bash -n lib/host.sh
 bash -n lib/network.sh
+bash -n lib/cgroup.sh
 bash -n lib/session.sh
 bash -n lib/cli.sh
 bash -n lib/context.sh
@@ -425,17 +442,29 @@ For repeat verification, use the [real-host acceptance checklist](docs/host-vali
 
 ### Existing verification records
 
-The project's historical records include real-host networking and session tests on Ubuntu 20.04, followed by installation, permissions, and launcher regression tests. The latest recorded launcher run had **127 tests: 125 passed, 2 skipped because of environment limitations, and zero failures**.
+As of **2026-10-19**, results are recorded by the layer actually exercised:
 
-These are previous test results, **not tests rerun while preparing this public edition**. Real-host tests used a temporary Hysteria2 node on the same test machine. They do not establish acceptance of your actual remote node, other system versions, or desktop environments. Complete acceptance testing with actual X11/Wayland windows also remains unfinished.
+| Layer and environment | Verified scope |
+| --- | --- |
+| Configuration checks | The initial 24 examples passed the shared compiler and actual sing-box 1.14.2 core checks. AnyTLS was subsequently withdrawn, leaving 23 public examples. Their fake endpoints are not usable nodes. |
+| Real protocol loopback | Each of the initial 47 cases passed at least once; later acceptance led to explicit rejection of the three HTTPUpgrade cases and AnyTLS. The current default inventory is 43. TCP, UDP delivery or capability-based refusal, DNS caching/TTL and server-stop records remain available. This layer does not replace host cgroup, TUN or firewall acceptance. |
+| Ubuntu 20.04.6 hybrid/v1 | Hysteria2 and HTTP CONNECT each passed 17/17 core/failure checks and exit-IP comparison. Additional v1 results include lifecycle 10/10 with 100 short sessions, capabilities 13/13, and CLI 9/9. |
+| Ubuntu 26.04.1 native pure v2 | Hysteria2 and HTTP each ran healthy, gateway-stop, gateway-kill, gateway-recreate, and docker-restart: all 10 CI jobs passed, including real sessions, packet inspection, exit-IP comparison, and lifecycle checks. |
+| Debian 13.7 KVM pure v2 | Both Hysteria2 and HTTP healthy jobs passed: each includes core 16/16, lifecycle 10/10, 100 short sessions, and exit-IP comparison. Container/Docker namespace failure scenarios on Debian are outside these two jobs' scope. |
 
-To avoid publishing host information, raw logs, packet captures, and private deployment data are not included in the public edition. See the [verification records](docs/VERIFICATION.md) for the retained technical summary.
+The first per-protocol host run, [CI 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481), finished **50/59**; the second, [CI 39206996173](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39206996173), finished **54/56**. The third, [CI 39261938798](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39261938798), finished **54/55**. All three runs remain failures. The third run failed only at a healthy-stage UDP DNS query timeout; bounded client queries and complete attempt evidence still require a new full acceptance run. The explicit HTTPUpgrade/AnyTLS refusal, capture-completeness changes and 43+12 required jobs are recorded in the [follow-up validation record](docs/validation-20261019-followup.md).
+
+The pure-v2 results come from [CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891) at `58dcfad596856fc3696d138f84d1c0f37e6e0ebd`: **12/12 jobs passed**. The v2 evidence also matches actual socket inodes created by sessions to their service cgroups. Container recreation changed both the container ID and namespace. The old binding and shared rules remained, while `check`, `init`, and new workload admission refused the changed identity. Offline rebinding is required; the program does not automatically adopt a new namespace.
+
+Controlled DNS tests cover shared caching across TCP/UDP queries, TTL expiry/refetch, and expected failures when disabling the cache or removing the HTTPS DNS detour. SSH uses the pinned core client and a separate Paramiko 3.5.1 server. ShadowTLS uses an inner Shadowsocks/UoT proxy and a private TLS cover that sends no session tickets; certificate verification remains enabled. These results apply to the concrete configurations in the [protocol matrix](docs/protocol-matrix.md). The complete host egress matrix for individual protocols and actual X11/Wayland window acceptance still await their respective results. Unlisted protocol options and host environments do not inherit the results above.
+
+Host fixtures use isolated proxies with fake authentication on the same machine. Exit-IP equality proves that managed requests match an independent observation from the designated fixture; it does not establish remote anonymity or the quality of your actual node. See the [verification records](docs/VERIFICATION.md) for versions, commands, CI artifacts, skip reasons, and historical results. Public summaries omit private nodes, credentials, actual exit IPs, and raw packet captures. These changes remain on a work branch and have not been merged into `main`; merging requires separate review and explicit approval.
 
 ## FAQ
 
 **The container is running. Why does `session` still fail?**
 
-First confirm that you replaced the example address and password with a working node, that its UDP port is reachable, and that you have run `session init`. Check the gateway logs:
+First confirm that the protocol, address, authentication and TLS match your server, that its required outer TCP/UDP ports are reachable, and that you have run `session init`. If you changed configuration or restarted/recreated the container, check whether offline rebinding is required. Read the gateway logs:
 
 ```bash
 sudo docker compose -p worker -f /opt/session/docker-compose.yml logs --tail=50 worker
@@ -471,6 +500,9 @@ ping uses a different form of communication. This edition does not forward ICMP 
 | --- | --- |
 | [README.md](README.md) | Installation, usage, and limitations. |
 | [network.json](network.json) | sing-box proxy and DNS settings; the public edition provides example values using Hysteria2. |
+| [gateway-policy.jq](gateway-policy.jq) | Shared host/container compiler for policy and effective configuration. |
+| [examples/proxies/](examples/proxies/) and [protocol matrix](docs/protocol-matrix.md) | Pinned-core examples, transport capabilities and rejection reasons. |
+| [Offline upgrade procedure](docs/offline-upgrade.md) | Update versions, change configuration or rebind a gateway after closing sessions. |
 | [policy.json](policy.json) | Startup check URL and policy version. |
 | [docker-compose.yml](docker-compose.yml) | Docker forwarding container configuration. |
 | [Dockerfile.gateway](Dockerfile.gateway) | Builds an image containing sing-box and gateway tools. |

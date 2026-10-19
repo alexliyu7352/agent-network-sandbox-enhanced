@@ -15,7 +15,10 @@ LIB = ROOT / 'lib/session.sh'
 def run(body, *args, env=None):
     if not LIB.exists():
         raise AssertionError('native session management has not been implemented')
-    return subprocess.run(['bash', '-c', 'set -euo pipefail; source "$1"; shift; '+body,
+    # These tests isolate the established v1 session lifecycle. The cgroup
+    # adapter's state/readback validation has its own complete mount fixtures.
+    return subprocess.run(['bash', '-c', 'set -euo pipefail; source "${1%/*}/cgroup.sh"; '
+                           'source "$1"; CGROUP_MODE=v1; cgroup_verify() { :; }; shift; '+body,
                            'test', str(LIB), *map(str,args)], text=True, capture_output=True,
                           stdin=subprocess.DEVNULL, env=dict(os.environ, **(env or {})))
 

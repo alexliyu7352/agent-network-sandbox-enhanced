@@ -26,7 +26,7 @@ for arg in "$@"; do
         *) die 'Usage: install-dev-session.sh [--check] [--no-link]' ;;
     esac
 done
-for file in dev-session session-launcher install-dev-session.sh lib/main.sh lib/host.sh lib/network.sh lib/session.sh lib/cli.sh lib/context.sh network.json policy.json \
+for file in dev-session session-launcher install-dev-session.sh lib/main.sh lib/host.sh lib/network.sh lib/cgroup.sh lib/session.sh lib/cli.sh lib/context.sh gateway-policy.jq network.json policy.json \
     Dockerfile.gateway docker-compose.yml entrypoint-gateway.sh .dockerignore; do
     trusted_path "$source_dir/$file" || die "Untrusted source: $file"
     [[ -f $source_dir/$file ]] || die "Not a regular file: $file"

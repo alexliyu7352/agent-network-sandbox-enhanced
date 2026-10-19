@@ -2,25 +2,7 @@
 # Pure definitions. Privileged orchestration is in dev-session.
 valid_session_id() { [[ ${1:-} =~ ^[0-9a-f]{32}$ ]]; }
 
-cleanup_group() {
-    local sid=${1:-} path members
-    valid_session_id "$sid" || return 1
-    path=$CGROOT/$sid
-    [[ ! -L $path ]] || return 1
-    [[ -e $path ]] || return 0
-    [[ -d $path && -r $path/cgroup.procs && ! -L $path/cgroup.procs ]] || {
-        [[ ! -e $path && ! -L $path ]]; return;
-    }
-    members=$(cat "$path/cgroup.procs" 2>/dev/null) || {
-        [[ ! -e $path && ! -L $path ]]; return;
-    }
-    if [[ -n $members ]]; then
-        return 2
-    fi
-    # Explicit close and the launcher may both complete the same stop job.
-    rmdir -- "$path" 2>/dev/null || [[ ! -e $path && ! -L $path ]]
-    # Never delete a firewall rule, route, mark, or another session directory.
-}
+cleanup_group() { cgroup_cleanup "$@"; }
 
 reclaim_stopped_group() {
     local sid=$1 attempt status
@@ -41,6 +23,7 @@ unit_arguments() {
     local sid=$1 mode=$2
     valid_session_id "$sid" || return 1
     [[ $mode == pty || $mode == pipe ]] || return 1
+    cgroup_unit_arguments || return
     UNIT_ARGS=(--quiet --system --wait --collect --service-type=exec
         "--unit=dev-session-$sid.service" "--$mode"
         --property=Restart=no --property=KillMode=control-group
@@ -49,7 +32,8 @@ unit_arguments() {
         --property=UMask=0077 --property=NoNewPrivileges=yes
         '--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK'
         --property=SystemCallArchitectures=native
-        "--property=ExecStopPost=$ROOT/dev-session --internal-clean $sid")
+        "--property=ExecStopPost=$ROOT/dev-session --internal-clean $sid"
+        "${CGROUP_UNIT_ARGS[@]}")
 }
 
 probe_network() {
@@ -117,19 +101,7 @@ user_checks() {
     done
 }
 
-attach_group() {
-    local sid=$1 path=$CGROOT/$1
-    valid_session_id "$sid" || return 1
-    awk -F: -v p="/system.slice/dev-session-$sid.service" '
-      $2 ~ /(^|,)name=systemd(,|$)/ && $3==p {found=1} END{exit !found}' /proc/self/cgroup || return
-    mkdir -- "$path" || return
-    chmod 700 "$path" || return
-    printf '%s\n' "$CLASSID" >"$path/net_cls.classid" || return
-    [[ $(cat "$path/net_cls.classid") == "$((CLASSID))" ]] || return 1
-    printf '%s\n' "$$" >"$path/cgroup.procs" || return
-    awk -F: -v p="/dev-session-v8/$sid" '
-      $2 ~ /(^|,)net_cls(,|$)/ && $3==p {found=1} END{exit !found}' /proc/self/cgroup
-}
+attach_group() { cgroup_attach "$@"; }
 
 bootstrap_workload() {
     local sid=$1 helper uid gid home fd last_cap cap drop_caps='' key value expected_bnd=''

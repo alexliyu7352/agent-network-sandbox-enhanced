@@ -12,6 +12,7 @@ RUN apk add --no-cache iproute2 iptables iptables-legacy jq \
 # and /proc/PID/exe basename; a shell alias or exec -a would not do both.
 
 COPY entrypoint-gateway.sh /entrypoint.sh
+COPY gateway-policy.jq /usr/local/lib/worker/gateway-policy.jq
 
 # 節點設定僅運行時唯讀掛入，不 COPY 進映像層；.dockerignore 預設排除全部。
 
