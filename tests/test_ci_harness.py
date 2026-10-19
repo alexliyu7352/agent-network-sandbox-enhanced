@@ -1,6 +1,7 @@
 """Offline CI bootstrap checks. These tests never provision a host or launch QEMU."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -66,6 +67,72 @@ class HostBootstrapTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 37, result.stderr)
             self.assertEqual((Path(td) / "installer-args").read_text().splitlines(), ["--no-link"])
+
+    def test_failed_init_retains_failure_after_read_only_diagnostics(self):
+        for status in (0, 73):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as td:
+                manager = Path(td) / "dev-session"
+                manager.write_text('#!/bin/bash\nexit ' + str(status) + '\n')
+                manager.chmod(0o755)
+                result = shell(
+                    HOST, 'CI_ROOT=$1; ci_failed_init_diagnostics() { touch "$CI_ROOT/diagnosed"; }; '
+                          'ci_initialize', td,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual((Path(td) / "diagnosed").exists(), status != 0)
+
+    def test_failed_init_diagnostics_selects_metadata_and_stops_after_failed_phase(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "lib").mkdir()
+            (root / "lib/host.sh").write_text("")
+            (root / "lib/network.sh").write_text(
+                'read_proxy_policy() { echo read_proxy_policy >>"$ROOT/phases"; '
+                'echo DO_NOT_EXPORT_AUTH; return 0; }\n'
+                'gateway_open() { echo gateway_open >>"$ROOT/phases"; '
+                'echo DO_NOT_EXPORT_AUTH >&2; return 7; }\n'
+                'gateway_verify() { echo gateway_verify >>"$ROOT/phases"; return 0; }\n'
+            )
+            helper = root / "bin"
+            helper.mkdir()
+            container = {
+                "Id": "b" * 64, "State": {"Pid": os.getpid(), "Running": True},
+                "Config": {"Env": ["PASSWORD=DO_NOT_EXPORT_AUTH"]},
+                "HostConfig": {
+                    "CapAdd": ["CAP_NET_ADMIN", "CAP_NET_RAW"], "CapDrop": ["ALL"],
+                    "ReadonlyRootfs": True, "Privileged": False, "NetworkMode": "bridge",
+                    "SecurityOpt": ["no-new-privileges=true"], "Sysctls": {"net.ipv4.ip_forward": "0"},
+                },
+                "Mounts": [{"Source": str(root / "network.json"), "Destination": "/etc/worker/network.json",
+                            "Type": "bind", "RW": False}],
+                "NetworkSettings": {"SandboxKey": "/run/docker/netns/absent-ci-test",
+                                    "Networks": {"test": {"NetworkID": "a" * 64, "IPAddress": "172.18.0.2"}}},
+            }
+            docker = helper / "docker"
+            docker.write_text(
+                "#!/usr/bin/python3\nimport json,sys\n"
+                "container=" + repr(container) + "\n"
+                "print(json.dumps([container] if sys.argv[1]=='inspect' else "
+                "[{'Driver':'bridge','EnableIPv6':False,'Options':{},'Containers':{}}]))\n"
+            )
+            docker.chmod(0o755)
+            ip = helper / "ip"
+            ip.write_text('#!/bin/sh\nprintf "%s\\n" "[]"\n')
+            ip.chmod(0o755)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            result = shell(
+                HOST, 'CI_ROOT=$1; CI_EVIDENCE=$2; PATH="$1/bin:/usr/bin:/bin"; '
+                      'ci_failed_init_diagnostics', root, evidence,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            text = (evidence / "init-diagnostics.json").read_text()
+            self.assertNotIn("DO_NOT_EXPORT_AUTH", text + result.stdout + result.stderr)
+            data = json.loads(text)
+            self.assertEqual(data["container"]["HostConfig"]["CapAdd"], ["CAP_NET_ADMIN", "CAP_NET_RAW"])
+            self.assertEqual(data["phase_checks"]["gateway_open"]["exit_code"], 7)
+            self.assertEqual(data["phase_checks"]["gateway_verify"]["status"], "not_run")
+            self.assertEqual((root / "phases").read_text().splitlines(), ["read_proxy_policy", "gateway_open"])
 
     @unittest.skipUnless(shutil.which("jq"), "jq is required by the shared parser")
     def test_fake_sources_compile_to_the_expected_transport_and_dns(self):

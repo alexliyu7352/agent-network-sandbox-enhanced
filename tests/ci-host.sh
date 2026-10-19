@@ -174,6 +174,139 @@ PY
     iptables-legacy -w 5 -S DOCKER-USER
 }
 
+ci_failed_init_diagnostics() {
+    # Inspect only the CI-owned gateway and already selected fake source.
+    # This never retries init, creates a binding, or repairs rules/routes.
+    python3 - "$CI_ROOT" "$CI_EVIDENCE" <<'PY'
+import ipaddress, json, os, pathlib, re, subprocess, sys
+checkout, evidence = map(pathlib.Path, sys.argv[1:])
+data = {}
+
+def read_json(argv):
+    try:
+        result = subprocess.run(argv, stdin=subprocess.DEVNULL, text=True,
+                                capture_output=True, timeout=20)
+        if result.returncode == 0:
+            return json.loads(result.stdout), {"exit_code": 0}
+        return None, {"exit_code": result.returncode}
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return None, {"error": type(error).__name__}
+
+def identity(path):
+    try:
+        status = path.stat()
+        return {"device_inode": f"{status.st_dev}:{status.st_ino}"}
+    except OSError as error:
+        return {"error": type(error).__name__}
+
+info, data["container_read"] = read_json(["docker", "inspect", "worker"])
+if isinstance(info, list) and len(info) == 1 and isinstance(info[0], dict):
+    source = info[0]
+    host = source.get("HostConfig", {})
+    settings = source.get("NetworkSettings", {})
+    # Never retain Config.Env, command arguments, labels, or source credentials.
+    data["container"] = {
+        "Id": source.get("Id"),
+        "State": {key: source.get("State", {}).get(key) for key in ("Running", "Pid", "Status")},
+        "HostConfig": {key: host.get(key) for key in (
+            "CapDrop", "CapAdd", "SecurityOpt", "Sysctls", "ReadonlyRootfs",
+            "Privileged", "NetworkMode", "UsernsMode")},
+        "Mounts": [{key: mount.get(key) for key in
+                    ("Type", "Source", "Destination", "RW", "Mode", "Propagation")}
+                   for mount in source.get("Mounts", [])],
+        "NetworkSettings": {key: settings.get(key) for key in ("SandboxID", "SandboxKey", "Networks")},
+    }
+    pid = source.get("State", {}).get("Pid")
+    if isinstance(pid, int) and pid > 0:
+        proc = pathlib.Path("/proc") / str(pid)
+        process = {"pid": pid, "net_namespace": identity(proc / "ns/net")}
+        try:
+            process["credentials"] = {
+                key: value.strip() for key, value in
+                (line.split(":", 1) for line in (proc / "status").read_text().splitlines() if ":" in line)
+                if key in ("Uid", "Gid", "CapEff", "NSpid", "Seccomp")
+            }
+            process["cgroup"] = (proc / "cgroup").read_text()
+        except OSError as error:
+            process["read_error"] = type(error).__name__
+        data["process"] = process
+    sandbox = settings.get("SandboxKey")
+    if isinstance(sandbox, str) and re.fullmatch(r"/(?:var/)?run/docker/netns/[A-Za-z0-9_-]+", sandbox):
+        data["sandbox_namespace"] = identity(pathlib.Path(sandbox))
+    networks = settings.get("Networks")
+    if isinstance(networks, dict) and len(networks) == 1:
+        endpoint = next(iter(networks.values()))
+        nid = endpoint.get("NetworkID")
+        if isinstance(nid, str) and re.fullmatch(r"[0-9a-f]{64}", nid):
+            net, data["network_read"] = read_json(["docker", "network", "inspect", nid])
+            if isinstance(net, list) and len(net) == 1 and isinstance(net[0], dict):
+                net = net[0]
+                data["network"] = {key: net.get(key) for key in ("Id", "Driver", "EnableIPv6", "Options")}
+                data["network"]["container_ids"] = sorted((net.get("Containers") or {}).keys())
+                bridge = (net.get("Options") or {}).get("com.docker.network.bridge.name") or "br-" + nid[:12]
+                if isinstance(bridge, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,15}", bridge):
+                    data["bridge"] = {
+                        "name": bridge,
+                        "kernel_bridge_present": (pathlib.Path("/sys/class/net") / bridge / "bridge").is_dir(),
+                    }
+                    data["bridge"]["link"], data["bridge"]["read"] = read_json(
+                        ["ip", "-j", "link", "show", "dev", bridge])
+        try:
+            address = str(ipaddress.IPv4Address(endpoint.get("IPAddress")))
+        except (ValueError, TypeError):
+            address = None
+        if address is not None:
+            data["host_route_get"], data["host_route_read"] = read_json(
+                ["ip", "-j", "-4", "route", "get", address])
+data["host_namespaces"] = {name: identity(pathlib.Path("/proc/1/ns") / name)
+                           for name in ("net", "pid", "cgroup")}
+
+# These library calls read configuration, hold a namespace FD, and verify
+# existing state. None calls policy/cgroup installation or admits forwarding.
+phases = ("read_proxy_policy", "gateway_open", "gateway_verify")
+data["phase_checks"] = {name: {"status": "not_run"} for name in phases}
+script = r'''
+set -u -o pipefail
+ROOT=$1
+source "$ROOT/lib/host.sh" || exit 121
+source "$ROOT/lib/network.sh" || exit 121
+GATEWAY=worker
+for phase in read_proxy_policy gateway_open gateway_verify; do
+    if [[ $phase == read_proxy_policy ]]; then
+        "$phase" "$ROOT/network.json" >/dev/null 2>&1
+    else
+        "$phase" >/dev/null 2>&1
+    fi
+    phase_status=$?
+    printf '%s\t%s\n' "$phase" "$phase_status"
+    (( phase_status == 0 )) || exit 0
+done
+'''
+try:
+    result = subprocess.run(
+        ["/bin/bash", "-p", "-c", script, "ci-read-only-diagnostics", str(checkout)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, timeout=90, env={"PATH": os.environ["PATH"], "LC_ALL": "C", "HOME": "/root"})
+    data["phase_runner_exit_code"] = result.returncode
+    for line in result.stdout.splitlines():
+        name, separator, status = line.partition("\t")
+        if separator and name in phases and re.fullmatch(r"[0-9]{1,3}", status):
+            data["phase_checks"][name] = {
+                "exit_code": int(status), "status": "passed" if status == "0" else "failed"}
+except (OSError, subprocess.TimeoutExpired) as error:
+    data["phase_runner_error"] = type(error).__name__
+(evidence / "init-diagnostics.json").write_text(json.dumps(data, indent=2) + "\n")
+print("CI_INIT_DIAGNOSTICS=" + json.dumps(data["phase_checks"], sort_keys=True))
+PY
+}
+
+ci_initialize() {
+    local status=0
+    "$CI_ROOT/dev-session" init || status=$?
+    if (( status != 0 )); then ci_failed_init_diagnostics || :; fi
+    return "$status"
+}
+
 ci_fixture() {
     local extract
     ci_write_config "$CI_PROTOCOL" "$CI_ROOT/network.json"
@@ -207,7 +340,7 @@ ci_fixture() {
         sleep 1
     done
     [[ $ready == true ]] || ci_fail 'Gateway never published readiness'
-    "$CI_ROOT/dev-session" init
+    ci_initialize
     jq -e --arg protocol "$CI_PROTOCOL" '
       .format==2 and .cgroup.mode=="v2" and
       (if $protocol=="http" then .proxy_policy.payload_networks==["tcp"] and
@@ -251,7 +384,7 @@ ci_snapshot() {
 import json, pathlib, subprocess, sys
 root = pathlib.Path(sys.argv[1])
 commands = [
-    ["uname", "-a"], ["systemd", "--version"], ["iptables-legacy", "--version"],
+    ["uname", "-a"], ["systemctl", "--version"], ["iptables-legacy", "--version"],
     ["ip6tables-legacy", "--version"], ["docker", "version"], ["docker", "compose", "version"],
     ["findmnt", "--json", "--list", "--types", "cgroup,cgroup2", "--output", "TARGET,FSTYPE,FSROOT,OPTIONS"],
     ["systemctl", "show", "devsession.slice", "--property=ActiveState,ControlGroup,FragmentPath"],
@@ -340,6 +473,10 @@ ci_main() {
         python3 -m unittest discover -s "$CI_ROOT/tests" -p 'test_*.py' -v
     ci_stage docker_backend ci_docker_legacy
     ci_stage fixture ci_fixture
+    ci_stage exit_ip timeout --signal=TERM --kill-after=30s 5m \
+        python3 "$CI_ROOT/tests/host_exit_ip.py" --user "$CI_ACCOUNT" \
+        --fixture-output "$CI_FIXTURE" --upstream-namespace d8-test-upstream \
+        --output "$CI_EVIDENCE/exit-ip"
     ci_suites
 }
 

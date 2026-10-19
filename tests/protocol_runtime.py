@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import socket
 import socketserver
@@ -46,7 +47,7 @@ BLOCKED = {
     "ssh": "The pinned core has no SSH server inbound; a separately managed SSH fixture is required.",
     "snell4": "The pinned server exposes versions 5/6; v4-to-v5 compatibility needs separate verification.",
     "shadowtls": "A local cover TLS server and protocol injection chain need a dedicated fixture.",
-    "hysteria-port-hopping": "Actual rotation needs a shared QUIC backend with observed multiport relays; not counted by this matrix.",
+    "hysteria1-port-hopping": "Only Hysteria2 has an observed-rotation recipe; Hysteria1 hopping is not counted.",
 }
 
 
@@ -77,7 +78,7 @@ def case_names():
     for kind in ("trojan", "vmess", "vless"):
         names.append(kind)
         names.extend(kind + "-" + transport for transport in ("http", "ws", "grpc", "httpupgrade", "quic"))
-    return names + ["selector-trojan", "selector-hysteria2", "urltest", "detour"]
+    return names + ["selector-trojan", "selector-hysteria2", "urltest", "detour", "hysteria2-port-hopping"]
 
 
 def transport_options(kind):
@@ -187,6 +188,11 @@ def build_configs(name, original, ports, certificate, cert_path, key_path):
         extra_ports.append(ports["proxy"])
     else:
         outbound, inbound = protocol_pair(name, "proxy", ports["proxy"], certificate, cert_path, key_path)
+        if name == "hysteria2-port-hopping":
+            outbound.pop("server_port")
+            outbound["server_ports"] = [str(ports["hop" + str(index)]) + ":" + str(ports["hop" + str(index)])
+                                        for index in range(8)]
+            outbound["hop_interval"] = "5s"
         outbounds, inbounds = [outbound], [inbound]
     source["outbounds"] = outbounds
     policy = compile_config(source, "policy")
@@ -265,6 +271,77 @@ class UDPHandler(socketserver.BaseRequestHandler):
         # Canary listeners also record arbitrary DNS/TLS bytes without logging them.
         response = {"peer": self.client_address[0], "token": message.decode(errors="replace").strip()}
         sock.sendto(json.dumps(response).encode() + b"\n", self.client_address)
+
+
+class MultiportRelay:
+    """One client/QUIC session, many destination ports, one stable backend peer.
+
+    The pinned sing-quic hysteria/hop.go creates a new connected UDP socket at
+    each hop. This fixture collapses those local source addresses onto one UDP
+    socket, so all ports really reach the same live QUIC connection. It records
+    received traffic; configured ports alone never count as a successful hop.
+    """
+
+    def __init__(self, ports, backend_port):
+        self.frontends = []
+        self.backend = None
+        self.thread = None
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.seen_ports = set()
+        try:
+            for port in ports:
+                frontend = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.frontends.append(frontend)
+                frontend.bind((LOOPBACK, port))
+            self.backend = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.backend.bind((LOOPBACK, 0))
+            self.backend.connect((LOOPBACK, backend_port))
+            self.ports = [item.getsockname()[1] for item in self.frontends]
+            self.thread = threading.Thread(target=self._serve, daemon=True)
+            self.thread.start()
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def observed_ports(self):
+        with self.lock:
+            return sorted(self.seen_ports)
+
+    def _serve(self):
+        current = None
+        while not self.stop.is_set():
+            readable, _, _ = select.select(self.frontends + [self.backend], [], [], 0.03)
+            for sock in readable:
+                try:
+                    if sock is self.backend:
+                        payload = sock.recv(65535)
+                        if current is not None:
+                            current[0].sendto(payload, current[1])
+                    else:
+                        payload, address = sock.recvfrom(65535)
+                        with self.lock:
+                            self.seen_ports.add(sock.getsockname()[1])
+                        current = (sock, address)
+                        self.backend.send(payload)
+                except OSError:
+                    # A stopped backend generates local ICMP; no alternate
+                    # destination or direct path is introduced on that error.
+                    continue
+
+    def close(self):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        for sock in self.frontends + ([self.backend] if self.backend is not None else []):
+            sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
 
 
 @contextmanager
@@ -394,7 +471,10 @@ def run_case(binary, name, original, directory, check_only=False):
         udp_sink = stack.enter_context(serving(UDPSink((LOOPBACK, 0))))
         # Determine DNS transport from the real compiler, before creating the resolver.
         ports = {"tcp": tcp_sink.server_address[1], "udp": udp_sink.server_address[1]}
-        for field in ("proxy", "proxy2", "dns", "ingress_tcp", "ingress_udp", "ingress_dns"):
+        port_fields = ["proxy", "proxy2", "dns", "ingress_tcp", "ingress_udp", "ingress_dns"]
+        if name == "hysteria2-port-hopping":
+            port_fields.extend("hop" + str(index) for index in range(8))
+        for field in port_fields:
             port = dns_fixture.free_dns_port()
             while port in ports.values():
                 port = dns_fixture.free_dns_port()
@@ -418,6 +498,9 @@ def run_case(binary, name, original, directory, check_only=False):
         if check_only:
             return {"case": name, "status": "CONFIG_PASS", "runtime_tested": False}
         try:
+            relay = None
+            if name == "hysteria2-port-hopping":
+                relay = stack.enter_context(MultiportRelay([ports["hop" + str(index)] for index in range(8)], ports["proxy"]))
             proxy = start_core(binary, directory / "server.json", directory / "server.log", "start-server")
             processes.append(proxy)
             client_process = start_core(binary, directory / "client.json", directory / "client.log", "start-client")
@@ -432,6 +515,23 @@ def run_case(binary, name, original, directory, check_only=False):
             else:
                 require_unavailable(lambda: udp_exchange(ports["ingress_udp"], "udp-refusal"), "tcp-only-udp-refusal")
                 require(not udp_sink.seen, "tcp-only-udp-reached-sink")
+            observed_hop_ports = []
+            if relay is not None:
+                # Random port choice may repeat a port. Eight choices and a
+                # bounded 45-second observation window avoid assuming the first
+                # scheduled hop must pick a different one.
+                deadline = time.monotonic() + 45
+                while len(relay.observed_ports) < 2 and time.monotonic() < deadline:
+                    reply = tcp_exchange(ports["ingress_tcp"], "tcp-during-hop", persistent)
+                    require(reply == {"peer": PROXY_EXIT, "token": "tcp-during-hop"}, "tcp-stream-during-hop")
+                    time.sleep(0.15)
+                observed_hop_ports = relay.observed_ports
+                require(len(observed_hop_ports) >= 2, "actual-port-rotation-not-observed")
+                require(set(observed_hop_ports).issubset(set(relay.ports)), "hop-outside-declared-ports")
+                reply = tcp_exchange(ports["ingress_tcp"], "tcp-after-hop", persistent)
+                require(reply == {"peer": PROXY_EXIT, "token": "tcp-after-hop"}, "tcp-stream-after-hop")
+                reply = udp_exchange(ports["ingress_udp"], "udp-after-hop")
+                require(reply == {"peer": PROXY_EXIT, "token": "udp-after-hop"}, "udp-after-hop")
             first = dns_fixture.query(ports["ingress_dns"], "udp", 0x1234)
             require(first == "203.0.113.1" and resolver.query_count == 1, "dns-first")
             cached = dns_fixture.query(ports["ingress_dns"], "tcp", 0x5678)
@@ -465,6 +565,7 @@ def run_case(binary, name, original, directory, check_only=False):
                     "server_stop": ["existing-tcp-refused", "new-tcp-refused", "udp-refused", "uncached-dns-refused"],
                     "direct_canaries": "no-traffic", "host_firewall_tested": False,
                     "graph_forwarded": graph_forwarded,
+                    "observed_hop_ports": observed_hop_ports,
                     "configured_outer_endpoints": policy["outer_endpoints"]}
         finally:
             if persistent is not None:
