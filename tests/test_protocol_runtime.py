@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import time
 import unittest
 
@@ -106,6 +108,42 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
                     reply = runtime.udp_exchange(port, "relay-" + str(index))
                     self.assertEqual(reply, {"peer": runtime.LOOPBACK, "token": "relay-" + str(index)})
                 self.assertEqual(relay.observed_ports, sorted(relay.ports))
+
+    def test_experimental_recipes_do_not_expand_the_verified_default(self):
+        self.assertEqual(len(runtime.case_names()), 41)
+        result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--list"],
+                                check=True, capture_output=True, text=True)
+        inventory = json.loads(result.stdout)
+        self.assertEqual(inventory["experimental_cases"], ["snell4", "hysteria-port-hopping"])
+        self.assertEqual(inventory["cases"], runtime.case_names())
+        self.assertFalse(set(inventory["experimental_cases"]) & set(inventory["cases"]))
+
+    def test_snell4_recipe_uses_the_real_server_version5_schema(self):
+        _, client, server, policy = runtime.build_configs(
+            "snell4", self.original, self.ports, "TEST CERTIFICATE", "/fake/cert", "/fake/key")
+        outbound, inbound = client["outbounds"][0], server["inbounds"][0]
+        self.assertEqual((outbound["type"], outbound["version"]), ("snell", 4))
+        self.assertEqual((inbound["type"], inbound["version"]), ("snell", 5))
+        self.assertEqual(outbound["psk"], inbound["psk"])
+        self.assertEqual(outbound["obfs_mode"], "none")
+        self.assertEqual(inbound["obfs_mode"], "none")
+        self.assertEqual(policy["payload_networks"], ["tcp", "udp"])
+        self.assertEqual({entry["protocol"] for entry in policy["outer_endpoints"]}, {"tcp"})
+
+    def test_hysteria1_hopping_uses_its_own_auth_and_hop_fields(self):
+        _, client, server, policy = runtime.build_configs(
+            "hysteria-port-hopping", self.original, self.ports, "TEST CERTIFICATE", "/fake/cert", "/fake/key")
+        outbound, inbound = client["outbounds"][0], server["inbounds"][0]
+        self.assertEqual((outbound["type"], inbound["type"]), ("hysteria", "hysteria"))
+        self.assertEqual(outbound["auth_str"], inbound["users"][0]["auth_str"])
+        self.assertEqual(outbound["hop_interval"], "5s")
+        self.assertNotIn("hop_interval_max", outbound)
+        self.assertNotIn("server_port", outbound)
+        actual = {port for entry in policy["outer_endpoints"]
+                  for port in range(entry["port_start"], entry["port_end"] + 1)}
+        self.assertEqual(actual, {31100 + index for index in range(8)})
+        self.assertEqual({entry["protocol"] for entry in policy["outer_endpoints"]}, {"udp"})
+        self.assertNotIn(inbound["listen_port"], actual)
 
 
 if __name__ == "__main__":

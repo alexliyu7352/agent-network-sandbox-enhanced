@@ -43,11 +43,12 @@ PASSWORD = "public-protocol-matrix-fake-password"
 USERNAME = "matrix-user"
 UUID = "00000000-0000-4000-8000-000000000001"
 TIMEOUT = 3.0
+EXPERIMENTAL_CASES = ("snell4", "hysteria-port-hopping")
 BLOCKED = {
     "ssh": "The pinned core has no SSH server inbound; a separately managed SSH fixture is required.",
-    "snell4": "The pinned server exposes versions 5/6; v4-to-v5 compatibility needs separate verification.",
+    "snell4": "Opt-in snell4 tests a v4 client against the native v5 server; compatibility is not part of the default verified matrix.",
     "shadowtls": "A local cover TLS server and protocol injection chain need a dedicated fixture.",
-    "hysteria1-port-hopping": "Only Hysteria2 has an observed-rotation recipe; Hysteria1 hopping is not counted.",
+    "hysteria1-port-hopping": "Opt-in hysteria-port-hopping requires actual observed rotation; not part of the default verified matrix.",
 }
 
 
@@ -81,6 +82,10 @@ def case_names():
     return names + ["selector-trojan", "selector-hysteria2", "urltest", "detour", "hysteria2-port-hopping"]
 
 
+def is_hopping_case(name):
+    return name in {"hysteria2-port-hopping", "hysteria-port-hopping"}
+
+
 def transport_options(kind):
     result = {"type": kind}
     if kind in {"http", "ws", "httpupgrade"}:
@@ -96,7 +101,7 @@ def protocol_pair(name, tag, port, certificate, cert_path, key_path):
         kind = "http"
     if name.startswith("socks"):
         kind = "socks"
-    if name == "snell6":
+    if name in {"snell4", "snell6"}:
         kind = "snell"
     outbound = {"type": kind, "tag": tag, "server": LOOPBACK, "server_port": port}
     inbound = {"type": kind, "tag": tag + "-in", "listen": LOOPBACK, "listen_port": port}
@@ -147,8 +152,14 @@ def protocol_pair(name, tag, port, certificate, cert_path, key_path):
             outbound.update(username=USERNAME, password=PASSWORD)
             inbound["users"] = [{"username": USERNAME, "password": PASSWORD}]
     elif kind == "snell":
-        outbound.update(version=6, psk=PASSWORD)
-        inbound.update(version=6, psk=PASSWORD)
+        # The pinned core's option/snell.go exposes client versions 4/6 and
+        # server versions 5/6. Using the real server schema is an interoperability
+        # experiment, not an assumption that the version numbers are aliases.
+        outbound.update(version=4 if name == "snell4" else 6, psk=PASSWORD)
+        inbound.update(version=5 if name == "snell4" else 6, psk=PASSWORD)
+        if name == "snell4":
+            outbound["obfs_mode"] = "none"
+            inbound["obfs_mode"] = "none"
     if kind in {"trojan", "vmess", "vless"} and "-" in name:
         transport = name.split("-", 1)[1]
         outbound["transport"] = transport_options(transport)
@@ -167,7 +178,7 @@ def compile_config(source, mode):
 
 
 def build_configs(name, original, ports, certificate, cert_path, key_path):
-    require(name in case_names(), "unknown-case")
+    require(name in case_names() or name in EXPERIMENTAL_CASES, "unknown-case")
     source = copy.deepcopy(original)
     source["log"] = {"level": "info", "timestamp": False}
     extra_ports = []
@@ -188,11 +199,13 @@ def build_configs(name, original, ports, certificate, cert_path, key_path):
         extra_ports.append(ports["proxy"])
     else:
         outbound, inbound = protocol_pair(name, "proxy", ports["proxy"], certificate, cert_path, key_path)
-        if name == "hysteria2-port-hopping":
+        if is_hopping_case(name):
             outbound.pop("server_port")
             outbound["server_ports"] = [str(ports["hop" + str(index)]) + ":" + str(ports["hop" + str(index)])
                                         for index in range(8)]
             outbound["hop_interval"] = "5s"
+            # Pinned sing-quic hysteria/client.go passes this interval to the
+            # same NewHopConn with intervalMax=0; no Hy2-only field is added.
         outbounds, inbounds = [outbound], [inbound]
     source["outbounds"] = outbounds
     policy = compile_config(source, "policy")
@@ -472,7 +485,7 @@ def run_case(binary, name, original, directory, check_only=False):
         # Determine DNS transport from the real compiler, before creating the resolver.
         ports = {"tcp": tcp_sink.server_address[1], "udp": udp_sink.server_address[1]}
         port_fields = ["proxy", "proxy2", "dns", "ingress_tcp", "ingress_udp", "ingress_dns"]
-        if name == "hysteria2-port-hopping":
+        if is_hopping_case(name):
             port_fields.extend("hop" + str(index) for index in range(8))
         for field in port_fields:
             port = dns_fixture.free_dns_port()
@@ -499,7 +512,7 @@ def run_case(binary, name, original, directory, check_only=False):
             return {"case": name, "status": "CONFIG_PASS", "runtime_tested": False}
         try:
             relay = None
-            if name == "hysteria2-port-hopping":
+            if is_hopping_case(name):
                 relay = stack.enter_context(MultiportRelay([ports["hop" + str(index)] for index in range(8)], ports["proxy"]))
             proxy = start_core(binary, directory / "server.json", directory / "server.log", "start-server")
             processes.append(proxy)
@@ -579,13 +592,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", help="Actual pinned worker executable; required except with --list")
     parser.add_argument("--config", type=Path, default=ROOT / "network.json")
-    parser.add_argument("--case", action="append", choices=case_names(), help="Repeat to select cases; default is the full implemented matrix")
+    parser.add_argument("--case", action="append", choices=case_names() + list(EXPERIMENTAL_CASES),
+                        help="Repeat to select cases; defaults to the verified 41-case matrix. Experimental cases require explicit selection")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--check-only", action="store_true", help="Emit CONFIG_PASS only; never count configuration checks as runtime verification")
     parser.add_argument("--artifacts", type=Path, help="New root-private directory retaining fake fixture configs/logs; otherwise temporary files are removed")
     args = parser.parse_args()
     if args.list:
-        print(json.dumps({"cases": case_names(), "blocked": BLOCKED, "scope": "loopback-only"}, sort_keys=True))
+        print(json.dumps({"cases": case_names(), "experimental_cases": EXPERIMENTAL_CASES,
+                          "blocked": BLOCKED, "scope": "loopback-only"}, sort_keys=True))
         return 0
     if not args.engine or not shutil.which(args.engine) or not shutil.which("openssl") or not shutil.which("jq"):
         parser.error("A pinned --engine, openssl and jq are required")
@@ -615,9 +630,11 @@ def main():
             except Exception as error:
                 failures += 1
                 result = {"case": name, "status": "FAIL", "stage": "fixture-" + type(error).__name__, "runtime_completed": False}
+            result["experimental"] = name in EXPERIMENTAL_CASES
             print(json.dumps(result, sort_keys=True), flush=True)
         print(json.dumps({"summary": "FAIL" if failures else "CONFIG_PASS" if args.check_only else "PASS",
                           "cases": len(args.case or case_names()), "failures": failures, "blocked": BLOCKED,
+                          "experimental_cases": [name for name in args.case or case_names() if name in EXPERIMENTAL_CASES],
                           "host_firewall_tested": False}, sort_keys=True), flush=True)
         return 1 if failures else 0
 

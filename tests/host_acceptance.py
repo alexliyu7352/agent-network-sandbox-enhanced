@@ -7,8 +7,10 @@ is not part of the runtime launcher or gateway. No global firewall flushes.
 """
 import argparse
 import concurrent.futures
+import contextlib
 import errno
 import fcntl
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -301,6 +303,7 @@ class Suite:
         assert not self.output.is_symlink() and self.output.stat().st_uid==0 and self.output.stat().st_mode&0o077==0,'output must be root private'
         self.sessions, self.servers, self.captures, self.results = [], [], [], []
         self.namespace_fault=getattr(args,'namespace_fault','none')
+        self.compose_project=getattr(args,'compose_project',None)
         self.udp_echo=getattr(args,'udp_echo',None)
         self.binding=Binding.load()
         (self.output/'binding.json').write_text(json.dumps(self.binding.data,indent=2)+'\n')
@@ -565,7 +568,9 @@ result={'response':data[:100].decode('ascii','replace')}
             except (ValueError,KeyError,IndexError,AssertionError,OSError):
                 if time.monotonic()>=deadline:raise AssertionError('gateway did not restart for namespace identity check')
                 time.sleep(0.2)
-        changed=identity!=self.binding.gateway['namespace_identity'] or container['Id']!=self.binding.gateway['container_id']
+        namespace_changed=identity!=self.binding.gateway['namespace_identity']
+        container_changed=container['Id']!=self.binding.gateway['container_id']
+        changed=namespace_changed or container_changed
         check=command(DEV,'check',check=False)
         (self.output/(label+'-check.log')).write_text(check.stdout+check.stderr)
         init_exit=None;rejection=None
@@ -584,11 +589,15 @@ result={'response':data[:100].decode('ascii','replace')}
             self.gateway_ready()
         self.assert_rules()
         return {'namespace_before':self.binding.gateway['namespace_identity'],'namespace_after':identity,
-                'namespace_changed':changed,'check_exit':check.returncode,'init_exit':init_exit,
+                'namespace_changed':namespace_changed,'container_changed':container_changed,
+                'container_id_before':self.binding.gateway['container_id'],'container_id_after':container['Id'],
+                'check_exit':check.returncode,'init_exit':init_exit,
                 'rejected_start':rejection,'binding_and_guards_retained':True,
                 'offline_rebind_required':changed,'offline_maintenance_required':bool(check.returncode)}
 
     def gateway_namespace_fault(self,action):
+        if action=='gateway-recreate':return self.gateway_recreate_fault()
+        assert action in ('gateway-stop','gateway-kill'),'unsupported gateway fault'
         before=self.https(self.a,keep=True);assert before['ok'],before
         try:
             if action=='gateway-stop':command('docker','stop','--time','1','worker')
@@ -603,6 +612,85 @@ result={'response':data[:100].decode('ascii','replace')}
         result.update(existing_connection_blocked_during_fault=True,new_connection_blocked_during_fault=True,
                       other_session_loopback_alive=True)
         return result
+
+    def compose_target(self,bound):
+        """Authorize only the explicitly selected, single-worker test project."""
+        project=self.compose_project
+        assert isinstance(project,str) and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}',project),\
+            'gateway recreation requires an explicit Compose project'
+        root=INSTALL_ROOT;source=root/'network.json';compose=root/'docker-compose.yml'
+        for path in (root,*root.parents):
+            metadata=path.stat()
+            assert not path.is_symlink() and metadata.st_uid==0 and metadata.st_mode&0o022==0,\
+                'untrusted Compose project directory'
+        assert root.stat().st_mode&0o077==0,'Compose test project must be root private'
+        hashes={}
+        for path in (source,compose):
+            metadata=path.stat()
+            assert not path.is_symlink() and path.is_file() and metadata.st_uid==0 and \
+                metadata.st_mode&0o077==0 and metadata.st_nlink==1,'untrusted Compose project file'
+            hashes[path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
+        assert hashes['network.json']==self.binding.data['source_sha256'],'Compose source differs from the retained binding'
+        rows=json.loads(command('docker','inspect','worker').stdout)
+        assert isinstance(rows,list) and len(rows)==1 and isinstance(rows[0],dict),'ambiguous Compose gateway'
+        container=rows[0];labels=container.get('Config',{}).get('Labels',{})
+        expected={'com.docker.compose.project':project,'com.docker.compose.service':'worker',
+                  'com.docker.compose.project.working_dir':str(root),
+                  'com.docker.compose.project.config_files':str(compose),'com.docker.compose.oneoff':'False'}
+        assert isinstance(labels,dict) and all(labels.get(key)==value for key,value in expected.items()),\
+            'gateway does not belong to the selected Compose source and project'
+        assert container.get('Name')=='/worker' and re.fullmatch(r'[0-9a-f]{64}',container.get('Id','')),\
+            'unexpected Compose gateway identity'
+        assert re.fullmatch(r'sha256:[0-9a-f]{64}',container.get('Image','')),'invalid Compose image identity'
+        state=container.get('State',{});pid=state.get('Pid')
+        assert state.get('Running') is True and type(pid) is int and pid>0,'Compose gateway is not running'
+        metadata=Path('/proc/'+str(pid)+'/ns/net').stat();namespace='{}:{}'.format(metadata.st_dev,metadata.st_ino)
+        if bound:
+            assert container['Id']==self.binding.gateway['container_id'] and namespace==self.binding.gateway['namespace_identity'],\
+                'refusing recreation of an unbound gateway'
+        mounts=container.get('Mounts',[]);binds=[mount for mount in mounts if mount.get('Type')=='bind']
+        assert len(binds)==1 and binds[0].get('Source')==str(source) and \
+            binds[0].get('Destination')=='/etc/worker/network.json' and binds[0].get('RW') is False,\
+            'Compose gateway source is not the exact read-only bound file'
+        members=command('docker','ps','--all','--quiet','--no-trunc','--filter',
+                        'label=com.docker.compose.project='+project).stdout.splitlines()
+        assert members==[container['Id']],'Compose test project contains another container'
+        return {'container_id':container['Id'],'namespace_identity':namespace,'image_id':container['Image'],
+                'file_hashes':hashes,'command':('docker','compose','--project-directory',str(root),
+                    '--project-name',project,'-f',str(compose))}
+
+    def gateway_recreate_fault(self):
+        target=self.compose_target(bound=True)
+        try:
+            before=self.https(self.a,keep=True)
+            assert before['ok'] and before['result']['status']==200 and before['result']['tls'],before
+            command(*target['command'],'up','-d','--no-deps','--no-build','--pull','never','--force-recreate','worker',timeout=90)
+            replacement=self.compose_target(bound=False)
+            assert replacement['container_id']!=target['container_id'],'Compose did not recreate the gateway container'
+            assert replacement['image_id']==target['image_id'] and replacement['file_hashes']==target['file_hashes'],\
+                'Compose source or image changed during recreation'
+            deadline=time.monotonic()+30
+            while True:
+                ready=command('docker','exec',replacement['container_id'],'cat','/run/worker/policy-ready',check=False,timeout=10)
+                if ready.returncode==0:break
+                assert time.monotonic()<deadline,'replacement gateway did not publish readiness'
+                time.sleep(0.2)
+            expected={'format':2,'policy':self.binding.policy}
+            expected.update({key:self.binding.data[key] for key in ('source_sha256','effective_sha256','policy_parser_sha256')})
+            assert json.loads(ready.stdout)==expected,'replacement gateway readiness differs from the bound policy'
+            old=self.existing_https(self.a);new=self.https(self.a)
+            assert not old['ok'] and not new['ok'],{'old':old,'new':new}
+            self.rejected_start('gateway-recreate')
+            self.echo(self.b,'127.0.0.1',self.tcp.server_address[1]);self.forced_egress(self.a)
+            result=self.after_namespace_fault('gateway-recreate')
+            assert result['container_changed'] and result['container_id_after']==replacement['container_id'] and \
+                result['namespace_after']==replacement['namespace_identity'],'replacement identity changed during verification'
+            return dict(result,existing_connection_blocked_during_fault=True,new_connection_blocked_during_fault=True,
+                        other_session_loopback_alive=True,replacement_readiness_verified=True,compose_project=self.compose_project)
+        finally:
+            # A failed recreate may already have replaced the container. Keep
+            # the old binding and guards; never blindly start, repair or rebind.
+            self.assert_rules()
 
     def rejected_start(self, label):
         marker=Path('/tmp/d8-should-not-run-'+uuid.uuid4().hex)
@@ -853,9 +941,12 @@ def main():
     parser.add_argument('--output',default='/root/dev-session-acceptance-20261009/core')
     parser.add_argument('--repetitions',type=int,default=100)
     parser.add_argument('--udp-echo',type=udp_target,required=True,help='controlled non-DNS echo target, reachable only through the upstream fixture')
-    parser.add_argument('--namespace-fault',choices=('none','gateway-stop','gateway-kill'),default='none',
+    parser.add_argument('--namespace-fault',choices=('none','gateway-stop','gateway-kill','gateway-recreate'),default='none',
                         help='last scenario; changed namespace leaves guards and binding in place for offline rebind')
+    parser.add_argument('--compose-project',help='explicit owned project; required only for gateway-recreate on a fresh Compose test host')
     args=parser.parse_args()
+    if bool(args.compose_project)!=(args.namespace_fault=='gateway-recreate'):
+        parser.error('--compose-project is required only with --namespace-fault gateway-recreate')
     assert os.geteuid()==0,'requires root on a disposable test host'
     os.umask(0o077)
     suite=Suite(args)
@@ -1145,6 +1236,132 @@ class FaultTests(unittest.TestCase):
                     else:
                         with self.assertRaises(AssertionError):Suite.gateway_command(suite,'ip','link','set','dev','tun0','down')
                         self.assertEqual(len(calls),1)
+
+
+class RecreateTests(unittest.TestCase):
+    """Fake Docker/Compose ownership and replacement boundaries only."""
+
+    @contextlib.contextmanager
+    def fixture(self,alter=None,recreate=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'network.json';compose=root/'docker-compose.yml'
+            source.write_text('{"fixture_password":"d8-fixture-only-password"}\n')
+            compose.write_text('services:\n  worker:\n    image: worker:1.14.2-v8\n')
+            source.chmod(0o600);compose.chmod(0o600)
+            suite=FaultTests().suite();suite.compose_project='repo';suite.output=root
+            suite.binding.data['source_sha256']=hashlib.sha256(source.read_bytes()).hexdigest()
+            labels={'com.docker.compose.project':'repo','com.docker.compose.service':'worker',
+                    'com.docker.compose.project.working_dir':str(root),
+                    'com.docker.compose.project.config_files':str(compose),
+                    'com.docker.compose.oneoff':'False'}
+            container={'Id':'d'*64,'Name':'/worker','Image':'sha256:'+'1'*64,
+                       'State':{'Running':True,'Pid':123},'Config':{'Labels':labels},
+                       'Mounts':[{'Type':'bind','Source':str(source),'Destination':'/etc/worker/network.json','RW':False}]}
+            state={'container':container,'extra_containers':[],'calls':[],'source':source,'compose':compose,
+                   'namespace_inode':555,'ready':{'format':2,'source_sha256':suite.binding.data['source_sha256'],
+                     'effective_sha256':suite.binding.data['effective_sha256'],
+                     'policy_parser_sha256':suite.binding.data['policy_parser_sha256'],'policy':suite.binding.policy}}
+            if alter:alter(state)
+            def boundary(*args,**kwargs):
+                state['calls'].append(args)
+                if args==('docker','inspect','worker'):output=json.dumps([state['container']])
+                elif args[:2]==('docker','ps'):
+                    output='\n'.join([state['container']['Id']]+state['extra_containers'])+'\n'
+                elif args[:2]==('docker','compose'):
+                    if recreate:recreate(state)
+                    else:
+                        state['container']['Id']='f'*64;state['container']['State']['Pid']=124
+                        state['namespace_inode']=556
+                    output=''
+                elif args[:2]==('docker','exec'):
+                    self.assertEqual(args[2:],('f'*64,'cat','/run/worker/policy-ready'))
+                    output=json.dumps(state['ready'])
+                elif args in ((DEV,'check'),(DEV,'init')):
+                    return subprocess.CompletedProcess(args,1,'','binding rejected')
+                else:raise AssertionError('unexpected external operation')
+                return subprocess.CompletedProcess(args,0,output,'')
+            original_stat=Path.stat
+            def stat(path,*args,**kwargs):
+                if str(path) in ('/proc/123/ns/net','/proc/124/ns/net'):
+                    return SimpleNamespace(st_dev=4,st_ino=state['namespace_inode'])
+                # Model the trusted root directory ancestry of the CI checkout.
+                if path in root.parents:return SimpleNamespace(st_uid=0,st_mode=0o40755)
+                return original_stat(path,*args,**kwargs)
+            with mock.patch(__name__+'.INSTALL_ROOT',root),mock.patch(__name__+'.command',side_effect=boundary),\
+                 mock.patch.object(Path,'stat',stat):
+                yield suite,state
+
+    def test_recreate_targets_only_owned_project_and_requires_binding_refusal(self):
+        with self.fixture() as (suite,state):
+            result=suite.gateway_namespace_fault('gateway-recreate')
+            mutations=[args for args in state['calls'] if args[:2]==('docker','compose')]
+            self.assertEqual(mutations,[('docker','compose','--project-directory',str(suite.output),
+                '--project-name','repo','-f',str(suite.output/'docker-compose.yml'),
+                'up','-d','--no-deps','--no-build','--pull','never','--force-recreate','worker')])
+            self.assertTrue(result['container_changed']);self.assertTrue(result['offline_rebind_required'])
+            self.assertEqual(result['container_id_before'],'d'*64);self.assertEqual(result['container_id_after'],'f'*64)
+            self.assertTrue(result['replacement_readiness_verified'])
+            self.assertIn((DEV,'check'),state['calls']);self.assertIn((DEV,'init'),state['calls'])
+            suite.gateway_ready.assert_not_called();suite.forced_egress.assert_called_once_with(suite.a)
+            self.assertGreaterEqual(suite.assert_rules.call_count,3)
+
+    def test_recreate_rejects_unowned_container_project_and_source_before_mutating(self):
+        alterations=[
+            lambda s:s['container'].update(Id='a'*64),
+            lambda s:s['container'].update(Name='/unrelated'),
+            lambda s:s.update(namespace_inode=999),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.project':'production'}),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.service':'database'}),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.project.working_dir':'/other'}),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.project.config_files':'/other/compose.yml'}),
+            lambda s:s['container']['Config']['Labels'].update({'com.docker.compose.oneoff':'True'}),
+            lambda s:s['container']['Mounts'][0].update(RW=True),
+            lambda s:s['container']['Mounts'][0].update(Source='/unrelated/network.json'),
+            lambda s:s['extra_containers'].append('a'*64),
+            lambda s:s['source'].write_text('changed fake source'),
+            lambda s:s['source'].chmod(0o666)]
+        for index,alter in enumerate(alterations):
+            with self.subTest(alteration=index),self.fixture(alter=alter) as (suite,state):
+                with self.assertRaises(AssertionError):suite.gateway_namespace_fault('gateway-recreate')
+                self.assertFalse(any(args[:2] in (('docker','compose'),('docker','kill'),('docker','start'),('docker','stop'))
+                                     for args in state['calls']))
+                suite.https.assert_not_called()
+
+    def test_recreate_requires_a_different_container_id(self):
+        with self.fixture(recreate=lambda state:None) as (suite,state):
+            with self.assertRaises(AssertionError):suite.gateway_namespace_fault('gateway-recreate')
+            suite.existing_https.assert_not_called();suite.assert_rules.assert_called()
+            self.assertNotIn((DEV,'init'),state['calls'])
+
+    def test_new_container_id_requires_refusal_even_if_namespace_inode_is_reused(self):
+        def recreate(state):
+            state['container']['Id']='f'*64;state['container']['State']['Pid']=124
+        with self.fixture(recreate=recreate) as (suite,state):
+            result=suite.gateway_namespace_fault('gateway-recreate')
+            self.assertTrue(result['container_changed']);self.assertFalse(result['namespace_changed'])
+            self.assertTrue(result['offline_rebind_required'])
+            self.assertIn((DEV,'check'),state['calls']);self.assertIn((DEV,'init'),state['calls'])
+            suite.gateway_ready.assert_not_called()
+
+    def test_recreate_refuses_source_image_or_ready_drift(self):
+        for alteration in ('source','compose','image','ready'):
+            def recreate(state):
+                state['container']['Id']='f'*64;state['container']['State']['Pid']=124;state['namespace_inode']=556
+                if alteration in ('source','compose'):state[alteration].write_text('changed fixture')
+                elif alteration=='image':state['container']['Image']='sha256:'+'2'*64
+                else:state['ready']['effective_sha256']='0'*64
+            with self.subTest(alteration=alteration),self.fixture(recreate=recreate) as (suite,state):
+                with self.assertRaises(AssertionError):suite.gateway_namespace_fault('gateway-recreate')
+                suite.existing_https.assert_not_called();suite.gateway_ready.assert_not_called()
+                suite.assert_rules.assert_called()
+
+    def test_recreate_failure_never_blindly_starts_or_repairs_a_container(self):
+        def fail(state):raise RuntimeError('controlled Compose failure')
+        with self.fixture(recreate=fail) as (suite,state):
+            with self.assertRaisesRegex(RuntimeError,'controlled Compose failure'):
+                suite.gateway_namespace_fault('gateway-recreate')
+            self.assertFalse(any(args[:2] in (('docker','start'),('docker','kill'),('docker','stop')) for args in state['calls']))
+            self.assertNotIn((DEV,'init'),state['calls']);suite.assert_rules.assert_called()
 
 
 if __name__=='__main__':main()

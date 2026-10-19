@@ -25,7 +25,7 @@ jobs:
       matrix:
         platform: [ubuntu-26.04]
         protocol: [hysteria2, http]
-        scenario: [healthy, gateway-stop, gateway-kill, docker-restart]
+        scenario: [healthy, gateway-stop, gateway-kill, gateway-recreate, docker-restart]
         include:
           - platform: debian-13-kvm
             protocol: hysteria2

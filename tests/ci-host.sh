@@ -24,7 +24,7 @@ ci_require_disposable() {
 
 ci_validate_case() {
     [[ $1 == hysteria2 || $1 == http ]] || return 1
-    case $2 in healthy|gateway-stop|gateway-kill|docker-restart) ;; *) return 1 ;; esac
+    case $2 in healthy|gateway-stop|gateway-kill|gateway-recreate|docker-restart) ;; *) return 1 ;; esac
     [[ $3 =~ ^[1-9][0-9]{0,2}$ ]] && (( 10#$3 <= 200 ))
 }
 
@@ -124,6 +124,13 @@ ci_stage() {
     "$@" 2>&1 | tee "$CI_EVIDENCE/logs/$CI_STAGE.log"
     ci_record_stage "$CI_EVIDENCE" "$CI_STAGE" 0 "$((SECONDS-CI_STAGE_STARTED))"
     CI_STAGE=''
+}
+
+ci_offline_helpers() {
+    # unittest discovery only loads test_*.py. These host tools also contain
+    # pure regression cases and must pass before any privileged fixture setup.
+    env PYTHONPATH="$CI_ROOT/tests" timeout --signal=TERM --kill-after=10s 2m \
+        python3 -m unittest -v host_acceptance host_upstream_fixture host_lifecycle
 }
 
 ci_packages() {
@@ -353,10 +360,16 @@ ci_fixture() {
 
 ci_suites() {
     local core_fault=none lifecycle_fault=none
+    local -a core_options=()
     case $CI_SCENARIO in
-        gateway-stop|gateway-kill) core_fault=$CI_SCENARIO ;;
+        gateway-stop|gateway-kill|gateway-recreate) core_fault=$CI_SCENARIO ;;
         docker-restart) lifecycle_fault=docker-restart ;;
     esac
+    if [[ $core_fault == gateway-recreate ]]; then
+        # ci_fixture creates this single-service project in CI_ROOT=.../repo.
+        # The core harness independently verifies its container ownership.
+        core_options=(--compose-project repo)
+    fi
     # A namespace-changing fault is always LAST. The process never removes a
     # binding or retries init to accept the replacement namespace afterward.
     if [[ $core_fault != none ]]; then
@@ -367,7 +380,8 @@ ci_suites() {
     fi
     ci_stage core timeout --signal=TERM --kill-after=30s 20m \
         python3 "$CI_ROOT/tests/host_acceptance.py" --user "$CI_ACCOUNT" \
-        --output "$CI_EVIDENCE/core" --udp-echo 192.0.2.254:40123 --namespace-fault "$core_fault"
+        --output "$CI_EVIDENCE/core" "${core_options[@]}" \
+        --udp-echo 192.0.2.254:40123 --namespace-fault "$core_fault"
     if [[ $core_fault == none ]]; then
         ci_stage lifecycle timeout --signal=TERM --kill-after=30s 20m \
             python3 "$CI_ROOT/tests/host_lifecycle.py" --user "$CI_ACCOUNT" \
@@ -446,7 +460,7 @@ ci_main() {
             --protocol) [[ $# -ge 2 ]] || ci_fail 'Missing protocol'; CI_PROTOCOL=$2; shift 2 ;;
             --scenario) [[ $# -ge 2 ]] || ci_fail 'Missing scenario'; CI_SCENARIO=$2; shift 2 ;;
             --repetitions) [[ $# -ge 2 ]] || ci_fail 'Missing repetitions'; CI_REPETITIONS=$2; shift 2 ;;
-            *) ci_fail 'Usage: ci-host.sh --protocol hysteria2|http --scenario healthy|gateway-stop|gateway-kill|docker-restart [--repetitions 1..200]' ;;
+            *) ci_fail 'Usage: ci-host.sh --protocol hysteria2|http --scenario healthy|gateway-stop|gateway-kill|gateway-recreate|docker-restart [--repetitions 1..200]' ;;
         esac
     done
     ci_validate_case "$CI_PROTOCOL" "$CI_SCENARIO" "$CI_REPETITIONS" || ci_fail 'Invalid CI case'
@@ -471,6 +485,7 @@ ci_main() {
     ci_stage dependencies ci_packages
     ci_stage offline timeout --signal=TERM --kill-after=30s 10m \
         python3 -m unittest discover -s "$CI_ROOT/tests" -p 'test_*.py' -v
+    ci_stage offline_helpers ci_offline_helpers
     ci_stage docker_backend ci_docker_legacy
     ci_stage fixture ci_fixture
     ci_stage exit_ip timeout --signal=TERM --kill-after=30s 5m \

@@ -41,6 +41,43 @@ class HostBootstrapTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertNotEqual(shell(HOST, 'ci_validate_case "$@"', *args).returncode, 0)
 
+    def test_gateway_recreation_case_requires_a_disposable_host(self):
+        for protocol in ("http", "hysteria2"):
+            with self.subTest(protocol=protocol):
+                result = shell(HOST, 'ci_validate_case "$@"', protocol, "gateway-recreate", "100")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                result = subprocess.run(
+                    ["bash", str(HOST), "--protocol", protocol, "--scenario", "gateway-recreate"],
+                    capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=10,
+                )
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertNotIn("CI_STAGE=", result.stdout)
+
+    def test_gateway_recreation_runs_last_and_preserves_a_failed_suite(self):
+        for core_exit in (0, 39):
+            with self.subTest(core_exit=core_exit), tempfile.TemporaryDirectory() as td:
+                # Intercept the suite boundary, so no sessions, Docker commands,
+                # binding files, or real policy checks run on this test host.
+                result = shell(
+                    HOST, 'CI_ROOT=$1; CI_EVIDENCE=$1; CI_ACCOUNT=ci-test; CI_REPETITIONS=100; '
+                          'CI_SCENARIO=gateway-recreate; CI_TEST_CORE_EXIT=$2; '
+                          'ci_stage() { printf "%s\\n" "$*" >>"$CI_EVIDENCE/stage-calls"; '
+                          'if [[ $1 == core ]]; then return "$CI_TEST_CORE_EXIT"; fi; }; '
+                          'cmp() { printf "%s\\n" binding-checked >>"$CI_EVIDENCE/stage-calls"; }; '
+                          'ci_suites', td, core_exit,
+                )
+                self.assertEqual(result.returncode, core_exit, result.stderr)
+                calls = (Path(td) / "stage-calls").read_text().splitlines()
+                self.assertTrue(calls[0].startswith("lifecycle "), calls)
+                self.assertTrue(calls[0].endswith("--namespace-fault none"), calls)
+                self.assertNotIn("--compose-project", calls[0])
+                self.assertTrue(calls[1].startswith("core "), calls)
+                self.assertIn("--compose-project repo", calls[1])
+                self.assertTrue(calls[1].endswith("--namespace-fault gateway-recreate"), calls)
+                self.assertEqual([row.split()[0] for row in calls],
+                                 ["lifecycle", "core", "results", "binding-checked"]
+                                 if core_exit == 0 else ["lifecycle", "core"])
+
     def test_nested_stage_failure_cannot_continue_setup(self):
         with tempfile.TemporaryDirectory() as td:
             Path(td, "logs").mkdir()
@@ -50,6 +87,30 @@ class HostBootstrapTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertFalse(Path(td, "unprotected").exists())
+
+    def test_inline_harness_regressions_run_and_fail_the_ci_stage(self):
+        modules = ("host_acceptance", "host_upstream_fixture", "host_lifecycle")
+        for failed in (None, *modules):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "tests").mkdir()
+                (root / "logs").mkdir()
+                for module in modules:
+                    (root / "tests" / (module + ".py")).write_text(
+                        "import unittest\nclass InlineRegression(unittest.TestCase):\n"
+                        "    def test_inline_case(self):\n"
+                        "        self.assertTrue(" + repr(module != failed) +
+                        ", 'controlled inline failure')\n"
+                    )
+                result = shell(
+                    HOST, 'CI_ROOT=$1; CI_EVIDENCE=$1; '
+                          'ci_stage offline_helpers ci_offline_helpers', root,
+                )
+                self.assertEqual(result.returncode, 0 if failed is None else 1, result.stderr)
+                self.assertIn("Ran 3 tests", result.stdout)
+                if failed is not None:
+                    self.assertIn("controlled inline failure", result.stdout)
+                    self.assertFalse((root / "stages.jsonl").exists())
 
     def test_fixture_uses_private_install_without_public_launcher(self):
         with tempfile.TemporaryDirectory() as td:
