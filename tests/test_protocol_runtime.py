@@ -24,7 +24,7 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
 
     def test_matrix_includes_protocol_transports_and_graphs(self):
         names = runtime.case_names()
-        for kind in ("hysteria", "hysteria2", "tuic", "shadowsocks", "anytls", "http", "https",
+        for kind in ("hysteria", "hysteria2", "tuic", "shadowsocks", "http", "https",
                      "socks5-tcp", "socks5-uot", "naive", "naive-quic", "snell4", "snell6",
                      "hysteria-port-hopping", "hysteria2-port-hopping",
                      "ssh", "shadowtls1", "shadowtls2", "shadowtls3",
@@ -120,22 +120,22 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
                     self.assertEqual(reply, {"peer": runtime.LOOPBACK, "token": "relay-" + str(index)})
                 self.assertEqual(relay.observed_ports, sorted(relay.ports))
 
-    def test_inventory_and_help_select_44_recipes_and_report_blocked_httpupgrade(self):
-        self.assertEqual(len(runtime.case_names()), 44)
+    def test_inventory_and_help_select_43_recipes_and_report_blocked_cases(self):
+        self.assertEqual(len(runtime.case_names()), 43)
         result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--list"],
                                 check=True, capture_output=True, text=True)
         inventory = json.loads(result.stdout)
         self.assertEqual(inventory["experimental_cases"], [])
         self.assertEqual(inventory["cases"], runtime.case_names())
-        blocked = {kind + "-httpupgrade" for kind in ("trojan", "vmess", "vless")}
+        blocked = {kind + "-httpupgrade" for kind in ("trojan", "vmess", "vless")} | {"anytls"}
         self.assertEqual(set(inventory["blocked"]), blocked)
         self.assertFalse(blocked.intersection(inventory["cases"] + inventory["experimental_cases"]))
-        for reason in inventory["blocked"].values():
+        for name, reason in inventory["blocked"].items():
             self.assertIn("pinned-core", reason)
-            self.assertIn("paired-reliability", reason)
+            self.assertIn("native-fault-recovery" if name == "anytls" else "paired-reliability", reason)
         help_result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--help"],
                                      check=True, capture_output=True, text=True)
-        self.assertIn("accepted 44-case loopback matrix", " ".join(help_result.stdout.split()))
+        self.assertIn("accepted 43-case loopback matrix", " ".join(help_result.stdout.split()))
         self.assertNotIn("Experimental cases", help_result.stdout)
 
     def test_httpupgrade_cannot_be_selected_or_built_as_an_opt_in_case(self):
@@ -149,6 +149,15 @@ class ProtocolRuntimeFixtureTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("invalid choice", result.stderr)
                 self.assertEqual(result.stdout, "")
+
+    def test_anytls_cannot_be_selected_or_built_as_an_opt_in_case(self):
+        with self.assertRaisesRegex(runtime.CaseFailure, "anytls.*native-fault-recovery"):
+            runtime.build_configs("anytls", self.original, self.ports, "TEST CERTIFICATE", "/fake/cert", "/fake/key")
+        result = subprocess.run([sys.executable, str(Path(runtime.__file__)), "--case", "anytls"],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice", result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_snell4_recipe_uses_the_real_server_version5_schema(self):
         _, client, server, policy = runtime.build_configs(

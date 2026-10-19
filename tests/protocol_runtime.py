@@ -47,6 +47,7 @@ TIMEOUT = 3.0
 EXPERIMENTAL_CASES = ()
 BLOCKED = {name: "pinned-core-httpupgrade-paired-reliability-not-accepted"
            for name in ("trojan-httpupgrade", "vmess-httpupgrade", "vless-httpupgrade")}
+BLOCKED["anytls"] = "pinned-core-anytls-native-fault-recovery-not-accepted"
 
 
 class CaseFailure(Exception):
@@ -70,7 +71,7 @@ def validate_version(text):
 
 def case_names():
     names = ["hysteria", "hysteria2", "tuic", "tuic-over-stream", "shadowsocks",
-             "shadowsocks-uot", "shadowsocks-mux", "anytls", "http", "https",
+             "shadowsocks-uot", "shadowsocks-mux", "http", "https",
              "socks4-tcp", "socks4a-tcp", "socks5-tcp", "socks5-uot", "naive",
              "naive-quic", "naive-uot", "snell4", "snell6"]
     for kind in ("trojan", "vmess", "vless"):

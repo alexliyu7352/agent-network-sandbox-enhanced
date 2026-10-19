@@ -58,7 +58,7 @@ def check_tls:
     "certificate_public_key_sha256","client_certificate","client_key","fragment",
     "fragment_fallback_delay","record_fragment","kernel_tx","kernel_rx",
     "handshake_timeout","utls","reality"];
-    "unsupported TLS option; external files, ECH discovery, and packet spoofing are not managed")
+    "unsupported TLS option. External files, ECH discovery, and packet spoofing are not managed")
   | optional_type(["enabled","disable_sni","insecure","fragment","record_fragment",
                    "kernel_tx","kernel_rx"]; "boolean"; "invalid TLS boolean option")
   | optional_type(["engine","server_name","min_version","max_version",
@@ -79,9 +79,9 @@ def check_transport:
   ensure(type == "object"; "transport must be an object")
   | .type as $type
   | ensure($type != "httpupgrade";
-           "HTTPUpgrade is not accepted for pinned core 1.14.2 after paired reliability failures; use native TCP (omit transport), ws, http, grpc, or quic")
+           "HTTPUpgrade is not accepted for pinned core 1.14.2 after paired reliability failures. Use native TCP (omit transport), ws, http, grpc, or quic")
   | ensure(["http","ws","grpc","quic"] | index($type) != null;
-           "unsupported V2Ray transport; use http, ws, grpc, or quic; omit transport for native TCP")
+           "unsupported V2Ray transport. Use http, ws, grpc, or quic. Omit transport for native TCP")
   | allowed(["type"] + (if $type == "http" then
        ["host","path","method","headers","idle_timeout","ping_timeout"]
      elif $type == "ws" then ["path","headers","max_early_data","early_data_header_name"]
@@ -149,7 +149,7 @@ def protocol_fields($type):
   elif $type == "vmess" then ["uuid","security","alter_id","global_padding","authenticated_length",
      "network","tls","packet_encoding","multiplex","transport"]
   elif $type == "vless" then ["uuid","flow","network","tls","multiplex","transport","packet_encoding"]
-  elif $type == "anytls" then ["tls","password","idle_session_check_interval","idle_session_timeout","min_idle_session","client_metadata"]
+  elif $type == "anytls" then fail("AnyTLS is not accepted for pinned core 1.14.2 after native fault-recovery failure. Use another validated proxy protocol")
   elif $type == "snell" then ["version","psk","userkey","reuse","network","obfs_mode","obfs_host","mode"]
   elif $type == "http" then ["username","password","tls","path","headers"]
   elif $type == "socks" then ["version","username","password","network","udp_over_tcp"]
@@ -158,7 +158,7 @@ def protocol_fields($type):
   elif $type == "shadowtls" then ["version","password","tls"]
   elif $type == "naive" then ["username","password","insecure_concurrency","extra_headers","stream_receive_window",
      "udp_over_tcp","quic","quic_congestion_control","quic_session_receive_window","tls"]
-  else fail("unsupported outbound type; direct exits, endpoints, Tor, removed protocols, and unknown types are not managed") end;
+  else fail("unsupported outbound type. Direct exits, endpoints, Tor, removed protocols, and unknown types are not managed") end;
 
 def check_group:
   .type as $type
@@ -183,8 +183,8 @@ def check_node:
   | if group then check_group else
       .type as $type
       | allowed(common_fields + protocol_fields($type);
-          "unknown or unsupported outbound option; dynamic discovery, routing overrides, and extra dialers are not managed")
-      | ensure(.server | ipv4; "proxy server requires a canonical fixed IPv4 address; retain TLS names separately")
+          "unknown or unsupported outbound option. Dynamic discovery, routing overrides, and extra dialers are not managed")
+      | ensure(.server | ipv4; "proxy server requires a canonical fixed IPv4 address. Retain TLS names separately")
       | ensure(.server_port == null or (.server_port | integer(1;65535)); "server_port must be an integer in 1..65535")
       | ensure(.detour == null or .detour == "" or (.detour | tag); "detour must be a valid outbound tag")
       | ensure(.bind_interface == null or .bind_interface == "" or .bind_interface == "eth0";
@@ -226,7 +226,7 @@ def check_node:
                  "SOCKS version must be 4, 4a, or 5")
           | if (.udp_over_tcp | enabled) then
               ensure(.version == null or .version == "" or .version == "5"; "SOCKS UDP over TCP requires SOCKS5 and a compatible server")
-            else ensure(networks == ["tcp"]; "native SOCKS UDP relay is negotiated; set network to tcp or enable compatible UDP over TCP") end
+            else ensure(networks == ["tcp"]; "native SOCKS UDP relay is negotiated. Set network to tcp or enable compatible UDP over TCP") end
         elif $type == "shadowtls" then
           ensure(.version == null or .version == 0 or .version == 1 or .version == 2 or .version == 3;
                  "ShadowTLS version must be 1, 2, or 3")
@@ -256,7 +256,7 @@ def check_node:
 
 def check_source:
   allowed(["log","dns","inbounds","outbounds","route"];
-          "only managed log, DNS, TUN, outbound, and route sections are supported; additional exit services are forbidden")
+          "only managed log, DNS, TUN, outbound, and route sections are supported. Additional exit services are forbidden")
   | if .log != null then .log |= (
       allowed(["level","timestamp","disabled"]; "unsupported log option")
       | optional_type(["timestamp","disabled"]; "boolean"; "invalid log boolean option")
@@ -278,7 +278,7 @@ def check_source:
           and .auto_route == false and .auto_redirect == false and .dns_mode == "disabled";
           "TUN interface, address, MTU, and disabled automatic routing must match the managed gateway"))
   | ensure(.route == {rules:[{inbound:["tun-in"],port:53,action:"hijack-dns"}],final:"proxy"};
-           "route must contain only managed DNS hijacking and final proxy; remote rules and alternate exits are unsupported")
+           "route must contain only managed DNS hijacking and final proxy. Remote rules and alternate exits are unsupported")
   | ensure((.outbounds | type) == "array" and (.outbounds | length) > 0 and (.outbounds | length) <= 128;
            "outbounds must be a nonempty list with at most 128 nodes")
   | .outbounds |= map(check_node)
@@ -347,11 +347,11 @@ def capabilities($map; $order; $roles):
        else $node | intrinsic end) as $payload
     | if $node.detour != null and $node.detour != "" then
         ensure(subset(($node | channels($payload)); $known[$node.detour]);
-               "detour cannot carry the configured protocol transport; use a compatible carrier or restrict payload network")
+               "detour cannot carry the configured protocol transport. Use a compatible carrier or restrict payload network")
       else . end
     | if $node.type == "urltest" then
         ensure(all($node.outbounds[]; ($known[.] | index("tcp")) != null);
-               "urltest TCP health probes require TCP-capable candidate paths; use compatible carriers")
+               "urltest TCP health probes require TCP-capable candidate paths. Use compatible carriers")
       else . end
     | .[$name] = $payload);
 
@@ -389,11 +389,11 @@ try (
   | graph_order($map) as $order
   | graph_roles($map;$order) as $roles
   | ensure(($roles.reachable | length) == ($map | length);
-           "unreferenced outbounds are unsupported; all configured nodes must belong to the proxy graph")
+           "unreferenced outbounds are unsupported. All configured nodes must belong to the proxy graph")
   | (capabilities($map;$order;$roles) | .proxy) as $payload
   | ensure(($payload | length) > 0; "proxy candidates have no common usable payload network")
   | ensure(($payload | index("tcp")) != null;
-           "final proxy must guarantee TCP for session readiness; UDP-only detour carriers are allowed")
+           "final proxy must guarantee TCP for session readiness. UDP-only detour carriers are allowed")
   | (endpoints($map;$order) | normalize_endpoints) as $outer
   | ensure(($outer | length) > 0; "proxy graph has no controlled outer endpoint")
   | (if ($payload | index("udp")) != null then "udp" else "https" end) as $dns

@@ -4,7 +4,7 @@
 
 截至 2026-10-19，歷史證據包括 24／24 公開配置檢查、初輪 47／47 協議 loopback 案例，以及 Ubuntu 20.04.6 hybrid／v1 上 Hysteria2 和 HTTP 的核心／故障套件各 17／17。[CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891) 在 `58dcfad596856fc3696d138f84d1c0f37e6e0ebd` 通過 12／12 jobs：Ubuntu 26.04.1 原生純 v2 的兩個協議各測 healthy、stop、kill、recreate、Docker restart；Debian 13.7 KVM 純 v2 的兩個協議各測 healthy。Debian 的兩個 jobs 仍含路由、TUN 及受控上游中斷測試，但不含容器／Docker namespace 故障。
 
-後續逐協議 CI 的第一輪為 50／59，未全數通過；HTTPUpgrade 追加重測失敗後已明確拒絕，現行必需矩陣為 44 個逐協議 jobs 加原有 12 個代表性 jobs。AnyTLS 另含一項有界限制與恢復驗證，第一條失敗保留，不在通用故障測試或產品探測加入重試。完整失敗紀錄與後續結果見[追加驗證](validation-20261019-followup.md)。
+後續逐協議 CI 的第一輪為 50／59，第二輪為 54／56，均未全數通過。HTTPUpgrade 在固定核心配對的追加重測失敗，AnyTLS 的有限恢復步驟通過後仍未完成獨立節點故障恢復，兩者本版明確拒絕。現行必需矩陣為 43 個逐協議 jobs 加原有 12 個代表性 jobs；全部可接受逐協議 job 使用原有 core17，不在通用故障測試或產品探測加入重試。完整失敗紀錄與後續結果見[追加驗證](validation-20261019-followup.md)。
 
 各次版本、套件數量、封包與 socket 身分證據見 [驗證摘要](VERIFICATION.md)。以下清單也列出尚待擴充的測試範圍，不能把它的每個項目都當成已通過。配置／loopback 結果不代替主機層驗收，已測主機也不能代替其他協議、transport 或使用者實際遠端節點。歷史結果另保留於 [2026-10-10](host-acceptance-20261010.md) 與 [2026-10-09](host-acceptance-20261009.md)。
 
@@ -96,7 +96,7 @@ python3 tests/test_dns_runtime.py --engine /absolute/path/to/pinned-worker --pro
 
 先把範例中的 engine 路徑換成已核對版本的測試 binary。最後兩行是預期非零的負對照，不能當作整套測試失敗或以 `--check-only` 取代。loopback fixture 使用臨時服務、假認證及測試憑證；完整主機驗收仍需實際會話／防火牆／路由／封包證據。
 
-更廣的成對協議測試由 [`tests/protocol_runtime.py`](../tests/protocol_runtime.py) 執行。初輪 47 組曾在固定核心各至少一次通過，三個 HTTPUpgrade 隨後因可靠性反例而拒絕；現行預設為 44 組。每組先做正式 policy／effective 編譯，再將 TUN、介面與 DNS 邊界替換為 loopback fixture。這些替換表示結果沒有執行正式主機的 cgroup、TUN 或 firewall 路徑。SSH 另需在私有 Python 環境安裝固定 Paramiko 3.5.1 依賴。可重跑：
+更廣的成對協議測試由 [`tests/protocol_runtime.py`](../tests/protocol_runtime.py) 執行。初輪 47 組曾在固定核心各至少一次通過，三個 HTTPUpgrade 及 AnyTLS 隨後因未滿足追加驗收而拒絕；現行預設為 43 組。每組先做正式 policy／effective 編譯，再將 TUN、介面與 DNS 邊界替換為 loopback fixture。這些替換表示結果沒有執行正式主機的 cgroup、TUN 或 firewall 路徑。SSH 另需在私有 Python 環境安裝固定 Paramiko 3.5.1 依賴。可重跑：
 
 ```bash
 python3 tests/protocol_runtime.py --list
@@ -134,7 +134,9 @@ sudo python3 tests/host_exit_ip.py --user testagent \
 5. 插入、刪除或重排一條本工具規則，核對 exact-rule 檢查拒絕入場；這類完整性案例需按個別測試記錄，不因正常連線通過而視為已測。
 6. 停止或終止 gateway core，並在獨立測試主機分開執行 container stop/start、kill/start、recreate 或 Docker daemon restart。會改變 namespace 的故障放在最後；後續不能自動恢復成可入場狀態。
 
-PCAP 的開始必須由本次唯一 root canary 實際入檔證明，結束也要另有本次唯一末端 canary；重複的起始封包不能代替末端證據。對未加密 SOCKS5 UoT／VLESS，DNS 或 UDP marker 可以出現在精確允許的代理流內，測試須如實記錄可見性；這不允許其他外層端點、直連 DNS 或實體介面 workload 直連。DoH 及不支援 UDP 的出口仍不允許相應 marker。
+PCAP 的開始必須由本次唯一 root canary 實際入檔證明，並在任何該 capture 的 workload probe 前取得新統計，確認 captured 等於 received 且 dropped 為零。初始不完整的 collector 只可在 workload 前限次重建，先停止並保留被拒的 PCAP／log。結束仍需另一個唯一末端 canary，且只接受 SIGINT 後新寫入的完整統計，要求整個選中 collector 的 captured 等於 received、dropped 為零；不扣 baseline，也不能以起始統計或重複起始封包代替末端證據。
+
+對未加密 SOCKS5 UoT／VLESS，DNS 或 UDP marker 可以出現在精確允許的代理流內，測試須如實記錄可見性；這不允許其他外層端點、直連 DNS 或實體介面 workload 直連。DoH 及不支援 UDP 的出口仍不允許相應 marker。
 
 故障期間抓實體介面，確認不使用原本的直連出口；既有及新受管外網連線應失敗或中斷，另一會話的 loopback 仍可用。抓包必須有能被觀察到的正對照，再核對受管直連數為零，並逐一比對真正的外層 IP／TCP 或 UDP／埠區間。HTTP 的普通 UDP 拒絕與 Hysteria2 的實際 UDP echo 必須分開判定。**不要以清空 mangle 或全機防火牆注入故障。**
 

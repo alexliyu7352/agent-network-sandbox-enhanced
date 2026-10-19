@@ -152,9 +152,9 @@ sudoedit /opt/session/network.json
 
 **公开版中的地址和密码都是示例，不能直接使用。请勿把填好真实信息的配置文件提交到公开仓库。**
 
-**本版已实现以下配置的静态策略适配：** Hysteria 1／2、TUIC、Shadowsocks、Trojan、VMess、VLESS、AnyTLS、Snell 4／6、HTTP／HTTPS CONNECT、SOCKS4／4a／5 的 TCP、SOCKS5 UoT、SSH、Naive，以及作 detour 包装的 ShadowTLS 1／2／3。另支持 selector、urltest、兼容的 detour、明确的 Hysteria 端口区间，以及矩阵列出的 V2Ray transport、UoT 和 multiplex 组合。Naive 需要镜像包含对应构建标签；已核对的 amd64 测试镜像具备此标签。
+**本版已实现以下配置的静态策略适配：** Hysteria 1／2、TUIC、Shadowsocks、Trojan、VMess、VLESS、Snell 4／6、HTTP／HTTPS CONNECT、SOCKS4／4a／5 的 TCP、SOCKS5 UoT、SSH、Naive，以及作 detour 包装的 ShadowTLS 1／2／3。另支持 selector、urltest、兼容的 detour、明确的 Hysteria 端口区间，以及矩阵列出的 V2Ray transport、UoT 和 multiplex 组合。Naive 需要镜像包含对应构建标签；已核对的 amd64 测试镜像具备此标签。
 
-**HTTPUpgrade 目前明确拒绝。** 固定核心配对的重复验收在 Trojan／VMess／VLESS 上出现间歇失败；可按服务端改用原生 TCP、HTTP、WebSocket、gRPC 或 QUIC。AnyTLS 保留策略适配，但固定核心在取消仍等待的上游连接后，下一条复用连接可能约三秒后失败；健康准入检查可能因此拒绝一次启动。具体证据和有界恢复测试见[追加验证记录](docs/validation-20261019-followup.md)。
+**HTTPUpgrade 与 AnyTLS 本版明确拒绝。** 固定核心配对的 HTTPUpgrade 重复验收在 Trojan／VMess／VLESS 上出现间歇失败；可按服务端改用原生 TCP、HTTP、WebSocket、gRPC 或 QUIC。AnyTLS 虽通过一次有限的复用连接恢复对照，仍未通过后续节点故障解除后的 HTTPS 恢复，请改用另一个已验收的代理协议。这些是固定核心下的具体验收边界；完整成功与失败证据见[追加验证记录](docs/validation-20261019-followup.md)。
 
 未加密的 SOCKS5 UoT 或 VLESS 可能让代理流内的 DNS／UDP 内容在链路上可见。端点限制和 DNS 拦截控制流量路径，内容保密仍取决于原始代理和 TLS 设置。程序不会自动修改这些设置。
 
@@ -446,13 +446,13 @@ sha256sum -c MANIFEST.sha256
 
 | 层次与环境 | 已通过的范围 |
 | --- | --- |
-| 配置检查 | 24／24 份公开代理示例通过共用解析器及真实 sing-box 1.14.2 核心检查；假节点不因此变成可用节点。 |
-| 真实协议 loopback | 初轮 47 组各至少一次通过；后续重测使三个 HTTPUpgrade 案例被明确拒绝，现行默认为 44 组。TCP、UDP 或按能力拒绝、DNS 缓存／TTL 和停止 server 后的阻断记录保留。这一层不代替主机 cgroup／TUN／防火墙验收。 |
+| 配置检查 | 初轮 24／24 份示例通过共用解析器及真实 sing-box 1.14.2 核心检查；后续撤下 AnyTLS，现行保留 23 份公开示例。假节点不因此变成可用节点。 |
+| 真实协议 loopback | 初轮 47 组各至少一次通过；后续验收使三个 HTTPUpgrade 案例及 AnyTLS 被明确拒绝，现行默认为 43 组。TCP、UDP 或按能力拒绝、DNS 缓存／TTL 和停止 server 后的阻断记录保留。这一层不代替主机 cgroup／TUN／防火墙验收。 |
 | Ubuntu 20.04.6 hybrid／v1 | Hysteria2 与 HTTP CONNECT 的核心／故障套件各 17／17，两者的代理出口 IP 比对通过。另完成 v1 生命周期 10／10（含 100 个短会话）、能力 13／13、CLI 9／9。 |
 | Ubuntu 26.04.1 原生纯 v2 | Hysteria2／HTTP 各执行 healthy、gateway-stop、gateway-kill、gateway-recreate、docker-restart，共 10／10 CI jobs 通过；包括真实会话、抓包、出口 IP 与生命周期验收。 |
 | Debian 13.7 KVM 纯 v2 | Hysteria2／HTTP 的 healthy jobs 共 2／2 通过；各含核心 16／16、生命周期 10／10、100 个短会话及出口 IP 比对。Debian 的容器／Docker namespace 故障不在这两个 job 范围内。 |
 
-逐协议主机初轮 [CI 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481) 为 **50／59，未全部通过**。修正、HTTPUpgrade 的明确拒绝、AnyTLS 的限制以及后续 44＋12 组关卡见[追加验证记录](docs/validation-20261019-followup.md)。
+逐协议主机初轮 [CI 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481) 为 **50／59**，第二轮 [CI 39206996173](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39206996173) 为 **54／56**，两轮均未全部通过。HTTPUpgrade／AnyTLS 的明确拒绝、抓包完整性修正及后续 43＋12 组关卡见[追加验证记录](docs/validation-20261019-followup.md)。
 
 纯 v2 结果来自 [CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891)（`58dcfad596856fc3696d138f84d1c0f37e6e0ebd`），**12／12 jobs 通过**。v2 证据另核对会话创建的实际 socket inode 与所属 service cgroup。容器重建确实更换 container ID 与 namespace；旧 binding／共同规则保留，`check`、`init` 及新工作负载入场拒绝，必须离线重新绑定，没有自动沿用新 namespace。
 

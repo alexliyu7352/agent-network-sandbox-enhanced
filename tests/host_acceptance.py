@@ -377,67 +377,140 @@ class Suite:
         assert p.poll() is None, 'capture failed'
         return path
 
+    @staticmethod
+    def capture_statistics(text,final=False):
+        # Linux tcpdump prints SIGUSR1 statistics on one line; the SIGINT
+        # report is multiline. Require the complete report, including newline.
+        if final:
+            pattern=(r'^(\d+) packets? captured\n(\d+) packets? received by filter\n'
+                     r'(\d+) packets? dropped by kernel(?:\n(\d+) packets? dropped by interface)?\n')
+        else:
+            pattern=(r'^tcpdump: (\d+) packets? captured, (\d+) packets? received by filter, '
+                     r'(\d+) packets? dropped by kernel(?:, (\d+) packets? dropped by interface)?\n')
+        matches=list(re.finditer(pattern,text,re.M))
+        if not matches:return None
+        # Do not silently use the preceding complete report when a newer
+        # report or an interface-drop suffix has only been partially written.
+        if text[matches[-1].end():].strip():return None
+        return dict(zip(('captured','received','dropped','interface_dropped'),
+                        (int(value or 0) for value in matches[-1].groups())))
+
+    def stop_capture(self,capture,strict=True,deadline=None):
+        if capture['stopped']:return []
+        errors=[]
+        p,log,path=(capture[key] for key in ('process','log','path'))
+        log_path=Path(log.name);final_offset=None
+        def budget(limit):
+            return limit if deadline is None else max(0,min(limit,deadline-time.monotonic()))
+        if p.poll() is not None:
+            errors.append(str(path)+': collector exited before observation ended')
+        else:
+            if strict and capture.get('physical'):
+                # This chosen collector remains alive for the whole workload.
+                # A missing end marker or late counter mismatch still fails.
+                marker=('D8-END-'+uuid.uuid4().hex).encode()
+                self.physical_canary(marker)
+                end=time.monotonic()+3
+                while marker not in path.read_bytes() and time.monotonic()<end:
+                    time.sleep(min(0.02,max(0,end-time.monotonic())))
+                if marker not in path.read_bytes():errors.append(str(path)+': trailing canary missing')
+            # Never reuse a clean SIGUSR1 snapshot if SIGINT emits no new
+            # complete final report. Read only bytes appended after this point.
+            final_offset=log_path.stat().st_size
+            p.send_signal(signal.SIGINT)
+            try:p.wait(timeout=budget(5))
+            except subprocess.TimeoutExpired:
+                p.kill()
+                try:p.wait(timeout=budget(1))
+                except subprocess.TimeoutExpired:pass
+                errors.append(str(path)+': collector would not stop')
+        log.close();capture['stopped']=p.poll() is not None
+        if p.returncode!=0:errors.append(str(path)+': collector exit '+str(p.returncode))
+        text=log_path.read_bytes()[final_offset:].decode('utf-8','replace') if final_offset is not None else ''
+        stats=self.capture_statistics(text,final=True)
+        capture['final_statistics']=stats
+        if stats is None:
+            errors.append(str(path)+': missing fresh final capture statistics')
+        else:
+            if stats['dropped']!=0 or stats['interface_dropped']!=0:
+                errors.append(str(path)+': dropped packets')
+            if capture.get('physical') and stats['captured']!=stats['received']:
+                errors.append(str(path)+': physical capture did not process every received packet')
+        return errors
+
     def stop_captures(self,strict=True):
         errors=[]
         for capture in self.captures:
-            if capture['stopped']:continue
-            p,log,path=(capture[key] for key in ('process','log','path'))
-            if p.poll() is not None:
-                errors.append(str(path)+': collector exited before observation ended')
-            else:
-                if strict and capture.get('physical'):
-                    # Observe a trailing packet in the savefile before stopping;
-                    # -U alone flushes userspace output, not capture buffers.
-                    marker=('D8-END-'+uuid.uuid4().hex).encode()
-                    self.physical_canary(marker)
-                    end=time.monotonic()+3
-                    while marker not in path.read_bytes() and time.monotonic()<end:
-                        time.sleep(0.02)
-                    if marker not in path.read_bytes():errors.append(str(path)+': trailing canary missing')
-                p.send_signal(signal.SIGINT)
-                try:p.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    p.kill();p.wait();errors.append(str(path)+': collector would not stop')
-            log.close();capture['stopped']=True
-            if p.returncode!=0:errors.append(str(path)+': collector exit '+str(p.returncode))
-            stats=Path(log.name).read_text()
-            dropped=re.search(r'^(\d+) packets dropped by kernel$',stats,re.M)
-            if not dropped or int(dropped.group(1))!=0:
-                errors.append(str(path)+': missing statistics or dropped packets')
-            if capture.get('physical'):
-                captured=re.search(r'^(\d+) packets? captured$',stats,re.M)
-                received=re.search(r'^(\d+) packets? received by filter$',stats,re.M)
-                if not captured or not received or captured.group(1)!=received.group(1):
-                    errors.append(str(path)+': physical capture did not process every received packet')
+            errors.extend(self.stop_capture(capture,strict=strict))
         if strict:assert not errors,errors
+
+    def reject_physical_preflight(self,capture,name,attempt,deadline):
+        # Only an unadmitted candidate reaches this method. Stop it before
+        # moving its evidence; a replacement must keep the canonical filename.
+        self.stop_capture(capture,strict=False,deadline=deadline)
+        assert capture['stopped'] and capture['process'].returncode==0,'preflight collector did not stop cleanly'
+        old_log=Path(capture['log'].name)
+        stem=name+'-preflight-rejected-'+str(attempt)+'-'+uuid.uuid4().hex
+        rejected=self.output/(stem+'.pcap');rejected_log=self.output/(stem+'-tcpdump.log')
+        assert not rejected.exists() and not rejected_log.exists(),'preflight evidence already exists'
+        if capture['path'].exists():capture['path'].rename(rejected)
+        old_log.rename(rejected_log)
+        capture['path']=rejected;capture['rejected_log']=rejected_log
+
+    def physical_preflight_statistics(self,capture,deadline):
+        p=capture['process'];log_path=Path(capture['log'].name)
+        end=min(deadline,time.monotonic()+3)
+        offset=log_path.stat().st_size
+        assert p.poll() is None,'physical collector exited before statistics snapshot'
+        p.send_signal(signal.SIGUSR1)
+        while True:
+            remaining=end-time.monotonic()
+            assert remaining>=0,'physical preflight statistics deadline exceeded'
+            assert p.poll() is None,'physical collector exited during statistics snapshot'
+            stats=self.capture_statistics(log_path.read_bytes()[offset:].decode('utf-8','replace'))
+            if stats is not None:
+                assert p.poll() is None,'physical collector exited after statistics snapshot'
+                return stats
+            assert remaining>0,'physical preflight statistics snapshot missing or incomplete'
+            time.sleep(min(0.02,remaining))
 
     def physical_capture(self,name):
         destinations=['(dst host 9.9.9.9 and dst port 44443)']
         if self.udp_echo:destinations.append('(dst host '+self.udp_echo[0]+' and dst port '+str(self.udp_echo[1])+')')
-        path=self.capture(name,self.interface,
-                          'src portrange 21000-21199 and ('+' or '.join(destinations)+')')
-        capture=self.captures[-1]
-        capture['physical']=True
-        # Positive control proves the exact capture can see a direct host flow.
-        # Workload attempts use 21001..21199; this root-only canary uses 21000.
-        marker=('D8-START-'+uuid.uuid4().hex).encode()
-        capture['initial_marker']=marker
-        end=time.monotonic()+3
-        while True:
-            assert capture['process'].poll() is None,'physical collector exited before readiness'
-            try:content=path.read_bytes()
-            except FileNotFoundError:content=b''
-            remaining=end-time.monotonic()
-            assert remaining>=0,'physical capture did not observe its initial canary'
-            if marker in content:
-                assert capture['process'].poll() is None,'physical collector exited before readiness'
+        deadline=time.monotonic()+10
+        for attempt in range(1,4):
+            assert time.monotonic()<deadline,'physical capture preflight deadline exhausted'
+            path=self.output/(name+'.pcap');log_path=self.output/(name+'-tcpdump.log')
+            assert not path.exists() and not log_path.exists(),'physical capture evidence already exists'
+            path=self.capture(name,self.interface,
+                              'src portrange 21000-21199 and ('+' or '.join(destinations)+')')
+            capture=self.captures[-1];capture['physical']=True
+            marker=('D8-START-'+uuid.uuid4().hex).encode();capture['initial_marker']=marker
+            end=min(deadline,time.monotonic()+3)
+            try:
+                while True:
+                    assert capture['process'].poll() is None,'physical collector exited before readiness'
+                    try:content=path.read_bytes()
+                    except FileNotFoundError:content=b''
+                    remaining=end-time.monotonic()
+                    assert remaining>=0,'physical capture did not observe its initial canary'
+                    if marker in content:
+                        assert capture['process'].poll() is None,'physical collector exited before readiness'
+                        break
+                    assert remaining>0,'physical capture did not observe its initial canary'
+                    self.physical_canary(marker)
+                    time.sleep(min(0.05,remaining))
+                stats=self.physical_preflight_statistics(capture,deadline)
+            except BaseException:
+                self.stop_capture(capture,strict=False,deadline=deadline)
+                raise
+            capture['preflight_statistics']=stats
+            if stats['captured']>0 and stats['captured']==stats['received'] and stats['dropped']==stats['interface_dropped']==0:
                 return path
-            assert remaining>0,'physical capture did not observe its initial canary'
-            # A live tcpdump process or savefile header does not prove its
-            # filter was installed before the first send. Wait for actual data
-            # before starting any workload; bounded retries only send canaries.
-            self.physical_canary(marker)
-            time.sleep(min(0.05,remaining))
+            # No workload has started. Preserve this rejected collector and
+            # try at most three whole new captures, never subtract a baseline.
+            self.reject_physical_preflight(capture,name,attempt,deadline)
+        raise AssertionError('physical capture preflight statistics failed after three candidates')
 
     def physical_canary(self,payload):
         with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:

@@ -159,6 +159,9 @@ if profile == "protocol-case":
         "gateway_half_route_removed", "failed_probe_no_payload", "extra_policy_rule_rejected",
         "writable_policy_rejected", "gateway-kill", "packet_capture_evidence", "shared_rules_unchanged",
     )
+    # Retain the strict historical AnyTLS evidence reader. The live inventory
+    # and ci_validate_protocol_case reject this protocol after native recovery
+    # failed; this branch cannot authorize provisioning or workload admission.
     if case == "anytls":
         expected = expected[:7] + ("anytls_cancelled_dial_recovery",) + expected[7:]
     core_key = "core18" if case == "anytls" else "core17"
@@ -708,8 +711,6 @@ ci_suites() {
 
 ci_protocol_suites() {
     local marker_policy=absent
-    local core_options=()
-    if [[ $CI_PROTOCOL_CASE == anytls ]]; then core_options+=(--anytls-reuse-check); fi
     case "$CI_PROTOCOL_CASE" in
         socks5-uot|vless|vless-http|vless-ws|vless-grpc) marker_policy=encapsulated ;;
     esac
@@ -723,7 +724,7 @@ ci_protocol_suites() {
     ci_stage core timeout --signal=TERM --kill-after=30s 20m \
         python3 "$CI_ROOT/tests/host_acceptance.py" --user "$CI_ACCOUNT" \
         --output "$CI_EVIDENCE/core" --udp-echo 192.0.2.254:40123 \
-        --payload-marker-policy "$marker_policy" --namespace-fault gateway-kill "${core_options[@]}"
+        --payload-marker-policy "$marker_policy" --namespace-fault gateway-kill
     ci_stage fixture_verify ci_protocol_fixture_verify
     ci_stage results ci_validate_results "$CI_EVIDENCE" protocol-case "$CI_PROTOCOL_CASE"
     cmp /run/dev-session-v8/binding "$CI_EVIDENCE/binding-initial.json"

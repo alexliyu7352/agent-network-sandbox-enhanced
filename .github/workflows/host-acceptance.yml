@@ -118,7 +118,6 @@ jobs:
           - shadowsocks
           - shadowsocks-uot
           - shadowsocks-mux
-          - anytls
           - http
           - https
           - socks4-tcp

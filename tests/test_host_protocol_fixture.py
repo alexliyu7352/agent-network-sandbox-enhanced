@@ -1,6 +1,6 @@
 """Pure/native-helper contracts; no namespace, route or firewall mutations."""
 import copy
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import http.client
 import io
 import json
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -25,7 +26,7 @@ class NativeRecipeTests(unittest.TestCase):
 
     def test_all_recipes_keep_real_tun_dns_and_inline_node_trust(self):
         names=list(dict.fromkeys(runtime.case_names()+list(runtime.EXPERIMENTAL_CASES)))
-        self.assertEqual(len(names),44)
+        self.assertEqual(len(names),43)
         for name in names:
             with self.subTest(case=name):
                 plan=self.recipe(name);source=plan['source'];effective=plan['effective']
@@ -56,6 +57,29 @@ class NativeRecipeTests(unittest.TestCase):
                 self.assertNotIn(name,runtime.case_names()+list(runtime.EXPERIMENTAL_CASES))
                 with self.assertRaisesRegex(RuntimeError,'fixture: unknown-protocol-case'):
                     self.recipe(name)
+
+    def test_anytls_has_no_native_or_experimental_recipe(self):
+        self.assertNotIn('anytls',fixture.protocol_case_names())
+        self.assertNotIn('anytls',runtime.EXPERIMENTAL_CASES)
+        with self.assertRaisesRegex(RuntimeError,'fixture: unknown-protocol-case'):
+            self.recipe('anytls')
+
+    def test_anytls_cli_cannot_enter_any_native_fixture_action(self):
+        for action in ('render','setup','verify','serve','prove-hopping'):
+            with self.subTest(action=action):
+                command=[str(Path(fixture.__file__)),action,'--protocol-case','anytls',
+                         '--config','/unused/config.json','--engine','/unused/worker','--output','/unused/fixture']
+                if action=='prove-hopping':command+=['--user','fixture-user']
+                stdout=io.StringIO();stderr=io.StringIO()
+                with mock.patch.object(sys,'argv',command), mock.patch.object(fixture.os,'geteuid',return_value=0), \
+                     mock.patch.object(fixture.os,'umask'), \
+                     mock.patch.object(fixture,'output_directory',side_effect=AssertionError('filesystem-must-not-be-entered')) as output, \
+                     redirect_stdout(stdout), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:fixture.main()
+                self.assertEqual(raised.exception.code,2)
+                self.assertIn('invalid choice',stderr.getvalue())
+                self.assertEqual(stdout.getvalue(),'')
+                output.assert_not_called()
 
     def test_detour_and_wrappers_expose_only_outer_nodes(self):
         for name in ('detour','shadowtls1','shadowtls2','shadowtls3'):

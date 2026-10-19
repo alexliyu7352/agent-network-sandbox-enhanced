@@ -2,7 +2,9 @@
 import copy
 import json
 from pathlib import Path
+import re
 import subprocess
+import tempfile
 import unittest
 
 
@@ -139,7 +141,6 @@ class ProxyPolicyTests(unittest.TestCase):
             (node("trojan"), ["tcp"], ["tcp", "udp"]),
             (node("vmess"), ["tcp"], ["tcp", "udp"]),
             (node("vless"), ["tcp"], ["tcp", "udp"]),
-            (node("anytls"), ["tcp"], ["tcp", "udp"]),
             (node("snell", version=4), ["tcp"], ["tcp", "udp"]),
             (node("snell", version=6), ["tcp"], ["tcp", "udp"]),
             (node("http"), ["tcp"], ["tcp"]),
@@ -177,8 +178,8 @@ class ProxyPolicyTests(unittest.TestCase):
                     self.assertEqual(effective, outbound, "accepted alternatives must preserve TLS and auth")
 
     def test_httpupgrade_rejected_for_every_base_protocol_and_graph_position(self):
-        reason = ("HTTPUpgrade is not accepted for pinned core 1.14.2 after paired reliability failures; "
-                  "use native TCP (omit transport), ws, http, grpc, or quic")
+        reason = ("HTTPUpgrade is not accepted for pinned core 1.14.2 after paired reliability failures. "
+                  "Use native TCP (omit transport), ws, http, grpc, or quic")
         for kind in ("trojan", "vmess", "vless"):
             wrapped = node(kind, transport={"type": "httpupgrade", "path": "/private-path",
                                            "headers": {"X-Fixture-Auth": "TEST-CREDENTIAL-DO-NOT-PRINT"}})
@@ -200,6 +201,98 @@ class ProxyPolicyTests(unittest.TestCase):
                         leaf["tag"] = "carrier"
                         value = config(node("http", detour="carrier"), leaf)
                     self.rejected(value, reason)
+
+    def test_anytls_rejected_in_every_reachable_graph_position_with_valid_alternatives(self):
+        reason = ("AnyTLS is not accepted for pinned core 1.14.2 after native fault-recovery failure. "
+                  "Use another validated proxy protocol")
+        for position in ("direct", "selector", "urltest", "inner-detour", "carrier-detour"):
+            with self.subTest(position=position):
+                leaf = node("anytls")
+                if position == "direct":
+                    value = config(leaf)
+                elif position in {"selector", "urltest"}:
+                    leaf["tag"] = "blocked"
+                    group = {"type": position, "tag": "proxy", "outbounds": ["good", "blocked"]}
+                    if position == "selector":
+                        group["default"] = "good"
+                    value = config(group, node("http", "good", "192.0.2.2"), leaf)
+                elif position == "inner-detour":
+                    leaf["detour"] = "carrier"
+                    value = config(leaf, node("hysteria2", "carrier", "192.0.2.2"))
+                else:
+                    leaf["tag"] = "carrier"
+                    value = config(node("http", detour="carrier"), leaf)
+                self.rejected(value, reason)
+                # Replacing only the rejected protocol must keep this graph
+                # usable without weakening its authentication or TLS policy.
+                replacement = copy.deepcopy(value)
+                replacement_leaf = next(item for item in replacement["outbounds"] if item["type"] == "anytls")
+                replacement_leaf["type"] = "trojan"
+                self.assertIn("tcp", self.parse(replacement)["payload_networks"])
+                effective = self.parse(replacement, "effective")
+                actual = next(item for item in effective["outbounds"] if item["tag"] == replacement_leaf["tag"])
+                self.assertEqual(actual["tls"], leaf["tls"])
+                self.assertEqual(actual["password"], leaf["password"])
+
+    def test_current_23_public_examples_are_accepted_without_anytls(self):
+        examples = sorted((ROOT / "examples" / "proxies").glob("*.json"))
+        self.assertEqual(len(examples), 23)
+        self.assertFalse((ROOT / "examples" / "proxies" / "anytls.json").exists())
+        for path in examples:
+            with self.subTest(example=path.name):
+                value = json.loads(path.read_text())
+                self.assertFalse(any(item["type"] == "anytls" for item in value["outbounds"]))
+                self.parse(value)
+                self.parse(value, "effective")
+
+    def test_host_caller_preserves_actionable_rejection_reason_without_partial_state(self):
+        def wrapped(transport):
+            return node("trojan", transport={"type": transport,
+                        "headers": {"X-Fixture-Auth": "TEST-CREDENTIAL-DO-NOT-PRINT"}})
+        cases = [
+            ("anytls", node("anytls"),
+             "AnyTLS is not accepted for pinned core 1.14.2 after native fault-recovery failure. "
+             "Use another validated proxy protocol"),
+            ("httpupgrade", wrapped("httpupgrade"),
+             "HTTPUpgrade is not accepted for pinned core 1.14.2 after paired reliability failures. "
+             "Use native TCP (omit transport), ws, http, grpc, or quic"),
+            ("xhttp", wrapped("xhttp"),
+             "unsupported V2Ray transport. Use http, ws, grpc, or quic. Omit transport for native TCP"),
+            ("domain-node", node("trojan", address="fixture.example.invalid"),
+             "proxy server requires a canonical fixed IPv4 address. Retain TLS names separately"),
+            ("native-socks-udp", node("socks", version="5"),
+             "native SOCKS UDP relay is negotiated. Set network to tcp or enable compatible UDP over TCP"),
+        ]
+        shell = '''source "$1/lib/network.sh"
+ROOT=$1
+PROXY_POLICY_JSON=stale SOURCE_SHA256=stale EFFECTIVE_SHA256=stale POLICY_PARSER_SHA256=stale
+if read_proxy_policy "$2"; then exit 91; fi
+[[ -z ${PROXY_POLICY_JSON+x} && -z ${SOURCE_SHA256+x} &&
+   -z ${EFFECTIVE_SHA256+x} && -z ${POLICY_PARSER_SHA256+x} ]]
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "private-config.json"
+            for name, outbound, reason in cases:
+                with self.subTest(case=name):
+                    source.write_text(json.dumps(config(outbound)))
+                    result = subprocess.run(["bash", "-c", shell, "caller-test", str(ROOT), str(source)],
+                                            text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, "caller must reject and clear every policy identity")
+                    self.assertEqual(result.stdout, "", "caller must not publish a partial policy")
+                    self.assertEqual(result.stderr.strip(), "gateway-policy: " + reason)
+                    self.assertNotIn("TEST-CREDENTIAL-DO-NOT-PRINT", result.stderr)
+                    self.assertNotIn(str(source), result.stderr)
+
+    def test_static_parser_reasons_fit_host_diagnostic_character_contract(self):
+        # Fixed reasons are the final literal argument of validators, or the
+        # sole literal argument of fail/check_headers. Decode JSON literals so
+        # escapes cannot conceal a character the host caller would suppress.
+        pattern = r'(?:;\s*|\b(?:fail|check_headers)\(\s*)("(?:\\.|[^"\\])*")\s*\)'
+        reasons = [json.loads(match.group(1)) for match in re.finditer(pattern, PROGRAM.read_text())]
+        self.assertGreaterEqual(len(reasons), 100)
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertRegex(reason, r'\A[A-Za-z0-9][A-Za-z0-9 .,:()_/\-]*\Z')
 
     def test_uot_and_multiplex_remove_native_shadowsocks_udp(self):
         for extra in ({"udp_over_tcp": True}, {"udp_over_tcp": {"enabled": True, "version": 1}},

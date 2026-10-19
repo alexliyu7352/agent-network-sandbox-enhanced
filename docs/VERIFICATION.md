@@ -2,7 +2,7 @@
 
 本頁記錄截至 **2026-10-19** 已實際執行的範圍。第一個完整純 cgroup v2 基線為 [CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891)，提交 [`58dcfad596856fc3696d138f84d1c0f37e6e0ebd`](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/commit/58dcfad596856fc3696d138f84d1c0f37e6e0ebd)，**12／12 jobs 通過**。這些 jobs 在原生 Ubuntu 與真正啟動的 Debian KVM 測試主機執行受管會話、Docker、TUN、legacy netfilter、systemd、代理 fixture 與封包觀測。
 
-後續逐協議 [CI 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481) 為 **50／59，整輪失敗**。九件失敗均保留；HTTPUpgrade 已因固定核心配對可靠性反例而明確拒絕，現行 inventory 為 44 組。封包判定、collector readiness、AnyTLS 的限制與有界恢復驗證，以及後續 44＋12 組原生關卡，集中記錄於[追加驗證](validation-20261019-followup.md)。
+後續逐協議 [CI 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481) 為 **50／59**，第二輪 [CI 39206996173](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39206996173) 為 **54／56**，兩輪均為 failure。HTTPUpgrade 的重複配對失敗、AnyTLS 在有限恢復步驟之後仍失敗的獨立節點恢復，以及 HTTP 的 capture 計數缺口均如實保留。HTTPUpgrade／AnyTLS 本版明確拒絕，現行 inventory 為 43 組；collector 起始／末端完整性與後續 43＋12 組原生關卡，集中記錄於[追加驗證](validation-20261019-followup.md)。
 
 配置、真實 loopback 傳輸和完整主機驗收分開記錄。較窄的檢查不能代替較廣的證據，也不能把一組協議選項的結果外推到所有組合。VPS 的整合過程、固定核心與早期結果見 [2026-10-18 起的驗證紀錄](validation-20261018.md)，逐項協議範圍見 [協議矩陣](protocol-matrix.md)。公開摘要不包含私人節點、憑證、實際出口 IP 或原始封包。
 
@@ -10,8 +10,8 @@
 
 | 層次 | 已執行的結果 | 適用範圍 |
 | --- | --- | --- |
-| 公開配置 | 24／24 通過共用解析器與固定核心配置檢查 | policy／effective 編譯與 sing-box 1.14.2 接受配置；不會連線到假節點。 |
-| 成對協議 loopback（歷史初輪） | 47／47 曾各至少一次通過；後續三個 HTTPUpgrade 已拒絕，現行 44 組 | 真正 client／server 的 TCP、UDP 或能力不足時的拒絕、DNS 共用快取／TTL、停止 server 後的阻斷，包含 Hysteria1／2 跳埠、Snell4、SSH 與 ShadowTLS 1／2／3。正式 TUN／介面／DNS 邊界被替換為本機 fixture，不包含主機 cgroup 或實體防火牆路徑。 |
+| 公開配置（歷史初輪） | 24／24 通過共用解析器與固定核心配置檢查；AnyTLS 撤下後現行保留 23 份 | policy／effective 編譯與 sing-box 1.14.2 接受配置；不會連線到假節點，也不代替後續故障恢復要求。 |
+| 成對協議 loopback（歷史初輪） | 47／47 曾各至少一次通過；後續三個 HTTPUpgrade 及 AnyTLS 已拒絕，現行 43 組 | 真正 client／server 的 TCP、UDP 或能力不足時的拒絕、DNS 共用快取／TTL、停止 server 後的阻斷，包含 Hysteria1／2 跳埠、Snell4、SSH 與 ShadowTLS 1／2／3。正式 TUN／介面／DNS 邊界被替換為本機 fixture，不包含主機 cgroup 或實體防火牆路徑。 |
 | VPS hybrid／v1 核心與故障 | Hysteria2 17／17；HTTP CONNECT 17／17；兩者出口 IP 比對通過 | Ubuntu 20.04.6／systemd 245 的實際 v1 選擇、受管流量、上游中斷、TUN down/up、主機及容器路由故障；兩者均確認 gateway kill 後的 namespace 拒絕。VPS 未執行 Docker daemon restart 或 Compose recreation。 |
 | VPS v1 生命週期與入口 | 生命週期 10／10，含 100 個短會話；能力 13／13；CLI 9／9 | 正常退出及子孫回收、100 次短會話與並行、實際 PTY、權限及原 CLI 邊界。這些是獨立 v1 套件結果，不重複計作每種代理都執行全部入口套件。 |
 | 原生 Ubuntu 純 v2 | Hysteria2／HTTP × 5 種情境，10／10 CI jobs 通過 | healthy、gateway-stop、gateway-kill、gateway-recreate、docker-restart；各有核心、生命週期、socket 建立身分、出口 IP 及封包證據。 |
@@ -88,10 +88,10 @@ Ubuntu 的 container stop／kill／recreate 與 Docker restart jobs 均實際觀
 
 ## 需要保留的限制
 
-- HTTPUpgrade 本版明確拒絕。AnyTLS 保留固定核心取消等待中 dial 後可能發生一次重用連線失敗的限制；單個有界恢復對照不是任意 idle pool 的恢復保證，見[追加驗證](validation-20261019-followup.md)。
+- HTTPUpgrade 與 AnyTLS 本版明確拒絕。AnyTLS 的單個有界恢復對照不能保證後續 node-outage 恢復；完整原生驗收失敗，見[追加驗證](validation-20261019-followup.md)。
 
 - 真正的 X11 視窗與 Wayland 桌面完整驗收尚未完成。環境變數能傳遞，不代表所有 GUI 程式都能使用。
-- 24 份配置及歷史 47 組 loopback 的通過範圍不能外推到未測的 cipher、TLS／Reality、flow、multiplex、selector／detour、ShadowTLS cover 站點或主機端點組合。逐協議實體出口矩陣完成前，不以成對互通替代完整主機驗收。
+- 歷史 24 份配置、47 組 loopback 及現行可接受案例的通過範圍不能外推到未測的 cipher、TLS／Reality、flow、multiplex、selector／detour、ShadowTLS cover 站點或主機端點組合。逐協議實體出口矩陣完成前，不以成對互通替代完整主機驗收。
 - Debian KVM 本輪只執行兩個 healthy jobs；Ubuntu 的容器與 Docker namespace 故障結果不能記成 Debian 已測。這三種主機環境也不涵蓋所有 Linux／systemd、rootless Docker 或防火牆 backend。
 - 啟動器被 SIGKILL 時，會話可能留存；歷史測試確認當時仍受限制，需用 `session close ID` 處理。
 - Docker 服務重新啟動後，若規則順序改變，檢查會拒絕啟動。container ID、network ID、namespace 或配置／解析器身分改變時，舊 binding 不能由 `session init` 自動更新；須關閉全部會話並依 [離線升級流程](offline-upgrade.md) 處理。不要刪除 `/run/dev-session-v8` 或清空共同 guards 強迫接納新身分。

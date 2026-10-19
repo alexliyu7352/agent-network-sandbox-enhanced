@@ -343,11 +343,11 @@ class ProtocolCaseChecks(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/host-acceptance.yml").read_text()
         block = workflow.split("  protocol-case:", 1)[1].split("    steps:", 1)[0]
         cases = re.findall(r"^          - ([a-z0-9-]+)$", block, re.MULTILINE)
-        self.assertEqual(len(cases), 44)
+        self.assertEqual(len(cases), 43)
         self.assertEqual(len(set(cases)), len(cases))
         self.assertEqual(set(cases), expected)
         for case in ("ssh", "shadowtls1", "shadowtls2", "shadowtls3", "hysteria-port-hopping", "unknown", "../ssh",
-                     "trojan-httpupgrade", "vmess-httpupgrade", "vless-httpupgrade"):
+                     "trojan-httpupgrade", "vmess-httpupgrade", "vless-httpupgrade", "anytls"):
             with self.subTest(case=case):
                 result = shell(HOST, 'CI_ROOT=$1; ci_validate_protocol_case "$2"', ROOT, case)
                 self.assertEqual(result.returncode == 0, case in expected, result.stderr)
@@ -752,11 +752,11 @@ class ProtocolCaseChecks(unittest.TestCase):
                 (root / 'core/results.json').write_text(json.dumps(rows))
                 self.assertNotEqual(shell(HOST, 'ci_validate_results "$1" protocol-case "$2"', root, case).returncode, 0)
 
-    def test_only_anytls_receives_the_explicit_reuse_check_flag(self):
+    def test_live_matrix_excludes_anytls_and_uses_no_recovery_exception(self):
         workflow = (ROOT / '.github/workflows/host-acceptance.yml').read_text()
         block = workflow.split('  protocol-case:', 1)[1].split('    steps:', 1)[0]
         cases = re.findall(r'^          - ([a-z0-9-]+)$', block, re.MULTILINE)
-        self.assertIn('anytls', cases)
+        self.assertNotIn('anytls', cases)
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
                 result = shell(
@@ -766,10 +766,7 @@ class ProtocolCaseChecks(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 calls = (Path(td) / 'calls').read_text().splitlines()
                 flagged = [line for line in calls if '--anytls-reuse-check' in line.split()]
-                self.assertEqual(len(flagged), 1 if case == 'anytls' else 0)
-                if flagged:
-                    self.assertTrue(flagged[0].startswith('core '))
-                    self.assertEqual(flagged[0].split().count('--anytls-reuse-check'), 1)
+                self.assertEqual(flagged, [])
 
     @staticmethod
     def add_hopping_window(root, case):
