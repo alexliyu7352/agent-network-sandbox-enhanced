@@ -34,6 +34,10 @@ ci_validate_protocol_case() {
         jq -e --arg name "$1" '(.cases + .experimental_cases) | index($name) != null' >/dev/null
 }
 
+ci_needs_hopping_continuity() {
+    [[ $1 == hysteria-port-hopping || $1 == hysteria2-port-hopping ]]
+}
+
 ci_archive_public_config() {
     # Only replace the committed, public example in this fresh private checkout.
     # Never inherit a configuration from the host or overwrite an existing backup.
@@ -97,7 +101,7 @@ PY
 
 ci_result_report() {
     python3 - "$1" "${2:-representative}" "${3:-}" <<'PY'
-import json, pathlib, re, sys
+import json, math, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 profile, case = sys.argv[2:]
 suites, proofs, loaded = {}, {}, {}
@@ -218,6 +222,34 @@ if profile == "protocol-case":
                        "fixture_render", "fixture", "exit_ip", "core", "fixture_verify"]
     if case == "ssh": required_stages.append("fixture_python")
     recorded = [row.get("name") for row in stages if isinstance(row, dict)]
+    if case in ("hysteria-port-hopping", "hysteria2-port-hopping"):
+        required_stages.append("fixture_continuity")
+        def hopping_continuity():
+            value = read_json("hopping-continuity.json")
+            names = ("single_tls_socket", "no_reconnect", "window_port_rotation", "workload_identity",
+                     "workload_cgroup", "session_reclaimed", "binding_retained", "namespace_retained",
+                     "recipe_unchanged")
+            if (type(value["format"]) is not int or value["format"] != 1 or value["protocol_case"] != case
+                    or value["passed"] is not True or not flags(value["checks"], names)): return False
+            evidence = value["evidence"]
+            duration, exchanges, connections = (evidence[name] for name in ("window_seconds", "exchanges", "connections"))
+            if not (type(duration) in (int, float) and math.isfinite(duration) and duration >= 20
+                    and type(exchanges) is int and exchanges >= 11
+                    and type(connections) is int and connections == 1): return False
+            ports = evidence["observed_hop_ports"]
+            if not (isinstance(ports, list) and len(ports) >= 2
+                    and all(type(port) is int and 1 <= port <= 65535 for port in ports)
+                    and len(set(ports)) == len(ports)): return False
+            info = read_json("fixture-info.json")
+            endpoints = info["endpoints"]
+            if not (type(info["format"]) is int and info["format"] == 1 and info["protocol_case"] == case
+                    and isinstance(endpoints, list) and endpoints): return False
+            if not all(entry["family"] == 4 and entry["protocol"] == "udp"
+                       and type(entry["port_start"]) is int and type(entry["port_end"]) is int
+                       and 1 <= entry["port_start"] <= entry["port_end"] <= 65535 for entry in endpoints): return False
+            return all(any(entry["port_start"] <= port <= entry["port_end"] for entry in endpoints) for port in ports)
+        proof("hopping_continuity", hopping_continuity)
+        proof("hopping_before_faults", lambda: recorded.index("exit_ip") < recorded.index("fixture_continuity") < recorded.index("core"))
     proofs["required_stages"] = stages_valid and all(recorded.count(name) == 1 for name in required_stages)
 
 passed = (profile in ("representative", "protocol-case") and stages_valid
@@ -508,11 +540,12 @@ PY
 }
 
 ci_protocol_fixture() {
+    local action=$1; shift
     local -a python_option=()
     if [[ -n ${CI_FIXTURE_PYTHON:-} ]]; then python_option=(--python "$CI_FIXTURE_PYTHON"); fi
-    python3 "$CI_ROOT/tests/host_upstream_fixture.py" "$1" \
+    python3 "$CI_ROOT/tests/host_upstream_fixture.py" "$action" \
         --protocol-case "$CI_PROTOCOL_CASE" --config "$CI_ROOT/network.json" \
-        --engine "$CI_BASE/worker" --output "$CI_FIXTURE" "${python_option[@]}"
+        --engine "$CI_BASE/worker" --output "$CI_FIXTURE" "${python_option[@]}" "$@"
 }
 
 ci_protocol_render() {
@@ -526,6 +559,14 @@ ci_protocol_fixture_verify() {
     # Server configs, host keys, certificates, and the descriptor stay private.
     install -m 600 "$CI_FIXTURE/runtime-state.json" "$CI_EVIDENCE/runtime-state.json"
     install -m 600 "$CI_FIXTURE/fixture-verification.json" "$CI_EVIDENCE/fixture-verification.json"
+}
+
+ci_protocol_continuity() {
+    ci_needs_hopping_continuity "$CI_PROTOCOL_CASE" || ci_fail 'Continuity proof requires an explicit hopping case'
+    ci_protocol_fixture prove-hopping --user "$CI_ACCOUNT"
+    # This contains only flags, counts, hashes and namespace identity. A failed
+    # prover cannot export a stale report or proceed into the fault suite.
+    install -m 600 "$CI_FIXTURE/hopping-continuity.json" "$CI_EVIDENCE/hopping-continuity.json"
 }
 
 ci_fixture() {
@@ -614,6 +655,11 @@ ci_suites() {
 }
 
 ci_protocol_suites() {
+    # main has already completed exit-IP. Observe real rotation on one healthy
+    # socket before a node outage or gateway kill could create another flow.
+    if ci_needs_hopping_continuity "$CI_PROTOCOL_CASE"; then
+        ci_stage fixture_continuity ci_protocol_continuity
+    fi
     # All transport cases get node/TUN/route faults plus old/new connection
     # refusal on gateway kill. No lifecycle stress or namespace adoption follows.
     ci_stage core timeout --signal=TERM --kill-after=30s 20m \

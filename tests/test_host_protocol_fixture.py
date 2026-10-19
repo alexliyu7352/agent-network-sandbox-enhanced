@@ -1,6 +1,7 @@
 """Pure/native-helper contracts; no namespace, route or firewall mutations."""
 import copy
 from contextlib import redirect_stdout
+import http.client
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import unittest
 from unittest import mock
 
 import host_upstream_fixture as fixture
+import host_acceptance as host
 import protocol_runtime as runtime
 
 
@@ -296,15 +298,79 @@ class RenderIdentityTests(unittest.TestCase):
         self.assertEqual(len(evidence['checks']),5);self.assertTrue(all(evidence['checks'].values()))
         self.assertNotIn('192.0.2.1',result.read_text()+public.getvalue())
 
+    def test_hopping_verify_refuses_cumulative_ports_without_healthy_socket_proof(self):
+        self.args.protocol_case='hysteria2-port-hopping';self.render()
+        plan,descriptor=fixture.load_recipe(self.args,self.output)
+        fixture.save_state(self.output/'upstream-fixture-state.json',
+            {'format':2,'source_sha256':descriptor['source_sha256'],'nodes':plan['nodes'],
+             'protocol_case':plan['case'],'units':{fixture.UNIT:True,fixture.ECHO_UNIT:True},'namespace_identity':'17:42'})
+        fixture.save_state(self.output/'runtime-state.json',
+            {'format':1,'protocol_case':plan['case'],'ready':True,
+             'observed_hop_ports':[4400,4410],'tls_cover_handshakes':0})
+        fixture.write_new(self.output/'fixture-server.log',b'server started\n')
+        with mock.patch.object(fixture,'run',return_value=subprocess.CompletedProcess([],0,'active\n','')),\
+             mock.patch.object(fixture,'owned_namespace',return_value='17:42'):
+            with self.assertRaises((RuntimeError,FileNotFoundError)):
+                fixture.verify_recipe(self.args,self.output)
+        self.assertFalse((self.output/'fixture-verification.json').exists())
+
+    def test_hopping_proof_rejects_window_and_bound_identity_tampering(self):
+        self.args.protocol_case='hysteria-port-hopping';self.render()
+        plan,descriptor=fixture.load_recipe(self.args,self.output)
+        proof={'format':1,'protocol_case':plan['case'],'passed':True,
+               'checks':{name:True for name in fixture.CONTINUITY_CHECKS},
+               'evidence':{'window_seconds':20.1,'exchanges':12,'connections':1,
+                           'observed_hop_ports':[4400,4410],'port_packet_deltas':{'4400':2,'4410':3}},
+               'identity':{'source_sha256':descriptor['source_sha256'],
+                           'recipe_sha256':fixture.file_digest(self.output/'protocol-recipe.json'),
+                           'binding_sha256':'b'*64,'namespace_identity':'17:42'}}
+        path=self.output/'hopping-continuity.json';fixture.write_new(path,fixture.json_bytes(proof))
+        with mock.patch.object(fixture,'bound_policy_digest',return_value='b'*64):
+            self.assertEqual(fixture.validate_hopping_proof(plan,descriptor,self.output,'17:42'),proof['evidence'])
+            for section,key,value in [('evidence','window_seconds',19.9),('evidence','connections',2),
+                    ('evidence','port_packet_deltas',{'4400':2}),('checks','no_reconnect',False),
+                    ('identity','source_sha256','d'*64),('identity','recipe_sha256','d'*64),
+                    ('identity','binding_sha256','d'*64),('identity','namespace_identity','17:43')]:
+                changed=copy.deepcopy(proof);changed[section][key]=value;path.write_bytes(fixture.json_bytes(changed))
+                with self.subTest(section=section,key=key),self.assertRaises(RuntimeError):
+                    fixture.validate_hopping_proof(plan,descriptor,self.output,'17:42')
+
+    def test_failed_continuity_probe_closes_only_its_managed_session(self):
+        self.args.protocol_case='hysteria2-port-hopping';self.args.user='test-agent';self.render()
+        plan,descriptor=fixture.load_recipe(self.args,self.output)
+        fixture.save_state(self.output/'upstream-fixture-state.json',
+            {'format':2,'source_sha256':descriptor['source_sha256'],'protocol_case':plan['case'],
+             'units':{fixture.UNIT:True,fixture.ECHO_UNIT:True},'namespace_identity':'17:42'})
+        fake_runtime=self.root/'runtime';(fake_runtime/'requests').mkdir(mode=0o700,parents=True)
+        binding=SimpleNamespace(data={'source_sha256':descriptor['source_sha256']},policy=plan['policy'])
+        session=SimpleNamespace(close=mock.Mock(),reader=SimpleNamespace(join=mock.Mock()),log=SimpleNamespace(close=mock.Mock()))
+        def start(holder,name):holder.sessions.append(session);return session
+        with mock.patch.object(host.Binding,'load',return_value=binding),\
+             mock.patch.object(host,'RUNTIME',fake_runtime),mock.patch.object(host,'Session',side_effect=start),\
+             mock.patch.object(host.Suite,'credentials'),mock.patch.object(fixture,'owned_namespace',return_value='17:42'),\
+             mock.patch.object(fixture,'bound_policy_digest',return_value='b'*64),\
+             mock.patch.object(fixture.pwd,'getpwnam',return_value=SimpleNamespace(pw_uid=1001,pw_gid=1001)),\
+             mock.patch.object(fixture,'run',return_value=subprocess.CompletedProcess([],0,'','')) as command,\
+             mock.patch.object(fixture,'hopping_window',side_effect=RuntimeError('injected reconnect refusal')):
+            with self.assertRaisesRegex(RuntimeError,'injected reconnect refusal'):
+                fixture.prove_hopping(self.args,self.output)
+        session.close.assert_called_once_with(strict=False)
+        session.log.close.assert_called_once()
+        self.assertFalse((self.output/'hopping-continuity.json').exists())
+        self.assertEqual(command.call_args_list,[mock.call('systemctl','list-units','--all','--plain','--no-legend','dev-session-*.service'),
+                                                mock.call(host.DEV,'check')])
+
 
 class NativeCLITests(unittest.TestCase):
     def test_new_commands_and_legacy_setup_dispatch(self):
         for action,protocol,target in [('render',True,'render'),('setup',True,'setup'),
                                        ('verify',True,'verify_recipe'),('serve',True,'serve_recipe'),
+                                       ('prove-hopping',True,'prove_hopping'),
                                        ('setup',False,'setup')]:
             argv=['fixture',action,'--engine','/root/worker','--config','/root/network.json',
                   '--output','/root/fixture']
             if protocol:argv+=['--protocol-case','ssh','--python','/root/venv/bin/python']
+            if action=='prove-hopping':argv+=['--user','test-agent']
             with self.subTest(action=action,protocol=protocol),\
                  mock.patch.object(fixture.sys,'argv',argv),mock.patch.object(fixture.os,'geteuid',return_value=0),\
                  mock.patch.object(fixture.os,'umask'),mock.patch.object(fixture,'output_directory',return_value=Path('/root/fixture')),\
@@ -340,6 +406,7 @@ class NativeHelperTests(unittest.TestCase):
                     relay.stop.set();return [],[],[]
                 with mock.patch.object(fixture.select,'select',side_effect=readable):relay._serve()
                 self.assertEqual(relay.observed_ports,[4400,4410])
+                self.assertEqual(relay.received_by_port,{'4400':1,'4410':1})
                 self.assertEqual(sockets[2].sent,[b'frontend-packet',b'frontend-packet'])
                 self.assertTrue(all(s.sent==[(b'backend-reply',('198.19.254.10',12345))] for s in sockets[:2]))
         self.assertTrue(all(s.closed for s in sockets))
@@ -351,6 +418,84 @@ class NativeHelperTests(unittest.TestCase):
             result=fixture.native_cover({'port':9443,'certificate':'/test/cert','key':'/test/key'})
         self.assertIs(result,cover)
         self.assertEqual(result.context.num_tickets,0)
+
+
+class HoppingContinuityTests(unittest.TestCase):
+    def plan(self):
+        return fixture.native_recipe('hysteria2-port-hopping',Path('/root/fake'),'TEST CERT')
+
+    def observation(self,sequence,counts):
+        return {'format':1,'protocol_case':'hysteria2-port-hopping','ready':True,
+                'sequence':sequence,'received_by_port':{str(port):counts.get(port,0) for port in fixture.HOP_PORTS}}
+
+    def test_rotation_requires_new_packets_at_two_ports_inside_window(self):
+        before=self.observation(10,{4400:8,4410:5})
+        # Both ports were previously seen, but only one receives window traffic.
+        after=self.observation(20,{4400:9,4410:5})
+        with self.assertRaises(RuntimeError):fixture.hopping_delta(self.plan(),before,after)
+        after['received_by_port']['4410']=6
+        self.assertEqual(fixture.hopping_delta(self.plan(),before,after),{'4400':1,'4410':1})
+        for changes in ({'sequence':10},{'sequence':1},{'received_by_port':{'4400':0}}):
+            bad=copy.deepcopy(after);bad.update(changes)
+            with self.subTest(changes=changes),self.assertRaises(RuntimeError):
+                fixture.hopping_delta(self.plan(),before,bad)
+
+    def execute_client(self,behavior='normal'):
+        class Stream:
+            def fileno(self):return 41
+            def getpeername(self):return ('1.1.1.1',443)
+        class Response:
+            status=200
+            will_close=behavior=='close'
+            def read(self,size):return b'ip=203.0.113.7\n'
+            def getheader(self,name,default=''):return 'close' if behavior=='close' else default
+        class Connection:
+            def __init__(self,*args,**kwargs):self.sock=None;self.requests=0;self.auto_open=1
+            def connect(self):self.sock=Stream()
+            def request(self,*args,**kwargs):
+                self.requests+=1
+                if behavior=='reconnect' and self.requests>1:self.connect()
+            def getresponse(self):return Response()
+            def close(self):self.sock=None
+        scope={'state':{}}
+        with mock.patch.object(http.client,'HTTPSConnection',Connection),\
+             mock.patch.object(fixture.os,'fstat',return_value=SimpleNamespace(st_ino=1234)):
+            exec(fixture.CONTINUITY_CONNECT,scope)
+            exec(fixture.CONTINUITY_EXCHANGE,scope)
+            if behavior=='normal':
+                original=scope['state']['hop']['socket']
+                exec(fixture.CONTINUITY_EXCHANGE,scope)
+                self.assertIs(scope['state']['hop']['connection'].sock,original)
+                self.assertEqual(scope['result']['connect_calls'],1)
+                self.assertEqual(scope['result']['exchanges'],2)
+                self.assertEqual(scope['state']['hop']['connection'].auto_open,0)
+                self.assertNotIn('203.0.113.7',json.dumps(scope['result']))
+            else:exec(fixture.CONTINUITY_EXCHANGE,scope)
+
+    def test_continuity_client_retains_same_socket_and_disables_auto_reopen(self):
+        self.execute_client()
+
+    def test_continuity_client_refuses_reconnect_or_connection_close(self):
+        for behavior in ('reconnect','close'):
+            with self.subTest(behavior=behavior),self.assertRaises((RuntimeError,AssertionError)):
+                self.execute_client(behavior)
+
+    def test_counter_baseline_follows_first_exchange_and_final_exchange_follows_window(self):
+        events=[];clock=[100.0];samples=[self.observation(10,{4400:8}),self.observation(50,{4400:9,4410:1})]
+        class Session:
+            exchanges=0
+            def value(self,code,**kwargs):
+                if code==fixture.CONTINUITY_CONNECT:events.append('connect');return True
+                self.exchanges+=1;events.append('exchange')
+                return {'same_socket':True,'connect_calls':1,'exchanges':self.exchanges}
+        def observation():events.append('observe');return samples.pop(0)
+        def sleep(seconds):clock[0]+=seconds
+        result=fixture.hopping_window(self.plan(),Session(),observation,lambda:clock[0],sleep)
+        self.assertEqual(events[:3],['connect','exchange','observe'])
+        self.assertEqual(events[-2:],['observe','exchange'])
+        self.assertGreaterEqual(result['window_seconds'],20)
+        self.assertGreaterEqual(result['exchanges'],11)
+        self.assertEqual(result['observed_hop_ports'],[4400,4410])
 
 
 if __name__=='__main__':unittest.main()

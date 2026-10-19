@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | 公開配置 | 24／24 通過共用解析器與固定核心配置檢查 | policy／effective 編譯與 sing-box 1.14.2 接受配置；不會連線到假節點。 |
 | 成對協議 loopback | 47／47 runtime 通過 | 真正 client／server 的 TCP、UDP 或能力不足時的拒絕、DNS 共用快取／TTL、停止 server 後的阻斷，包含 Hysteria1／2 跳埠、Snell4、SSH 與 ShadowTLS 1／2／3。正式 TUN／介面／DNS 邊界被替換為本機 fixture，不包含主機 cgroup 或實體防火牆路徑。 |
-| VPS hybrid／v1 核心與故障 | Hysteria2 17／17；HTTP CONNECT 17／17；兩者出口 IP 比對通過 | Ubuntu 20.04.6／systemd 245 的實際 v1 選擇、受管流量、上游中斷、TUN down/up、主機及容器路由故障；Hysteria2 另確認 gateway kill 後的 namespace 拒絕。VPS 未執行 Docker daemon restart 或 Compose recreation。 |
+| VPS hybrid／v1 核心與故障 | Hysteria2 17／17；HTTP CONNECT 17／17；兩者出口 IP 比對通過 | Ubuntu 20.04.6／systemd 245 的實際 v1 選擇、受管流量、上游中斷、TUN down/up、主機及容器路由故障；兩者均確認 gateway kill 後的 namespace 拒絕。VPS 未執行 Docker daemon restart 或 Compose recreation。 |
 | VPS v1 生命週期與入口 | 生命週期 10／10，含 100 個短會話；能力 13／13；CLI 9／9 | 正常退出及子孫回收、100 次短會話與並行、實際 PTY、權限及原 CLI 邊界。這些是獨立 v1 套件結果，不重複計作每種代理都執行全部入口套件。 |
 | 原生 Ubuntu 純 v2 | Hysteria2／HTTP × 5 種情境，10／10 CI jobs 通過 | healthy、gateway-stop、gateway-kill、gateway-recreate、docker-restart；各有核心、生命週期、socket 建立身分、出口 IP 及封包證據。 |
 | Debian KVM 純 v2 | Hysteria2／HTTP healthy，2／2 CI jobs 通過 | 各核心 16／16、生命週期 10／10、100 個短會話、socket 建立身分及出口 IP 通過；含核心套件的路由、TUN、上游中斷，不含容器／Docker namespace 故障。 |

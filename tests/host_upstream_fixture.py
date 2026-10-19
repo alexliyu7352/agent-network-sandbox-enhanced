@@ -13,8 +13,10 @@ from contextlib import ExitStack
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
+import pwd
 import re
 import select
 import signal
@@ -24,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 
 INSTALL_ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +51,45 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
         data,peer=sock.recvfrom(2048)
         sock.sendto(data,peer)
 """
+CONTINUITY_CHECKS=('single_tls_socket','no_reconnect','window_port_rotation','workload_identity',
+                   'workload_cgroup','session_reclaimed','binding_retained','namespace_retained','recipe_unchanged')
+CONTINUITY_CONNECT=r'''
+import http.client,os,ssl
+class SingleConnection(http.client.HTTPSConnection):
+    def connect(self):
+        self.fixture_connect_calls=getattr(self,'fixture_connect_calls',0)+1
+        if self.fixture_connect_calls!=1:raise RuntimeError('hopping-reconnect-denied')
+        super().connect()
+connection=SingleConnection('1.1.1.1',port=443,timeout=8,context=ssl.create_default_context())
+connection.auto_open=0
+connection.connect()
+original=connection.sock
+state['hop']={'connection':connection,'socket':original,'fd':original.fileno(),
+              'inode':os.fstat(original.fileno()).st_ino,'peer':original.getpeername(),'exchanges':0}
+result=True
+'''
+CONTINUITY_EXCHANGE=r'''
+import ipaddress,os
+hop=state['hop'];connection=hop['connection'];original=hop['socket']
+def unchanged():
+    if not (connection.sock is original and original.fileno()==hop['fd'] and
+            os.fstat(original.fileno()).st_ino==hop['inode'] and
+            original.getpeername()==hop['peer'] and connection.fixture_connect_calls==1):
+        raise RuntimeError('hopping-socket-changed')
+unchanged()
+connection.request('GET','/cdn-cgi/trace',headers={'Connection':'keep-alive'})
+unchanged()
+response=connection.getresponse()
+if response.status!=200 or response.will_close or 'close' in response.getheader('Connection','').lower().split(','):
+    raise RuntimeError('hopping-http-closed-or-failed')
+body=response.read(65537)
+if len(body)>65536:raise RuntimeError('hopping-response-too-large')
+rows=[row[3:] for row in body.decode('ascii').splitlines() if row.startswith('ip=')]
+if len(rows)!=1 or str(ipaddress.IPv4Address(rows[0]))!=rows[0]:raise RuntimeError('hopping-trace-invalid')
+unchanged()
+hop['exchanges']+=1
+result={'same_socket':True,'connect_calls':connection.fixture_connect_calls,'exchanges':hop['exchanges']}
+'''
 
 
 def run(*args, check=True, timeout=40):
@@ -239,7 +281,7 @@ def file_digest(path):
 
 
 def recipe_components():
-    names=('host_upstream_fixture.py','protocol_runtime.py','test_dns_runtime.py','protocol_ssh_fixture.py')
+    names=('host_upstream_fixture.py','host_acceptance.py','protocol_runtime.py','test_dns_runtime.py','protocol_ssh_fixture.py')
     return {name:file_digest(Path(__file__).resolve().with_name(name)) for name in names}
 
 
@@ -339,7 +381,7 @@ class NativeMultiportRelay:
     """Record received frontend ports, preserving one UDP backend peer."""
     def __init__(self,listen,ports,backend,backend_port):
         self.frontends=[];self.backend=None;self.thread=None
-        self.stop=threading.Event();self.lock=threading.Lock();self.seen=set()
+        self.stop=threading.Event();self.lock=threading.Lock();self.seen=set();self.counts={str(port):0 for port in ports}
         try:
             for port in ports:
                 sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);self.frontends.append(sock)
@@ -355,6 +397,10 @@ class NativeMultiportRelay:
     def observed_ports(self):
         with self.lock:return sorted(self.seen)
 
+    @property
+    def received_by_port(self):
+        with self.lock:return dict(self.counts)
+
     def _serve(self):
         current=None
         while not self.stop.is_set():
@@ -366,7 +412,8 @@ class NativeMultiportRelay:
                         if current is not None:current[0].sendto(payload,current[1])
                     else:
                         payload,peer=sock.recvfrom(65535)
-                        with self.lock:self.seen.add(sock.getsockname()[1])
+                        with self.lock:
+                            port=sock.getsockname()[1];self.seen.add(port);self.counts[str(port)]+=1
                         current=(sock,peer);self.backend.send(payload)
                 except OSError:
                     # A stopped backend introduces no alternative destination.
@@ -494,7 +541,7 @@ def serve_recipe(args,output):
     for signum in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP):signal.signal(signum,lambda *_:stop.set())
     metrics={'format':1,'protocol_case':plan['case'],'ready':False,
              'observed_hop_ports':[],'tls_cover_handshakes':0}
-    state_path=output/'runtime-state.json';process=None
+    state_path=output/'runtime-state.json';process=None;relay=None;sequence=0
     try:
         with ExitStack() as stack:
             relay=None;cover=None
@@ -514,9 +561,139 @@ def serve_recipe(args,output):
                 metrics['observed_hop_ports']=relay.observed_ports if relay else []
                 metrics['tls_cover_handshakes']=cover.handshakes if cover else 0
                 save_state(state_path,metrics)
+                if relay:
+                    sequence+=1
+                    save_state(output/'hopping-observations.json',
+                        {'format':1,'protocol_case':plan['case'],'ready':True,'sequence':sequence,
+                         'received_by_port':relay.received_by_port})
                 stop.wait(0.2)
     finally:
         metrics['ready']=False;save_state(state_path,metrics)
+        if relay:
+            save_state(output/'hopping-observations.json',
+                {'format':1,'protocol_case':plan['case'],'ready':False,'sequence':sequence,
+                 'received_by_port':relay.received_by_port})
+
+
+def validate_observation(plan,value):
+    ensure(isinstance(value,dict) and set(value)=={'format','protocol_case','ready','sequence','received_by_port'} and
+           type(value['format']) is int and value['format']==1 and value['protocol_case']==plan['case'] and
+           value['ready'] is True and type(value['sequence']) is int and value['sequence']>0,'hopping-observation-invalid')
+    counts=value['received_by_port'];ports={str(port) for port in plan['helpers']['hopping']['ports']}
+    ensure(isinstance(counts,dict) and set(counts)==ports and
+           all(type(count) is int and count>=0 for count in counts.values()),'hopping-counters-invalid')
+    return value
+
+
+def fresh_hopping_observation(plan,output):
+    path=output/'hopping-observations.json'
+    initial=validate_observation(plan,read_private_json(path));deadline=time.monotonic()+3
+    while time.monotonic()<deadline:
+        value=validate_observation(plan,read_private_json(path))
+        ensure(value['sequence']>=initial['sequence'],'hopping-observations-reset')
+        if value['sequence']>initial['sequence']:return value
+        time.sleep(0.03)
+    raise RuntimeError('fixture: hopping-observation-stale')
+
+
+def hopping_delta(plan,before,after):
+    validate_observation(plan,before);validate_observation(plan,after)
+    ensure(after['sequence']>before['sequence'],'hopping-observations-reset')
+    deltas={port:after['received_by_port'][port]-count for port,count in before['received_by_port'].items()}
+    ensure(all(value>=0 for value in deltas.values()),'hopping-counters-reset')
+    changed={port:value for port,value in deltas.items() if value>0}
+    ensure(len(changed)>=2,'continuous-port-hopping-not-observed')
+    return changed
+
+
+def hopping_window(plan,session,observe,clock=time.monotonic,sleep=time.sleep):
+    ensure(session.value(CONTINUITY_CONNECT) is True,'hopping-connect-failed')
+    def exchange():
+        result=session.value(CONTINUITY_EXCHANGE)
+        ensure(isinstance(result,dict) and result.get('same_socket') is True and
+               type(result.get('connect_calls')) is int and result['connect_calls']==1 and
+               type(result.get('exchanges')) is int,'hopping-exchange-invalid')
+        return result['exchanges']
+    ensure(exchange()==1,'hopping-first-exchange-invalid')
+    # A fresh sample excludes the handshake and traffic preceding this stream.
+    before=observe();started=clock()
+    for index in range(10):
+        sleep(2)
+        ensure(exchange()==index+2,'hopping-exchange-sequence-invalid')
+    after=observe();seconds=clock()-started
+    # The same application socket must also work after the ending sample.
+    exchanges=exchange();ensure(exchanges==12 and 20<=seconds<=180,'hopping-window-invalid')
+    deltas=hopping_delta(plan,before,after)
+    return {'window_seconds':seconds,'exchanges':exchanges,'connections':1,
+            'observed_hop_ports':sorted(map(int,deltas)),'port_packet_deltas':deltas}
+
+
+def bound_policy_digest():
+    from host_acceptance import RUNTIME
+    return file_digest(private_file(RUNTIME/'binding'))
+
+
+def validate_hopping_proof(plan,descriptor,output,identity):
+    value=read_private_json(output/'hopping-continuity.json')
+    ensure(isinstance(value,dict) and set(value)=={'format','protocol_case','passed','checks','evidence','identity'} and
+           type(value['format']) is int and value['format']==1 and value['protocol_case']==plan['case'] and
+           value['passed'] is True,'hopping-proof-invalid')
+    checks=value['checks'];evidence=value['evidence']
+    ensure(isinstance(checks,dict) and set(checks)==set(CONTINUITY_CHECKS) and
+           all(flag is True for flag in checks.values()),'hopping-proof-checks-invalid')
+    ensure(isinstance(evidence,dict) and set(evidence)=={'window_seconds','exchanges','connections','observed_hop_ports','port_packet_deltas'},
+           'hopping-proof-evidence-invalid')
+    seconds=evidence['window_seconds'];deltas=evidence['port_packet_deltas'];ports=evidence['observed_hop_ports']
+    ensure(type(seconds) in (int,float) and math.isfinite(seconds) and 20<=seconds<=180 and
+           type(evidence['exchanges']) is int and evidence['exchanges']==12 and
+           type(evidence['connections']) is int and evidence['connections']==1,'hopping-proof-continuity-invalid')
+    allowed={str(port) for port in plan['helpers']['hopping']['ports']}
+    ensure(isinstance(deltas,dict) and len(deltas)>=2 and set(deltas)<=allowed and
+           all(type(count) is int and count>0 for count in deltas.values()) and
+           isinstance(ports,list) and all(type(port) is int for port in ports) and
+           ports==sorted(map(int,deltas)),'hopping-proof-rotation-invalid')
+    ensure(value['identity']=={'source_sha256':descriptor['source_sha256'],
+                'recipe_sha256':file_digest(output/'protocol-recipe.json'),
+                'binding_sha256':bound_policy_digest(),'namespace_identity':identity},'hopping-proof-identity-changed')
+    return evidence
+
+
+def prove_hopping(args,output):
+    from host_acceptance import Binding,DEV,RUNTIME,Session,Suite
+    plan,descriptor=load_recipe(args,output)
+    ensure('hopping' in plan['helpers'],'hopping-case-required')
+    result_path=output/'hopping-continuity.json'
+    ensure(not os.path.lexists(result_path),'new-hopping-proof-required')
+    binding=Binding.load();identity=owned_namespace()
+    account=pwd.getpwnam(args.user);ensure(account.pw_uid!=0,'hopping-workload-account-invalid')
+    state=read_private_json(output/'upstream-fixture-state.json')
+    ensure(state.get('namespace_identity')==identity and state.get('protocol_case')==plan['case'] and
+           state.get('source_sha256')==descriptor['source_sha256']==binding.data['source_sha256'] and
+           binding.policy==plan['policy'] and state.get('units')=={UNIT:True,ECHO_UNIT:True},'hopping-fixture-binding-invalid')
+    ensure(not any((RUNTIME/'requests').iterdir()),'hopping-requires-idle-session-host')
+    ensure(not run('systemctl','list-units','--all','--plain','--no-legend','dev-session-*.service').stdout.strip(),
+           'hopping-requires-idle-session-host')
+    run(DEV,'check');binding_hash=bound_policy_digest()
+    holder=SimpleNamespace(binding=binding,user=args.user,output=output,sessions=[],uid=account.pw_uid,gid=account.pw_gid)
+    holder.reclaimed=lambda sid:Suite.reclaimed(holder,sid)
+    try:
+        session=Session(holder,'hopping-continuity')
+        Suite.credentials(holder,session)
+        evidence=hopping_window(plan,session,lambda:fresh_hopping_observation(plan,output))
+    finally:
+        for session in holder.sessions:
+            session.close(strict=False)
+            session.reader.join(timeout=2);session.log.close()
+    run(DEV,'check');binding.verify_parent()
+    ensure(bound_policy_digest()==binding_hash and owned_namespace()==identity,'hopping-runtime-identity-changed')
+    load_recipe(args,output)
+    result={'format':1,'protocol_case':plan['case'],'passed':True,
+            'checks':{name:True for name in CONTINUITY_CHECKS},'evidence':evidence,
+            'identity':{'source_sha256':descriptor['source_sha256'],
+                'recipe_sha256':file_digest(output/'protocol-recipe.json'),
+                'binding_sha256':binding_hash,'namespace_identity':identity}}
+    write_new(result_path,json_bytes(result))
+    print('UPSTREAM_FIXTURE_HOPPING_PROVEN',flush=True)
 
 
 def verify_recipe(args,output):
@@ -533,6 +710,8 @@ def verify_recipe(args,output):
     metrics=read_private_json(output/'runtime-state.json')
     log='' if plan['case']=='ssh' else private_file(output/'fixture-server.log').read_text(errors='replace')
     evidence=runtime_evidence(plan,metrics,log)
+    if 'hopping' in plan['helpers']:
+        evidence['healthy_continuity']=validate_hopping_proof(plan,descriptor,output,identity)
     # Repeat the identity read after consuming evidence, before publishing PASS.
     load_recipe(args,output);ensure(owned_namespace()==identity,'fixture-namespace-changed')
     result={'format':1,'protocol_case':plan['case'],'passed':True,
@@ -650,7 +829,8 @@ def setup(args,output):
         # All artifact and component checks precede privileged command calls.
         plan,descriptor=load_recipe(args,output);policy=plan['policy']
         ensure(not any(os.path.lexists(output/name) for name in
-                       ('fixture-info.json','runtime-state.json','fixture-server.log','fixture-verification.json')),
+                       ('fixture-info.json','runtime-state.json','fixture-server.log','fixture-verification.json',
+                        'hopping-observations.json','hopping-continuity.json')),
                'native-runtime-artifacts-exist')
     else:
         ensure(not getattr(args,'python',None),'python-requires-protocol-case')
@@ -787,7 +967,7 @@ class FixtureTests(unittest.TestCase):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     actions=parser.add_subparsers(dest='action',required=True)
-    for name in ('render','setup','verify','serve'):
+    for name in ('render','setup','verify','serve','prove-hopping'):
         action=actions.add_parser(name)
         action.add_argument('--config',required=True);action.add_argument('--engine',required=True)
         action.add_argument('--output',required=True)
@@ -796,6 +976,7 @@ def main():
         if name=='setup':
             action.add_argument('--udp-echo-address',default='192.0.2.254')
             action.add_argument('--udp-echo-port',type=int,default=40123)
+        if name=='prove-hopping':action.add_argument('--user',required=True)
     stop=actions.add_parser('cleanup');stop.add_argument('--output',required=True)
     args=parser.parse_args()
     if os.geteuid()!=0:parser.error('root required on a disposable test host')
@@ -803,7 +984,7 @@ def main():
         parser.error('--python requires --protocol-case')
     os.umask(0o077);output=output_directory(args.output)
     if args.action=='cleanup':cleanup(output)
-    else:{'render':render,'setup':setup,'verify':verify_recipe,'serve':serve_recipe}[args.action](args,output)
+    else:{'render':render,'setup':setup,'verify':verify_recipe,'serve':serve_recipe,'prove-hopping':prove_hopping}[args.action](args,output)
 
 
 if __name__=='__main__':

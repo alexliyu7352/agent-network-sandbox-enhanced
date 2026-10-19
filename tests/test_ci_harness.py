@@ -563,6 +563,126 @@ class ProtocolCaseChecks(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads((root / "manifest.json").read_text())["status"], "failed")
 
+    @staticmethod
+    def add_hopping_window(root, case):
+        """Synthetic healthy-window proof, distinct from post-fault port totals."""
+        value = {
+            "format": 1, "protocol_case": case, "passed": True,
+            "checks": {name: True for name in (
+                "single_tls_socket", "no_reconnect", "window_port_rotation", "workload_identity",
+                "workload_cgroup", "session_reclaimed", "binding_retained", "namespace_retained",
+                "recipe_unchanged")},
+            "evidence": {"window_seconds": 20.1, "exchanges": 11,
+                         "observed_hop_ports": [4400, 4410], "connections": 1},
+            "identity": {"source_sha256": "a" * 64, "recipe_sha256": "b" * 64,
+                         "binding_sha256": "c" * 64, "namespace_identity": "17:42"},
+        }
+        (root / "hopping-continuity.json").write_text(json.dumps(value))
+        (root / "fixture-info.json").write_text(json.dumps({
+            "format": 1, "protocol_case": case, "endpoints": [
+                {"family": 4, "address": "192.0.2.1", "protocol": "udp", "port_start": start, "port_end": end}
+                for start, end in ((4400, 4403), (4410, 4413))],
+        }))
+        stages = root / "stages.jsonl"
+        rows = [json.loads(line) for line in stages.read_text().splitlines()]
+        position = next(index for index, row in enumerate(rows) if row["name"] == "core")
+        rows.insert(position, {"name": "fixture_continuity", "exit_code": 0})
+        stages.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        return value
+
+    def test_hopping_requires_healthy_single_socket_proof_beyond_cumulative_ports(self):
+        for case in ("hysteria-port-hopping", "hysteria2-port-hopping"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                self.completed_evidence(root, case)
+                # A fully successful core and post-fault helper report cannot
+                # prove that port rotation occurred within one healthy flow.
+                result = shell(HOST, 'ci_validate_results "$1" protocol-case "$2"', root, case)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.add_hopping_window(root, case)
+                result = shell(HOST, 'ci_result_report "$1" protocol-case "$2"', root, case)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIs(json.loads(result.stdout)["proofs"]["hopping_continuity"], True)
+
+    def test_hopping_window_missing_weak_or_post_fault_evidence_is_rejected(self):
+        mutations = ("missing_proof", "wrong_case", "false_passed", "missing_check", "reconnected",
+                     "short_window", "few_exchanges", "multiple_connections", "one_port",
+                     "duplicate_ports", "undeclared_port", "missing_ranges", "failed_stage",
+                     "missing_stage", "duplicate_stage", "after_core")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                case = "hysteria2-port-hopping"
+                self.completed_evidence(root, case)
+                value = self.add_hopping_window(root, case)
+                if mutation == "wrong_case": value["protocol_case"] = "hysteria-port-hopping"
+                elif mutation == "false_passed": value["passed"] = False
+                elif mutation == "missing_check": value["checks"].pop("single_tls_socket")
+                elif mutation == "reconnected": value["checks"]["no_reconnect"] = False
+                elif mutation == "short_window": value["evidence"]["window_seconds"] = 19.9
+                elif mutation == "few_exchanges": value["evidence"]["exchanges"] = 10
+                elif mutation == "multiple_connections": value["evidence"]["connections"] = 2
+                elif mutation == "one_port": value["evidence"]["observed_hop_ports"] = [4400]
+                elif mutation == "duplicate_ports": value["evidence"]["observed_hop_ports"] = [4400, 4400]
+                elif mutation == "undeclared_port": value["evidence"]["observed_hop_ports"] = [4400, 4443]
+                path = root / "hopping-continuity.json"
+                path.write_text(json.dumps(value))
+                if mutation == "missing_proof": path.unlink()
+                if mutation == "missing_ranges": (root / "fixture-info.json").unlink()
+                if mutation in ("missing_stage", "failed_stage", "duplicate_stage", "after_core"):
+                    stages = root / "stages.jsonl"
+                    rows = [json.loads(line) for line in stages.read_text().splitlines()]
+                    continuity = next(row for row in rows if row["name"] == "fixture_continuity")
+                    if mutation == "missing_stage": rows.remove(continuity)
+                    elif mutation == "failed_stage": continuity["exit_code"] = 23
+                    elif mutation == "duplicate_stage": rows.append(continuity.copy())
+                    else:
+                        rows.remove(continuity)
+                        rows.append(continuity)
+                    stages.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                result = shell(HOST, 'ci_validate_results "$1" protocol-case "$2"', root, case)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                result = shell(
+                    HOST, 'ci_write_manifest "$1" 0 "$2" gateway-kill 0 "$3" protocol-case "$2"',
+                    root, case, "a" * 40,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads((root / "manifest.json").read_text())["status"], "failed")
+
+    def test_continuity_precedes_core_faults_and_failure_stops_the_suite(self):
+        for case in ("hysteria-port-hopping", "hysteria2-port-hopping"):
+            for continuity_exit in (0, 39):
+                with self.subTest(case=case, continuity_exit=continuity_exit), tempfile.TemporaryDirectory() as td:
+                    result = shell(
+                        HOST, 'CI_ROOT=$1; CI_EVIDENCE=$1; CI_ACCOUNT=ci-test; CI_PROTOCOL_CASE=$2; '
+                              'CI_TEST_EXIT=$3; ci_stage() { printf "%s\\n" "$*" >>"$CI_EVIDENCE/calls"; '
+                              'if [[ $1 == fixture_continuity ]]; then return "$CI_TEST_EXIT"; fi; }; '
+                              'cmp() { :; }; ci_protocol_suites', td, case, continuity_exit,
+                    )
+                    self.assertEqual(result.returncode, continuity_exit, result.stderr)
+                    names = [line.split()[0] for line in (Path(td) / "calls").read_text().splitlines()]
+                    self.assertEqual(names, ["fixture_continuity"] if continuity_exit else
+                                     ["fixture_continuity", "core", "fixture_verify", "results"])
+
+    def test_hopping_prover_receives_user_and_never_exports_a_failed_attempt(self):
+        for status in (0, 39):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "private-fixture").mkdir()
+                proof = root / "private-fixture/hopping-continuity.json"
+                proof.write_text('{"synthetic_hopping_proof":true}\n')
+                result = shell(
+                    HOST, 'CI_BASE=$1; CI_ROOT=$1/repo; CI_FIXTURE=$1/private-fixture; '
+                          'CI_EVIDENCE=$1; CI_ACCOUNT=ci-test; CI_PROTOCOL_CASE=hysteria-port-hopping; '
+                          'CI_TEST_EXIT=$2; python3() { printf "%s\\n" "$@" >"$CI_BASE/argv"; '
+                          'return "$CI_TEST_EXIT"; }; ci_protocol_continuity', root, status,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                argv = (root / "argv").read_text().splitlines()
+                self.assertEqual(argv[1], "prove-hopping")
+                self.assertEqual(argv[-2:], ["--user", "ci-test"])
+                self.assertEqual((root / "hopping-continuity.json").exists(), status == 0)
+
 
 class VMChecks(unittest.TestCase):
     def test_image_requires_one_exact_checksum_and_matching_bytes(self):
