@@ -84,6 +84,44 @@ HTTP 第二輪的 userspace 順序已確認：START 入檔後才執行 workload 
 
 另修正主機的靜態診斷文字契約：13 條固定拒絕原因中的分號改為既有白名單可接受的句點，主機白名單保持原樣。實際 `read_proxy_policy()` caller 回歸確認 HTTPUpgrade、未知 transport、節點域名及原生 SOCKS UDP 的具體原因和可行替代均可見，所有 policy／hash 變數仍清空，沒有部分結果、路徑或假憑證回顯。
 
+## 第三輪逐協議原生矩陣：54／55，保留 DNS 失敗
+
+[CI 39261938798](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39261938798) 在提交 [`7bfe620948dc3c890e48ec8a093de03c349ae3af`](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/commit/7bfe620948dc3c890e48ec8a093de03c349ae3af) 執行，2026-10-19 13:38:55–13:54:23 UTC，結論為 **failure**。本輪的 [55-row 白名單證據](evidence/ci-39261938798.json) 保存 run、job、artifact ID、ZIP SHA-256／大小、套件計數與逐項 gate 結果，供 artifacts 到期後核對；不保存原始 IP、qname、payload 或認證資料。
+
+| 範圍 | 通過 | 失敗 | 實際執行內容 |
+| --- | --- | --- | --- |
+| 逐協議／封裝矩陣 | **43** | **0** | 各自完成出口 IP、兩個受管 service 的 socket 建立身分、17／17 核心故障及封包驗收、fixture 核對；兩種 hopping 另有健康期間同一 TLS socket 的窗口證據。 |
+| 代表性環境／故障矩陣 | **11** | **1** | 唯一失敗是 Ubuntu Hysteria2／gateway-kill 的 DNS 健康測試；12 組 lifecycle 均完成各 100 個短會話，包括該失敗 job 在 core 前已完成的套件。 |
+| 合計 | **54** | **1** | 整輪未通過，不以 43 個逐協議 job 的成功抵銷代表性 job 的失敗。 |
+
+每個 job 的離線 discover 為 **346 項：343 通過、3 跳過**，inline helper **25／25**。SSH job 後續在私有 CPython 3.13.16 環境另跑 **20／20** 項 fixture 測試，零跳過。這些數量來自本輪實際 log，沒有沿用第二輪的 331／19。
+
+55 份 ZIP 的 API digest、大小及 run／head 歸屬，**2,754 個主機 evidence entries、144 個外層 VM evidence entries**，以及 exact revision、純 cgroup v2 環境全部核對一致。54 個成功 job 另行核對實際 outer／DNS PCAP、完整 physical capture、raw `ss` 的 socket inode→service cgroup、binding 保留、出口 IP 與適用的 fixture／hopping 證據。
+
+### Hysteria2 的第五筆 UDP DNS 交換逾時
+
+失敗 job 為 `118091563371`，對應 [artifact 12190948369](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39261938798/artifacts/12190948369)，ZIP SHA-256 為 `80f6e655e9bf10713e234507d041c4312ad30d7c09e1e8c12b94b91e3b7b950b`。Fixture、出口 IP、lifecycle 10／10 與 100 個會話先通過；core 前三項通過，第四項 `all_dns_destinations_redirected` 於 4.081 秒記錄 `TimeoutError`，其餘未執行。雖然 job 名稱是 gateway-kill，當時尚未開始任何 core fault 注入。
+
+Exact harness 與 worker RESULT 順序顯示：前四筆 DNS 交換成功，第五筆為 UDP；用戶端等候四秒仍未收到回覆而逾時。Bridge PCAP 已保存該筆完整的 A／IN query（65 bytes），沒有分片或截斷，封包目的地符合 artifact 中實際的 D8DNS DNAT target。此 capture 僅收集目的埠 53 的 request 側流量，不能據此判定回包是否曾到達 bridge，更不能定位為核心、上游或哪段網路丟失。
+
+同輪成功的 Hysteria2 healthy／gateway-stop 與失敗案例，其 source、effective、parser 及 worker SHA 相同；成功案例完成八筆 DNS 交換。這些對照保留為診斷證據，沒有將失敗補記為成功。
+
+後續將主機 DNS client 明確定義為有界查詢：UDP 僅在第一次完整接收逾時後，使用同一 socket／peer／source port／TID／wire question 再傳送一次；兩個五秒接收窗口共用十秒期限。TCP 保持一次傳送及共用四秒期限，兩者都加強回覆結構驗證，並在斷言前保存全部 attempts。這是[新的驗收契約](host-validation.md)，不是已證實的核心修復，也不改判本輪失敗；仍須由新提交通過原有 55 組完整關卡。
+
+### 本輪 capture 完整性
+
+全輪有 **69 個 canonical physical captures，68 個完整通過**，沒有 rejected preflight candidate。唯一不完整的是上述 DNS 失敗 job 的 core capture：有 START、沒有 END，清理後統計為 1／1、drop 0，因此不能當作完整的零直連驗收；該 job 的 lifecycle wrapper capture 則完整通過。
+
+第二輪失敗的 HTTP／gateway-stop 在本輪完整通過。其 core 與 lifecycle wrapper 的 canonical PCAP 各有兩個完整 records、唯一 START／END、兩個 root positive controls，且 direct workload packets 為零。各 log 先有完整 SIGUSR1 單行統計 captured 1／received 1／drop 0，之後有完整 SIGINT 多行統計 2／2／drop 0；final captured 與 PCAP record 數一致。Artifact 保存完整報告的先後順序，signal byte offset 由本版 producer 強制檢查，沒有另外序列化為 artifact 欄位。
+
+這證明本輪成功 captures 的完整性成立，**不證明第二輪額外三個 received 封包的根因已確定或修復**；前輪的失敗和限制仍保留。
+
+### 同一公開提交的 VPS 回歸
+
+VPS 對同一 `7bfe6209` 提交，使用實際固定核心及私有 SSH 環境，完整 discover **346／346、零跳過**，inline **25／25**，公開有效範例 **23／23** 通過編譯與實際核心檢查。生產檔案與原容器身分／運行狀態保持一致。
+
+VPS 的實際 tcpdump **4.9.3**／libpcap **1.9.1** 另以自有 loopback socket／collector 做格式 smoke：新 parser 成功讀取 fresh SIGUSR1 與 SIGINT 報告，collector 乾淨退出。這項測試只證明舊版本的統計格式相容性，不替代實體介面的完整擷取或故障驗收。
+
 ## 後續完整關卡
 
 修正後的工作分支須通過 **43 組逐協議原生 job＋12 組代表性環境／故障 job，共 55 組**。所有可接受逐協議 job 均保留原有 17 項核心故障驗收，沒有 AnyTLS 恢復例外。本節目前記錄必要關卡，尚未把等待重跑的修正記成通過；最終結果需要與正在審閱的提交及 artifact 對應。

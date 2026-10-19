@@ -452,7 +452,7 @@ sha256sum -c MANIFEST.sha256
 | Ubuntu 26.04.1 原生纯 v2 | Hysteria2／HTTP 各执行 healthy、gateway-stop、gateway-kill、gateway-recreate、docker-restart，共 10／10 CI jobs 通过；包括真实会话、抓包、出口 IP 与生命周期验收。 |
 | Debian 13.7 KVM 纯 v2 | Hysteria2／HTTP 的 healthy jobs 共 2／2 通过；各含核心 16／16、生命周期 10／10、100 个短会话及出口 IP 比对。Debian 的容器／Docker namespace 故障不在这两个 job 范围内。 |
 
-逐协议主机初轮 [CI 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481) 为 **50／59**，第二轮 [CI 39206996173](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39206996173) 为 **54／56**，两轮均未全部通过。HTTPUpgrade／AnyTLS 的明确拒绝、抓包完整性修正及后续 43＋12 组关卡见[追加验证记录](docs/validation-20261019-followup.md)。
+逐协议主机初轮 [CI 39202665481](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39202665481) 为 **50／59**，第二轮 [CI 39206996173](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39206996173) 为 **54／56**，第三轮 [CI 39261938798](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39261938798) 为 **54／55**，三轮均保留为失败。第三轮唯一失败为健康阶段的 UDP DNS 查询超时，后续有界查询与完整尝试证据仍须重新验收。HTTPUpgrade／AnyTLS 的明确拒绝、抓包完整性修正及 43＋12 组关卡见[追加验证记录](docs/validation-20261019-followup.md)。
 
 纯 v2 结果来自 [CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891)（`58dcfad596856fc3696d138f84d1c0f37e6e0ebd`），**12／12 jobs 通过**。v2 证据另核对会话创建的实际 socket inode 与所属 service cgroup。容器重建确实更换 container ID 与 namespace；旧 binding／共同规则保留，`check`、`init` 及新工作负载入场拒绝，必须离线重新绑定，没有自动沿用新 namespace。
 

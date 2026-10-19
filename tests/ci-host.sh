@@ -101,7 +101,7 @@ PY
 
 ci_result_report() {
     python3 - "$1" "${2:-representative}" "${3:-}" <<'PY'
-import json, math, pathlib, re, sys
+import hashlib, json, math, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 profile, case = sys.argv[2:]
 suites, proofs, loaded = {}, {}, {}
@@ -148,6 +148,86 @@ try:
                        and type(row.get("exit_code")) is int and row["exit_code"] == 0 for row in stages)
 except (OSError, ValueError, TypeError):
     stages_valid = False
+
+def dns_attempts():
+    # Current representative and protocol jobs share the same client contract.
+    # A passing summary alone cannot replace the durable per-query attempts.
+    dns_rows = [row for row in loaded.get("core", [])
+                if row.get("name") == "all_dns_destinations_redirected"]
+    if len(dns_rows) != 1 or dns_rows[0].get("passed") is not True: return False
+    values = dns_rows[0].get("detail")
+    if not isinstance(values, list) or len(values) != 8: return False
+    path = root / "core/dns-attempts.jsonl"
+    if not artifact("core/dns-attempts.jsonl") or path.stat().st_size > 65536: return False
+    content = path.read_text()
+    if not content.endswith("\n"): return False
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result: raise ValueError("duplicate DNS evidence key")
+            result[key] = value
+        return result
+
+    persisted = [json.loads(line, object_pairs_hook=unique_object) for line in content.splitlines()]
+    if len(persisted) != 8: return False
+    expected = {(address, tcp) for address in ("127.0.0.1", "127.0.0.53", "8.8.8.8", "10.0.0.53")
+                for tcp in (False, True)}
+    observed, queries = set(), set()
+    check_names = {"same_socket", "same_peer", "same_source_port", "same_query", "reply_validated"}
+    report_names = {"format", "transport", "ok", "query_sha256", "target_sha256", "elapsed_seconds",
+                    "transmissions", "attempts", "checks", "response", "error"}
+
+    def seconds(value, limit):
+        # Small scheduling/recording tolerance, not an additional receive
+        # window. Bound before isfinite to reject huge integers without overflow.
+        return type(value) in (int, float) and 0 <= value <= limit + 0.25 and math.isfinite(value)
+
+    for entry, saved in zip(values, persisted):
+        if not isinstance(entry, dict) or set(entry) != {"target", "tcp", "response"}: return False
+        address, tcp = entry["target"], entry["tcp"]
+        if not isinstance(address, str) or type(tcp) is not bool or (address, tcp) not in expected: return False
+        if (address, tcp) in observed: return False
+        observed.add((address, tcp))
+        report = entry["response"]
+        if not isinstance(report, dict) or set(report) != report_names: return False
+        # Python considers True == 1 and 1.0 == 1. Compare JSON types as well
+        # as values before applying the strict schema to their common content.
+        if (json.dumps(report, sort_keys=True, allow_nan=False)
+                != json.dumps(saved, sort_keys=True, allow_nan=False)): return False
+        if (type(report["format"]) is not int or report["format"] != 1 or report["ok"] is not True
+                or report["transport"] != ("tcp" if tcp else "udp") or report["error"] is not None): return False
+        query = report["query_sha256"]
+        if not isinstance(query, str) or not re.fullmatch(r"[0-9a-f]{64}", query) or query in queries: return False
+        queries.add(query)
+        if report["target_sha256"] != hashlib.sha256((address + ":53").encode("utf-8")).hexdigest(): return False
+        checks = report["checks"]
+        if not isinstance(checks, dict) or set(checks) != check_names or not all(v is True for v in checks.values()): return False
+        response = report["response"]
+        if (not isinstance(response, dict) or set(response) != {"rcode", "answers"}
+                or type(response["rcode"]) is not int or response["rcode"] not in (0, 3)
+                or type(response["answers"]) is not int or not 0 <= response["answers"] <= 65535): return False
+        count, attempts = report["transmissions"], report["attempts"]
+        if (type(count) is not int or count not in ((1,) if tcp else (1, 2))
+                or not isinstance(attempts, list) or len(attempts) != count
+                or not seconds(report["elapsed_seconds"], 4 if tcp else 10)): return False
+        total = 0
+        for index, attempt in enumerate(attempts, 1):
+            if (not isinstance(attempt, dict) or set(attempt) != {
+                    "number", "sent", "outcome", "elapsed_seconds", "error"}
+                    or type(attempt["number"]) is not int or attempt["number"] != index
+                    or attempt["sent"] is not True or not seconds(attempt["elapsed_seconds"], 4 if tcp else 5)):
+                return False
+            total += attempt["elapsed_seconds"]
+            if index < count:
+                if (tcp or attempt["outcome"] != "timeout" or attempt["error"] != "receive_timeout"
+                        or attempt["elapsed_seconds"] < 4.9): return False
+            elif attempt["outcome"] != "response" or attempt["error"] is not None:
+                return False
+        if total > report["elapsed_seconds"] + 0.00001: return False
+    return observed == expected
+
+proof("dns_attempts", dns_attempts)
 
 if profile == "protocol-case":
     suites["lifecycle"] = {"status": "not_requested",

@@ -14,6 +14,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -23,6 +24,7 @@ import select
 import signal
 import socket
 import socketserver
+import stat
 import struct
 import subprocess
 import termios
@@ -69,6 +71,214 @@ result={'uid':os.getuid(),'gid':os.getgid(),'groups':os.getgroups(),
         'cgroup_before_sockets':before,'pid':os.getpid(),
         'socket_inodes':[int(os.readlink('/proc/self/fd/'+str(s.fileno()))[8:-1]) for s in probes],
         'proxy_env':[k for k in os.environ if k.lower().endswith('_proxy')]}
+'''
+
+DNS_ERRORS = frozenset(('socket_error', 'connect_error', 'send_error', 'receive_error',
+    'receive_timeout', 'deadline_exceeded', 'identity_changed', 'invalid_query',
+    'invalid_header', 'invalid_tid', 'invalid_question', 'truncated_response',
+    'invalid_rcode', 'invalid_name', 'invalid_rr', 'trailing_data', 'tcp_eof',
+    'internal_error', 'worker_rpc_failed', 'worker_execution_failed', 'invalid_worker_report'))
+
+# This code runs inside the ordinary managed workload, not in the root harness.
+# The caller supplies one immutable message and returns the complete report even
+# on failure. Only a first UDP receive timeout can start one retransmission.
+DNS_PROBE = r'''
+import hashlib, socket, struct, time
+
+class DNSFailure(Exception):
+    pass
+
+def dns_name(data, offset):
+    labels, visited, end, size = [], set(), None, 1
+    while True:
+        if offset >= len(data) or offset in visited:
+            raise DNSFailure('invalid_name')
+        visited.add(offset)
+        length = data[offset]
+        if length & 0xc0 == 0xc0:
+            if offset + 2 > len(data):
+                raise DNSFailure('invalid_name')
+            pointer = ((length & 0x3f) << 8) | data[offset + 1]
+            if pointer < 12 or pointer >= offset:
+                raise DNSFailure('invalid_name')
+            if end is None:
+                end = offset + 2
+            offset = pointer
+            continue
+        if length & 0xc0:
+            raise DNSFailure('invalid_name')
+        offset += 1
+        if not length:
+            return tuple(labels), offset if end is None else end
+        if offset + length > len(data):
+            raise DNSFailure('invalid_name')
+        size += length + 1
+        if size > 255:
+            raise DNSFailure('invalid_name')
+        labels.append(data[offset:offset + length].lower())
+        offset += length
+
+def dns_response(data):
+    if len(data) < 12:
+        raise DNSFailure('invalid_header')
+    tid, flags, qd, an, ns, ar = struct.unpack('!6H', data[:12])
+    if not flags & 0x8000 or flags & 0x7840 or qd != 1:
+        raise DNSFailure('invalid_header')
+    if tid != 0x4d38:
+        raise DNSFailure('invalid_tid')
+    if flags & 0x0200:
+        raise DNSFailure('truncated_response')
+    if flags & 15 not in (0, 3):
+        raise DNSFailure('invalid_rcode')
+    wanted, wanted_end = dns_name(message, 12)
+    actual, offset = dns_name(data, 12)
+    if offset + 4 > len(data) or actual != wanted or data[offset:offset + 4] != message[wanted_end:wanted_end + 4]:
+        raise DNSFailure('invalid_question')
+    offset += 4
+    for unused in range(an + ns + ar):
+        owner, offset = dns_name(data, offset)
+        if offset + 10 > len(data):
+            raise DNSFailure('invalid_rr')
+        kind, klass, ttl, length = struct.unpack('!HHIH', data[offset:offset + 10])
+        begin, end = offset + 10, offset + 10 + length
+        if kind == 0 or end > len(data):
+            raise DNSFailure('invalid_rr')
+        if (kind == 1 and length != 4) or (kind == 28 and length != 16):
+            raise DNSFailure('invalid_rr')
+        if kind in (2, 5, 12, 39, 6, 15, 33):
+            position = begin + (2 if kind == 15 else 6 if kind == 33 else 0)
+            if position >= end:
+                raise DNSFailure('invalid_rr')
+            unused, position = dns_name(data, position)
+            if kind == 6:
+                unused, position = dns_name(data, position)
+                position += 20
+            if position != end:
+                raise DNSFailure('invalid_rr')
+        if kind in (16, 41):
+            position = begin
+            if kind == 41 and (owner or ttl >> 24):
+                raise DNSFailure('invalid_rr' if owner else 'invalid_rcode')
+            while position < end:
+                if kind == 16:
+                    position += 1 + data[position]
+                else:
+                    if position + 4 > end:
+                        raise DNSFailure('invalid_rr')
+                    position += 4 + struct.unpack('!H', data[position + 2:position + 4])[0]
+                if position > end:
+                    raise DNSFailure('invalid_rr')
+        offset = end
+    if offset != len(data):
+        raise DNSFailure('trailing_data')
+    return {'rcode': flags & 15, 'answers': an}
+
+started = time.monotonic()
+deadline = started + (4.0 if tcp else 10.0)
+phase = 'socket'
+attempt = {'number': 1, 'sent': False, 'outcome': 'error', 'elapsed_seconds': 0.0, 'error': None}
+report['attempts'].append(attempt)
+
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM) as sock:
+        original_socket, original_fd = sock, sock.fileno()
+
+        def before(until):
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                raise DNSFailure('deadline_exceeded')
+            sock.settimeout(remaining)
+
+        phase = 'connect'
+        before(deadline)
+        sock.connect((address, 53))
+        peer, local = sock.getpeername(), sock.getsockname()
+        report['checks'].update(same_socket=True, same_peer=True, same_source_port=True, same_query=True)
+
+        def identity():
+            checks = report['checks']
+            try:
+                checks['same_socket'] &= sock is original_socket and sock.fileno() == original_fd
+                checks['same_peer'] &= sock.getpeername() == peer == (address, 53)
+                checks['same_source_port'] &= sock.getsockname() == local and local[1] > 0
+                checks['same_query'] &= hashlib.sha256(message).hexdigest() == report['query_sha256']
+            except Exception:
+                raise DNSFailure('identity_changed')
+            if not all(checks[key] for key in ('same_socket', 'same_peer', 'same_source_port', 'same_query')):
+                raise DNSFailure('identity_changed')
+
+        def receive(length, until):
+            before(until)
+            data = sock.recv(length)
+            if time.monotonic() >= until:
+                raise DNSFailure('deadline_exceeded')
+            return data
+
+        def exact(length):
+            data = b''
+            while len(data) < length:
+                part = receive(length - len(data), deadline)
+                if not part:
+                    raise DNSFailure('tcp_eof')
+                data += part
+            return data
+
+        for number in range(1, 2 if tcp else 3):
+            if number == 2:
+                attempt = {'number': 2, 'sent': False, 'outcome': 'error', 'elapsed_seconds': 0.0, 'error': None}
+                report['attempts'].append(attempt)
+            identity()
+            phase = 'send'
+            before(deadline)
+            if tcp:
+                sock.sendall(struct.pack('!H', len(message)) + message)
+            elif sock.send(message) != len(message):
+                raise DNSFailure('send_error')
+            attempt['sent'] = True
+            report['transmissions'] += 1
+            phase = 'receive'
+            receiving = time.monotonic()
+            receive_deadline = deadline if tcp else min(deadline, receiving + 5.0)
+            try:
+                try:
+                    if tcp:
+                        length = struct.unpack('!H', exact(2))[0]
+                        if length < 12:
+                            raise DNSFailure('invalid_header')
+                        data = exact(length)
+                    else:
+                        data = receive(65535, receive_deadline)
+                finally:
+                    # Elapsed receive-window time; never label this as the RTT
+                    # of a particular transmission after retransmission.
+                    attempt['elapsed_seconds'] = time.monotonic() - receiving
+            except socket.timeout:
+                attempt.update(outcome='timeout', error='receive_timeout')
+                identity()
+                now = time.monotonic()
+                if not tcp and number == 1 and now >= receive_deadline and now < deadline:
+                    continue
+                raise DNSFailure('receive_timeout')
+            identity()
+            response = dns_response(data)
+            if time.monotonic() >= deadline:
+                raise DNSFailure('deadline_exceeded')
+            report['checks']['reply_validated'] = True
+            report.update(ok=True, response=response)
+            attempt.update(outcome='response', error=None)
+            break
+except Exception as error:
+    if isinstance(error, DNSFailure):
+        code = str(error)
+    elif isinstance(error, OSError):
+        code = phase + '_error'
+    else:
+        code = 'internal_error'
+    report.update(ok=False, error=code, response=None)
+    if attempt['outcome'] != 'timeout':
+        attempt.update(outcome='error', error=code)
+report['elapsed_seconds'] = time.monotonic() - started
+result = report
 '''
 
 
@@ -575,24 +785,77 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM if {udp} else socket.SOCK_S
         assert session.value(code)=='d8-loopback-proof'
 
     def dns(self, session, address, tcp, name):
-        code=r"""
-import socket,struct
-name={name!r}
-question=b''.join(bytes([len(x)])+x.encode() for x in name.split('.'))+b'\x00\x00\x01\x00\x01'
-message=struct.pack('!6H',0x4d38,0x0100,1,0,0,0)+question
-with socket.socket(socket.AF_INET,socket.SOCK_STREAM if {tcp} else socket.SOCK_DGRAM) as sock:
-    sock.settimeout(4);sock.connect(({address!r},53))
-    if {tcp}:
-        sock.sendall(struct.pack('!H',len(message))+message)
-        header=sock.recv(2);length=struct.unpack('!H',header)[0];reply=b''
-        while len(reply)<length: reply+=sock.recv(length-len(reply))
-    else:
-        sock.send(message);reply=sock.recv(4096)
-    tid,flags,qd,an,_,_=struct.unpack('!6H',reply[:12])
-    assert tid==0x4d38 and flags&0x8000 and flags&15 in (0,3)
-    result={{'rcode':flags&15,'answers':an}}
-""".format(name=name,tcp=tcp,address=address)
-        return session.value(code)
+        message=b'';query_error=False
+        try:
+            labels=[part.encode('ascii') for part in name.split('.')]
+            assert labels and all(0<len(label)<=63 for label in labels)
+            question=b''.join(bytes([len(label)])+label for label in labels)+b'\x00'
+            assert len(question)<=255 and str(ipaddress.IPv4Address(address))==address and type(tcp) is bool
+            message=struct.pack('!6H',0x4d38,0x0100,1,0,0,0)+question+b'\x00\x01\x00\x01'
+        except (ValueError,UnicodeError,AssertionError):
+            query_error=True
+        report={'format':1,'transport':'tcp' if tcp else 'udp','ok':False,
+                'query_sha256':hashlib.sha256(message).hexdigest(),
+                'target_sha256':hashlib.sha256((address+':53').encode('utf-8')).hexdigest(),
+                'elapsed_seconds':0.0,'transmissions':0,'attempts':[],
+                'checks':{key:False for key in ('same_socket','same_peer','same_source_port','same_query','reply_validated')},
+                'response':None,'error':None}
+
+        def valid(value):
+            def elapsed(number):
+                return type(number) in (int,float) and 0<=number<=20 and math.isfinite(number)
+            try:
+                if not isinstance(value,dict) or set(value)!=set(report):return False
+                if type(value['format']) is not int or value['format']!=1:return False
+                if any(value[key]!=report[key] for key in ('transport','query_sha256','target_sha256')):return False
+                if type(value['ok']) is not bool or not elapsed(value['elapsed_seconds']):return False
+                if type(value['transmissions']) is not int or not 0<=value['transmissions']<=2:return False
+                if value['error'] is not None and value['error'] not in DNS_ERRORS:return False
+                checks=value['checks']
+                if not isinstance(checks,dict) or set(checks)!=set(report['checks']) or any(type(flag) is not bool for flag in checks.values()):return False
+                attempts=value['attempts']
+                if not isinstance(attempts,list) or len(attempts)>2:return False
+                for number,attempt in enumerate(attempts,1):
+                    if not isinstance(attempt,dict) or set(attempt)!={'number','sent','outcome','elapsed_seconds','error'}:return False
+                    if type(attempt['number']) is not int or attempt['number']!=number or type(attempt['sent']) is not bool:return False
+                    if attempt['outcome'] not in ('response','timeout','error') or not elapsed(attempt['elapsed_seconds']):return False
+                    if attempt['error'] is not None and attempt['error'] not in DNS_ERRORS:return False
+                if value['transmissions']!=sum(attempt['sent'] for attempt in attempts):return False
+                response=value['response']
+                if response is not None:
+                    if not isinstance(response,dict) or set(response)!={'rcode','answers'}:return False
+                    if type(response['rcode']) is not int or response['rcode'] not in (0,3):return False
+                    if type(response['answers']) is not int or not 0<=response['answers']<=65535:return False
+                if not value['ok']:return value['error'] is not None and response is None
+                return all(checks.values()) and response is not None and value['error'] is None and bool(attempts) and attempts[-1]['outcome']=='response'
+            except (KeyError,TypeError,ValueError):
+                return False
+
+        if query_error:
+            report['error']='invalid_query'
+        else:
+            code='address={0!r}\ntcp={1!r}\nmessage={2!r}\nreport={3!r}\n'.format(address,tcp,message,report)+DNS_PROBE
+            started=time.monotonic()
+            try:
+                response=session.call(code,timeout=20)  # Explicitly exceeds the 10-second UDP budget.
+            except Exception:
+                report.update(error='worker_rpc_failed',elapsed_seconds=time.monotonic()-started)
+            else:
+                if isinstance(response,dict) and response.get('ok') is False:
+                    report.update(error='worker_execution_failed',elapsed_seconds=time.monotonic()-started)
+                elif isinstance(response,dict) and response.get('ok') is True and valid(response.get('result')):
+                    report=response['result']
+                else:
+                    report.update(error='invalid_worker_report',elapsed_seconds=time.monotonic()-started)
+        path=self.output/'dns-attempts.jsonl'
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_APPEND|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'a',encoding='utf-8') as evidence:
+            metadata=os.fstat(evidence.fileno())
+            assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid==os.geteuid() and metadata.st_mode&0o077==0,'DNS evidence must be a private regular file'
+            evidence.write(json.dumps(report,sort_keys=True,allow_nan=False)+'\n')
+            evidence.flush();os.fsync(evidence.fileno())
+        assert report['ok'],'DNS probe failed: '+report['error']
+        return report
 
     def ordinary_udp(self,session):
         assert self.udp_echo,'full network acceptance requires a controlled --udp-echo IPv4:port'

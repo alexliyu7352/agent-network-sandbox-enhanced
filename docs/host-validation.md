@@ -4,7 +4,7 @@
 
 截至 2026-10-19，歷史證據包括 24／24 公開配置檢查、初輪 47／47 協議 loopback 案例，以及 Ubuntu 20.04.6 hybrid／v1 上 Hysteria2 和 HTTP 的核心／故障套件各 17／17。[CI 39182626891](https://github.com/alexliyu7352/agent-network-sandbox-enhanced/actions/runs/39182626891) 在 `58dcfad596856fc3696d138f84d1c0f37e6e0ebd` 通過 12／12 jobs：Ubuntu 26.04.1 原生純 v2 的兩個協議各測 healthy、stop、kill、recreate、Docker restart；Debian 13.7 KVM 純 v2 的兩個協議各測 healthy。Debian 的兩個 jobs 仍含路由、TUN 及受控上游中斷測試，但不含容器／Docker namespace 故障。
 
-後續逐協議 CI 的第一輪為 50／59，第二輪為 54／56，均未全數通過。HTTPUpgrade 在固定核心配對的追加重測失敗，AnyTLS 的有限恢復步驟通過後仍未完成獨立節點故障恢復，兩者本版明確拒絕。現行必需矩陣為 43 個逐協議 jobs 加原有 12 個代表性 jobs；全部可接受逐協議 job 使用原有 core17，不在通用故障測試或產品探測加入重試。完整失敗紀錄與後續結果見[追加驗證](validation-20261019-followup.md)。
+後續逐協議 CI 的第一輪為 50／59，第二輪為 54／56，第三輪為 54／55，三輪均未全數通過。HTTPUpgrade 在固定核心配對的追加重測失敗，AnyTLS 的有限恢復步驟通過後仍未完成獨立節點故障恢復，兩者本版明確拒絕。第三輪只在 Hysteria2 的健康 DNS 階段逾時，尚未注入故障；後續 DNS client 契約見本頁第 4 節，不能改判舊失敗。現行必需矩陣為 43 個逐協議 jobs 加原有 12 個代表性 jobs；全部可接受逐協議 job 使用原有 core17，不在通用故障測試或產品探測加入重試。完整失敗紀錄與後續結果見[追加驗證](validation-20261019-followup.md)。
 
 各次版本、套件數量、封包與 socket 身分證據見 [驗證摘要](VERIFICATION.md)。以下清單也列出尚待擴充的測試範圍，不能把它的每個項目都當成已通過。配置／loopback 結果不代替主機層驗收，已測主機也不能代替其他協議、transport 或使用者實際遠端節點。歷史結果另保留於 [2026-10-10](host-acceptance-20261010.md) 與 [2026-10-09](host-acceptance-20261009.md)。
 
@@ -83,6 +83,23 @@ v2 還須核對 **socket 建立時的 cgroup**：在兩個受管 service 內各�
 外層不一定加密，例如普通 HTTP CONNECT 或 SOCKS 控制流量；這類代理可能讓目的主機名出現在代理連線的協商中。判斷是否 DNS 直漏，要核對 socket 的外層目的 IP／協議／埠、實際 DNS 路徑及 payload，不能一律要求所有協議抓包都看不到任何網域文字。
 
 DNS 測試對 localhost、8.8.8.8、內網 DNS 等目的地發送 TCP／UDP 53，確認都被 hijack 並經 proxy。能力保證 UDP 時有效上游為 UDP `1.1.1.1:53`；只保證 TCP 時為 HTTPS `1.1.1.1:443`、`/dns-query`、TLS server_name `cloudflare-dns.com`。1.1.1.1 不應取得外層直連 allow rule；混合候選群組以共同能力選 DNS，不能把其中某個候選的 UDP 能力當成全組保證。
+
+### 主機 DNS 查詢與嘗試證據
+
+[`tests/host_acceptance.py`](../tests/host_acceptance.py) 的八個查詢分別覆蓋 `127.0.0.1`、`127.0.0.53`、`8.8.8.8`、`10.0.0.53` 的 UDP／TCP；每個組合使用不同的隨機 qname，沒有預熱或跨組合共用查詢名稱。
+
+| 傳輸 | 一個 logical query 的限額 | 結果條件 |
+| --- | --- | --- |
+| UDP | 同一 socket、peer、source port、TID 與完整 wire question，最多兩次傳送；每次接收至多五秒，共用十秒 monotonic deadline。 | 只有第一次接收逾時可以再傳送一次；socket／connect／send 錯誤或任一無效回覆立即失敗。第二次仍無有效回覆即失敗。 |
+| TCP | 只有一次 query transmission；connect、send、兩 byte 長度與完整 body 的讀取共用四秒期限。 | 可接收分段 header／body；EOF、結構不完整或無效回覆立即失敗，沒有重連或 transport fallback。 |
+
+回覆必須完整符合 TID、QR、Question、A／IN、未設 TC、允許的 NOERROR／NXDOMAIN，以及全部 DNS record 的長度與名稱結構。收到錯誤回覆後不能繼續等另一份把它掩蓋掉。這是驗收 client 的明確契約；[RFC 1035 §4.2.1](https://www.rfc-editor.org/rfc/rfc1035.html#section-4.2.1) 要求考慮 UDP 遺失與重傳，[RFC 1123 §6.1.3.3](https://www.rfc-editor.org/rfc/rfc1123.html#section-6.1.3.3) 要求資源有界並建議沒有 RTT 資料時初始間隔至少五秒。本項的兩次／十秒是專案自選預算，不能聲稱是 RFC 規定的完整重傳演算法。
+
+成功與失敗都在斷言前將完整 report append／fsync 到 `core/dns-attempts.jsonl`。每列 format 1 含 query／target 的 SHA-256、實際 transmission 數、全部 attempts、每次接收窗口的耗時、固定安全錯誤碼，以及同 socket／peer／source port／query 和回覆驗證 flags。首試 timeout 不會因後續成功而消失；TCP 也保留單次結果。相同 TID 的回覆可能來自較早的傳送，因此耗時稱為接收窗口時間，不聲稱是第二份封包的 RTT。
+
+兩種 CI profile 均要求八個組合完整、查詢 hash 不重複、durable report 與 core 結果逐項相同，且次數、先後結果、回覆、型別和時間一致。CI 對結束排程／記錄僅容許 0.25 秒尾端誤差，producer 不因此增加接收窗口。缺記錄、逾時後仍未成功、無效回覆、超額重送或多餘／不一致的證據都使整個 job 失敗。這些檢查不取代原有 DNS DNAT、外層端點、完整抓包及故障阻斷關卡。
+
+### 可控制的快取與 TTL 對照
 
 使用可計數、可改 TTL 的受控 DNS fixture，測第一次查詢、跨 TCP／UDP 共用快取、到期重新查詢。HTTP fixture 必須驗證測試憑證而不是停用 TLS 驗證；負對照分別停用 cache 和移除 detour，要求對應斷言失敗。可執行的 loopback 合約見 [`tests/test_dns_runtime.py`](../tests/test_dns_runtime.py)：
 

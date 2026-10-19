@@ -23,6 +23,32 @@ def shell(script, body, *args):
     )
 
 
+def synthetic_dns_evidence(root):
+    """Complete client evidence for offline report controls, never live DNS."""
+    rows = []
+    for address in ("127.0.0.1", "127.0.0.53", "8.8.8.8", "10.0.0.53"):
+        for tcp in (False, True):
+            report = {
+                "format": 1, "transport": "tcp" if tcp else "udp", "ok": True,
+                "query_sha256": hashlib.sha256((address + str(tcp)).encode()).hexdigest(),
+                "target_sha256": hashlib.sha256((address + ":53").encode()).hexdigest(),
+                "elapsed_seconds": 0.1, "transmissions": 1,
+                "attempts": [{"number": 1, "sent": True, "outcome": "response",
+                              "elapsed_seconds": 0.09, "error": None}],
+                "checks": {name: True for name in (
+                    "same_socket", "same_peer", "same_source_port", "same_query", "reply_validated")},
+                "response": {"rcode": 0, "answers": 0}, "error": None,
+            }
+            rows.append({"target": address, "tcp": tcp, "response": report})
+    persist_dns_evidence(root, rows)
+    return rows
+
+
+def persist_dns_evidence(root, rows):
+    (root / "core/dns-attempts.jsonl").write_text("".join(
+        json.dumps(row["response"]) + "\n" for row in rows))
+
+
 class HostBootstrapTests(unittest.TestCase):
     def test_unmarked_host_is_rejected_before_provisioning(self):
         for script in (HOST, VM):
@@ -249,6 +275,10 @@ class HostBootstrapTests(unittest.TestCase):
                 path = Path(td) / name
                 path.mkdir()
                 (path / "results.json").write_text(json.dumps([{"passed": True}]))
+            (Path(td) / "core/results.json").write_text(json.dumps([{
+                "name": "all_dns_destinations_redirected", "passed": True,
+                "detail": synthetic_dns_evidence(Path(td)),
+            }]))
             self.assertEqual(shell(HOST, 'ci_validate_results "$1"', td).returncode, 0)
             (Path(td) / "core/results.json").write_text(json.dumps([{"passed": False}]))
             self.assertNotEqual(shell(HOST, 'ci_validate_results "$1"', td).returncode, 0)
@@ -296,6 +326,7 @@ class ProtocolCaseChecks(unittest.TestCase):
         }
         for name in ("core", "exit-ip"):
             (root / name).mkdir()
+        details["all_dns_destinations_redirected"]["detail"] = synthetic_dns_evidence(root)
         (root / "core/results.json").write_text(json.dumps(rows))
         for name in ("physical-direct-probes", "gateway-outer", "redirected-dns"):
             (root / "core" / (name + ".pcap")).write_bytes(b"synthetic packet evidence" * 2)
@@ -887,6 +918,118 @@ class ProtocolCaseChecks(unittest.TestCase):
                 self.assertEqual(argv[1], "prove-hopping")
                 self.assertEqual(argv[-2:], ["--user", "ci-test"])
                 self.assertEqual((root / "hopping-continuity.json").exists(), status == 0)
+
+
+class DNSAttemptEvidenceChecks(unittest.TestCase):
+    @staticmethod
+    def evidence(root, profile):
+        rows = ProtocolCaseChecks.completed_evidence(root)
+        if profile == "representative":
+            (root / "lifecycle").mkdir()
+            (root / "lifecycle/results.json").write_text('[{"passed":true}]')
+        dns = next(row["detail"] for row in rows if row["name"] == "all_dns_destinations_redirected")
+        return rows, dns
+
+    @staticmethod
+    def retransmission(report):
+        report["transmissions"] = 2
+        report["elapsed_seconds"] = 5.2
+        report["attempts"] = [
+            {"number": 1, "sent": True, "outcome": "timeout",
+             "elapsed_seconds": 5.0, "error": "receive_timeout"},
+            {"number": 2, "sent": True, "outcome": "response",
+             "elapsed_seconds": 0.1, "error": None},
+        ]
+
+    def test_both_profiles_require_eight_persisted_valid_logical_queries(self):
+        for profile in ("representative", "protocol-case"):
+            for retransmit in (False, True):
+                with self.subTest(profile=profile, retransmit=retransmit), tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    rows, dns = self.evidence(root, profile)
+                    if retransmit:
+                        self.retransmission(dns[0]["response"])
+                    persist_dns_evidence(root, dns)
+                    (root / "core/results.json").write_text(json.dumps(rows))
+                    result = shell(HOST, 'ci_result_report "$1" "$2" ssh', root, profile)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIs(json.loads(result.stdout)["proofs"].get("dns_attempts"), True)
+
+    def test_missing_inconsistent_or_unbounded_dns_evidence_fails_both_profiles(self):
+        mutations = (
+            "missing_file", "linked_file", "partial_jsonl", "extra_record", "record_mismatch",
+            "missing_query", "duplicate_query", "wrong_target", "wrong_transport", "untyped_tcp",
+            "missing_attempts", "untyped_transmissions", "missing_check", "false_check", "untyped_format",
+            "failed_report", "invalid_reply", "bad_rcode", "invalid_answers", "hidden_error",
+            "retry_without_timeout", "retry_after_send_error", "third_transmission", "tcp_retransmission",
+            "unsent_response", "wrong_attempt_number", "short_timeout", "timeout_without_response",
+            "over_budget", "nonfinite_time", "overflow_time", "attempt_time_exceeds_total",
+            "record_format_bool", "record_attempt_bool", "record_answers_bool", "record_count_float",
+        )
+        for profile in ("representative", "protocol-case"):
+            for mutation in mutations:
+                with self.subTest(profile=profile, mutation=mutation), tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    rows, dns = self.evidence(root, profile)
+                    report = dns[0]["response"]
+                    self.retransmission(report)
+                    if mutation == "missing_query": dns.pop()
+                    elif mutation == "duplicate_query": dns[-1] = dns[0]
+                    elif mutation == "wrong_target": report["target_sha256"] = "a" * 64
+                    elif mutation == "wrong_transport": report["transport"] = "tcp"
+                    elif mutation == "untyped_tcp": dns[0]["tcp"] = 0
+                    elif mutation == "missing_attempts": report.pop("attempts")
+                    elif mutation == "untyped_transmissions": report["transmissions"] = True
+                    elif mutation == "missing_check": report["checks"].pop("same_peer")
+                    elif mutation == "false_check": report["checks"]["same_socket"] = False
+                    elif mutation == "untyped_format": report["format"] = True
+                    elif mutation == "failed_report": report["ok"] = False
+                    elif mutation == "invalid_reply": report["checks"]["reply_validated"] = False
+                    elif mutation == "bad_rcode": report["response"]["rcode"] = 2
+                    elif mutation == "invalid_answers": report["response"]["answers"] = True
+                    elif mutation == "hidden_error": report["error"] = "receive_timeout"
+                    elif mutation == "retry_without_timeout":
+                        report["attempts"][0].update(outcome="response", error=None)
+                    elif mutation == "retry_after_send_error":
+                        report["attempts"][0].update(outcome="error", error="send_error")
+                    elif mutation == "third_transmission":
+                        report["transmissions"] = 3
+                        report["attempts"].append(dict(report["attempts"][-1], number=3))
+                    elif mutation == "tcp_retransmission":
+                        self.retransmission(dns[1]["response"])
+                    elif mutation == "unsent_response": report["attempts"][-1]["sent"] = False
+                    elif mutation == "wrong_attempt_number": report["attempts"][-1]["number"] = 1
+                    elif mutation == "short_timeout": report["attempts"][0]["elapsed_seconds"] = 0.01
+                    elif mutation == "timeout_without_response":
+                        report["attempts"][-1].update(outcome="timeout", error="receive_timeout")
+                    elif mutation == "over_budget": report["elapsed_seconds"] = 11
+                    elif mutation == "nonfinite_time": report["elapsed_seconds"] = float("nan")
+                    elif mutation == "overflow_time": report["elapsed_seconds"] = 10 ** 400
+                    elif mutation == "attempt_time_exceeds_total": report["elapsed_seconds"] = 4.9
+                    persist_dns_evidence(root, dns)
+                    path = root / "core/dns-attempts.jsonl"
+                    if mutation == "missing_file": path.unlink()
+                    elif mutation == "linked_file":
+                        path.rename(root / "borrowed-dns.jsonl")
+                        path.symlink_to(root / "borrowed-dns.jsonl")
+                    elif mutation == "partial_jsonl":
+                        path.write_text(path.read_text().rstrip("\n"))
+                    elif mutation == "extra_record":
+                        path.write_text(path.read_text() + json.dumps(report) + "\n")
+                    elif mutation == "record_mismatch": dns[0]["response"]["response"]["answers"] = 1
+                    elif mutation.startswith("record_"):
+                        saved = [json.loads(line) for line in path.read_text().splitlines()]
+                        if mutation == "record_format_bool": saved[0]["format"] = True
+                        elif mutation == "record_attempt_bool": saved[0]["attempts"][0]["number"] = True
+                        elif mutation == "record_answers_bool": saved[0]["response"]["answers"] = False
+                        elif mutation == "record_count_float": saved[0]["transmissions"] = 2.0
+                        path.write_text("".join(json.dumps(item) + "\n" for item in saved))
+                    (root / "core/results.json").write_text(json.dumps(rows))
+                    result = shell(HOST, 'ci_result_report "$1" "$2" ssh', root, profile)
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    parsed = json.loads(result.stdout)
+                    self.assertIs(parsed["passed"], False)
+                    self.assertIs(parsed["proofs"].get("dns_attempts"), False)
 
 
 class VMChecks(unittest.TestCase):
