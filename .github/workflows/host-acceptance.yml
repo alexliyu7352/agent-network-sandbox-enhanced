@@ -13,18 +13,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ubuntu-v2:
+  host-v2:
     # Public standard runners are free; never send this privileged harness to
     # self-hosted machines, production hosts, or a container-only runner.
     if: ${{ github.event.repository.private == false }}
-    name: Ubuntu 26.04 / ${{ matrix.protocol }} / ${{ matrix.scenario }}
+    name: ${{ matrix.platform }} / ${{ matrix.protocol }} / ${{ matrix.scenario }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: 80
     strategy:
       fail-fast: false
       matrix:
+        platform: [ubuntu-26.04]
         protocol: [hysteria2, http]
         scenario: [healthy, gateway-stop, gateway-kill, docker-restart]
+        include:
+          - platform: debian-13-kvm
+            protocol: hysteria2
+            scenario: healthy
+          - platform: debian-13-kvm
+            protocol: http
+            scenario: healthy
     steps:
       - name: Fetch this public commit into a fresh root-private checkout
         env:
@@ -49,14 +57,20 @@ jobs:
 
       - name: Run offline and real host acceptance with fake fixtures
         env:
+          CI_PLATFORM: ${{ matrix.platform }}
           CI_PROTOCOL: ${{ matrix.protocol }}
           CI_SCENARIO: ${{ matrix.scenario }}
           CI_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
+          case "$CI_PLATFORM" in
+            ubuntu-26.04) harness=ci-host.sh ;;
+            debian-13-kvm) harness=ci-vm.sh ;;
+            *) exit 125 ;;
+          esac
           sudo env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
             CI_DISPOSABLE_HOST=github-actions CI_GITHUB_SHA="$CI_COMMIT" \
-            bash /root/dev-session-ci/repo/tests/ci-host.sh \
+            bash "/root/dev-session-ci/repo/tests/$harness" \
             --protocol "$CI_PROTOCOL" --scenario "$CI_SCENARIO" --repetitions 100
 
       - name: Export only test evidence, including failure results
@@ -80,7 +94,7 @@ jobs:
         # Official actions/upload-artifact v7.0.2, Node 24; pinned to its commit.
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: ubuntu-26.04-${{ matrix.protocol }}-${{ matrix.scenario }}
+          name: ${{ matrix.platform }}-${{ matrix.protocol }}-${{ matrix.scenario }}
           path: ${{ runner.temp }}/dev-session-evidence
           if-no-files-found: error
           retention-days: 14

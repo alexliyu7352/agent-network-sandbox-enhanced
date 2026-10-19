@@ -624,11 +624,46 @@ result={'response':data[:100].decode('ascii','replace')}
             self.echo(self.b,'127.0.0.1',self.tcp.server_address[1])
             self.forced_egress(self.a)
         finally:
-            restore();self.gateway_ready()
+            restore();self.gateway_ready();self.assert_rules()
         assert self.https(self.a)['ok']
         self.a.value("state.pop('https').close();state.pop('kept_socket',None);result=True")
         return {'existing_socket':before['result']['socket'],'existing_connection_blocked':True,
-                'new_connection_blocked':True,'other_session_loopback_alive':True}
+                'new_connection_blocked':True,'other_session_loopback_alive':True,
+                'gateway_readback_verified_after_restore':True,'binding_and_guards_retained':True}
+
+    def gateway_command(self,*args):
+        pid=command('docker','inspect','-f','{{.State.Pid}}','worker').stdout.strip()
+        assert re.fullmatch(r'[1-9][0-9]*',pid),'gateway is not running'
+        namespace=Path('/proc/'+pid+'/ns/net');metadata=namespace.stat()
+        assert '{}:{}'.format(metadata.st_dev,metadata.st_ino)==self.binding.gateway['namespace_identity'],\
+            'refusing fault injection into an unbound gateway namespace'
+        return command('nsenter','--net='+str(namespace),'--',*args)
+
+    def tun_link_fault(self):
+        return self.fault('gateway-tun-down',
+            lambda:self.gateway_command('ip','link','set','dev','tun0','down'),
+            lambda:self.gateway_command('ip','link','set','dev','tun0','up'))
+
+    def node_outage(self):
+        addresses=sorted({endpoint['address'] for endpoint in self.binding.policy['outer_endpoints']},
+                         key=ipaddress.IPv4Address)
+        comment='d8-acceptance-node-outage-'+uuid.uuid4().hex
+        installed=[]
+        def apply():
+            for address in addresses:
+                rule=('-o','eth0','-d',address+'/32','-m','comment','--comment',comment,'-j','DROP')
+                self.gateway_command('iptables-legacy','-w','5','-I','OUTPUT','1',*rule)
+                installed.append(rule)
+        def restore():
+            failures=[]
+            # Track successful inserts; never flush or delete another rule.
+            # Continue restoring other nodes if one delete fails, then fail.
+            for rule in reversed(installed):
+                try:self.gateway_command('iptables-legacy','-w','5','-D','OUTPUT',*rule)
+                except Exception as error:failures.append(error)
+            if failures:raise AssertionError('could not restore every owned node-outage rule') from failures[0]
+        result=self.fault('controlled-node-outage',apply,restore)
+        return dict(result,blocked_outer_addresses=addresses,owned_drop_rules_removed=len(installed))
 
     def forced_egress(self, session):
         outcomes=[]
@@ -705,15 +740,14 @@ with socket.socket(socket.AF_INET,socket.SOCK_DGRAM if {udp} else socket.SOCK_ST
             assert response['exit']!=0;evidence.append(response)
             return evidence
         self.record('private_ipv6_privilege_denials',blocked)
+        self.record('controlled_upstream_node_outage',self.node_outage)
+        self.record('gateway_TUN_link_down',self.tun_link_fault)
         self.record('host_default_route_removed',lambda:self.fault('host-route',
             lambda:command('ip','-4','route','del','default','via',self.gateway,'dev',self.bridge,'table','32190'),
             lambda:command('ip','-4','route','add','default','via',self.gateway,'dev',self.bridge,'table','32190')))
-        def ns_command(*args):
-            pid=command('docker','inspect','-f','{{.State.Pid}}','worker').stdout.strip()
-            return command('nsenter','--net=/proc/'+pid+'/ns/net','--',*args)
         self.record('gateway_half_route_removed',lambda:self.fault('gateway-half-route',
-            lambda:ns_command('ip','-4','route','del','0.0.0.0/1','dev','tun0'),
-            lambda:ns_command('ip','-4','route','add','0.0.0.0/1','dev','tun0')))
+            lambda:self.gateway_command('ip','-4','route','del','0.0.0.0/1','dev','tun0'),
+            lambda:self.gateway_command('ip','-4','route','add','0.0.0.0/1','dev','tun0')))
         def bad_probe():
             policy=INSTALL_ROOT/'policy.json';original=policy.read_bytes()
             try:
@@ -913,6 +947,95 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(result['errno'],errno.ENETUNREACH)
         suite.binding=Binding.from_text(json.dumps(self.document()))
         with self.assertRaises(AssertionError):suite.ordinary_udp(SimpleNamespace(value=evaluate))
+
+
+class FaultTests(unittest.TestCase):
+    """Exercise restoration through fake command boundaries, never a firewall."""
+
+    def suite(self):
+        suite=object.__new__(Suite)
+        document=BindingTests.document()
+        # The first IP has two transport entries but needs exactly one DROP.
+        document['proxy_policy']['outer_endpoints'].insert(1,
+            {'family':4,'address':'192.0.2.8','protocol':'udp','port_start':443,'port_end':443})
+        suite.binding=Binding.from_text(json.dumps(document))
+        suite.a=SimpleNamespace(value=mock.Mock(return_value=True));suite.b=object()
+        suite.tcp=SimpleNamespace(server_address=('127.0.0.1',23456))
+        healthy={'ok':True,'result':{'status':200,'tls':True,'socket':['fake-kept-socket']}}
+        suite.https=mock.Mock(side_effect=[healthy,{'ok':False},healthy])
+        suite.existing_https=mock.Mock(return_value={'ok':False})
+        suite.rejected_start=mock.Mock();suite.echo=mock.Mock();suite.forced_egress=mock.Mock()
+        suite.gateway_ready=mock.Mock();suite.assert_rules=mock.Mock()
+        suite.gateway_command=mock.Mock(return_value=subprocess.CompletedProcess([],0,'',''))
+        return suite
+
+    def test_node_outage_blocks_every_unique_ip_and_deletes_only_exact_owned_rules(self):
+        suite=self.suite();result=suite.node_outage()
+        calls=[call.args for call in suite.gateway_command.call_args_list]
+        inserted=[args for args in calls if '-I' in args];deleted=[args for args in calls if '-D' in args]
+        self.assertEqual([args[args.index('-d')+1] for args in inserted],['192.0.2.8/32','198.51.100.9/32'])
+        self.assertEqual([args[6:] for args in inserted],[args[5:] for args in reversed(deleted)])
+        for args in inserted:
+            self.assertEqual(args[:6],('iptables-legacy','-w','5','-I','OUTPUT','1'))
+            self.assertEqual(args[-2:],('-j','DROP'))
+            self.assertIn('--comment',args)
+        self.assertEqual(result['blocked_outer_addresses'],['192.0.2.8','198.51.100.9'])
+        suite.gateway_ready.assert_called_once();suite.assert_rules.assert_called_once()
+        suite.forced_egress.assert_called_once_with(suite.a)
+
+    def test_partial_node_outage_insertion_is_rolled_back_on_exception(self):
+        suite=self.suite();calls=[]
+        def boundary(*args):
+            calls.append(args)
+            if '-I' in args and '198.51.100.9/32' in args:raise RuntimeError('insertion failed')
+        suite.gateway_command.side_effect=boundary
+        with self.assertRaisesRegex(RuntimeError,'insertion failed'):suite.node_outage()
+        deleted=[args for args in calls if '-D' in args]
+        self.assertEqual(len(deleted),1);self.assertIn('192.0.2.8/32',deleted[0])
+        suite.gateway_ready.assert_called_once();suite.assert_rules.assert_called_once()
+
+    def test_cleanup_attempts_every_inserted_node_when_one_delete_fails(self):
+        suite=self.suite();calls=[]
+        def boundary(*args):
+            calls.append(args)
+            if '-D' in args and '198.51.100.9/32' in args:raise RuntimeError('deletion failed')
+        suite.gateway_command.side_effect=boundary
+        with self.assertRaises(AssertionError):suite.node_outage()
+        self.assertEqual([args[args.index('-d')+1] for args in calls if '-D' in args],
+                         ['198.51.100.9/32','192.0.2.8/32'])
+        suite.gateway_ready.assert_not_called()
+
+    def test_tun_is_restored_even_if_fault_observation_raises(self):
+        for fail in (False,True):
+            with self.subTest(fail=fail):
+                suite=self.suite()
+                if fail:suite.existing_https.side_effect=RuntimeError('observation failed')
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError,'observation failed'):suite.tun_link_fault()
+                else:suite.tun_link_fault()
+                self.assertEqual([call.args for call in suite.gateway_command.call_args_list],
+                    [('ip','link','set','dev','tun0','down'),('ip','link','set','dev','tun0','up')])
+                suite.gateway_ready.assert_called_once();suite.assert_rules.assert_called_once()
+
+    def test_gateway_command_mutates_only_the_bound_namespace(self):
+        for inode in (555,999):
+            with self.subTest(inode=inode):
+                suite=self.suite();calls=[]
+                def boundary(*args,**kwargs):
+                    calls.append(args)
+                    return subprocess.CompletedProcess(args,0,'123\n' if args[0]=='docker' else '','')
+                original_stat=Path.stat
+                def namespace_stat(path,*args,**kwargs):
+                    if str(path)=='/proc/123/ns/net':return SimpleNamespace(st_dev=4,st_ino=inode)
+                    return original_stat(path,*args,**kwargs)
+                with mock.patch(__name__+'.command',side_effect=boundary),mock.patch.object(Path,'stat',namespace_stat):
+                    if inode==555:
+                        Suite.gateway_command(suite,'ip','link','set','dev','tun0','down')
+                        self.assertEqual(calls[-1],('nsenter','--net=/proc/123/ns/net','--',
+                                                   'ip','link','set','dev','tun0','down'))
+                    else:
+                        with self.assertRaises(AssertionError):Suite.gateway_command(suite,'ip','link','set','dev','tun0','down')
+                        self.assertEqual(len(calls),1)
 
 
 if __name__=='__main__':main()

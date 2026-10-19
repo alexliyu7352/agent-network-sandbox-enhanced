@@ -1,8 +1,26 @@
 #!/bin/bash
-# Real privileged acceptance, ONLY on a fresh disposable GitHub-hosted VM.
+# Real privileged acceptance, ONLY on a fresh disposable CI VM.
 # Source this file to test the pure config/result helpers without touching a host.
 
 ci_fail() { printf 'ci-host: %s\n' "$*" >&2; exit 125; }
+
+ci_require_disposable() {
+    [[ $EUID == 0 ]] || return 1
+    if [[ ${CI_DISPOSABLE_HOST:-} == github-actions ]]; then
+        [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
+    elif [[ ${CI_DISPOSABLE_HOST:-} == kvm-guest ]]; then
+        # ci-vm.sh creates this guest, SMBIOS marker, and root-private seed.
+        # An environment variable alone must never enable provisioning on a VPS.
+        [[ ${CI_GITHUB_SHA:-} =~ ^[0-9a-f]{40}$ &&
+           $(systemd-detect-virt --vm) == kvm &&
+           $(cat /sys/class/dmi/id/product_name) == DevSessionCIVM &&
+           ! -L /run/dev-session-ci-kvm &&
+           $(stat -c '%u:%a' /run/dev-session-ci-kvm) == 0:600 &&
+           $(cat /run/dev-session-ci-kvm) == "$CI_GITHUB_SHA" ]]
+    else
+        return 1
+    fi
+}
 
 ci_validate_case() {
     [[ $1 == hysteria2 || $1 == http ]] || return 1
@@ -113,7 +131,8 @@ ci_packages() {
     apt-get update
     apt-get install -y --no-install-recommends ca-certificates curl git jq python3 \
         iproute2 iptables util-linux procps sudo tcpdump openssl kmod
-    # Ubuntu2604-Readme.md lists Docker Engine and Compose on the hosted image.
+    # Ubuntu2604-Readme.md lists Docker Engine and Compose on the hosted image;
+    # ci-vm.sh installs the official Docker packages before entering a guest.
     # Fail explicitly if that contract changes; never run a downloaded installer.
     command -v dockerd
     docker compose version
@@ -158,7 +177,10 @@ PY
 ci_fixture() {
     local extract
     ci_write_config "$CI_PROTOCOL" "$CI_ROOT/network.json"
-    "$CI_ROOT/install-dev-session.sh"
+    # Both real suites invoke this private manager by absolute path. Hosted
+    # images may have a runner-writable /usr/local/bin; keep installer trust
+    # checks intact and avoid publishing a launcher there.
+    "$CI_ROOT/install-dev-session.sh" --no-link
     useradd --create-home --user-group --shell /bin/bash "$CI_ACCOUNT"
     passwd --lock "$CI_ACCOUNT"
     chmod 700 "/home/$CI_ACCOUNT"
@@ -283,9 +305,7 @@ ci_main() {
     set -euo pipefail
     export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
     umask 077
-    [[ $EUID == 0 && ${GITHUB_ACTIONS:-} == true &&
-       ${RUNNER_ENVIRONMENT:-} == github-hosted &&
-       ${CI_DISPOSABLE_HOST:-} == github-actions ]] ||
+    ci_require_disposable ||
         ci_fail 'This script requires an explicitly marked disposable GitHub-hosted VM'
     CI_PROTOCOL=''; CI_SCENARIO=''; CI_REPETITIONS=100
     while (( $# )); do
